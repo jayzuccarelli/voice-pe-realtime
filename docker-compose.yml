@@ -1,0 +1,10 @@
+# Run the broker alongside Home Assistant. host networking lets the Voice PE
+# reach it on the LAN and lets it reach HA's MCP server on localhost.
+services:
+  broker:
+    build: ./broker
+    image: voicepe-realtime:latest
+    container_name: voicepe-realtime
+    network_mode: host
+    restart: unless-stopped
+    env_file: ./broker/.env

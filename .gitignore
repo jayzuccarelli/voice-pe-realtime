@@ -1,0 +1,11 @@
+.env
+*.env
+!*.env.example
+secrets.yaml
+__pycache__/
+*.pyc
+.esphome/
+build/
+*.bin
+firmware/official-26.5.0.yaml
+stock-voice-pe-backup.bin
