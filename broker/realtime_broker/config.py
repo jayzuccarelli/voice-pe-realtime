@@ -27,6 +27,11 @@ class Config:
     vad_prefix_padding_ms: int = 300
     vad_silence_duration_ms: int = 500
 
+    # OpenAI caps a Realtime session at 60 min. Proactively rotate a bit before
+    # that so the broker never hits the fatal expiry. The device is turn-based,
+    # so a rotation between turns is invisible.
+    max_session_seconds: int = 3000  # 50 min
+
     @property
     def ha_control_enabled(self) -> bool:
         return bool(self.ha_mcp_url and self.ha_token)
@@ -48,4 +53,5 @@ class Config:
             vad_threshold=float(os.environ.get("VAD_THRESHOLD", "0.5")),
             vad_prefix_padding_ms=int(os.environ.get("VAD_PREFIX_PADDING_MS", "300")),
             vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "500")),
+            max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
         )

@@ -65,7 +65,7 @@ The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmwa
 - ✅ Realtime conversation, server-side
 - ✅ Home Assistant control via MCP (SSE)
 - ⏳ Firmware flash (per-device)
-- ⏳ Transparent reconnect on the 60-min Realtime session cap
+- ✅ Session rotation before the 60-min Realtime cap (no dropouts)
 - ⏳ Open-mic barge-in (true duplex, using the Voice PE's hardware AEC)
 
 ## Credits
