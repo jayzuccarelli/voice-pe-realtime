@@ -14,7 +14,9 @@ device is turn-based, so a rotation between turns is invisible.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import urllib.request
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -53,6 +55,32 @@ async def run(config: Config) -> None:
         await asyncio.sleep(0.5)  # let the socket fully release before rebind
 
 
+def _fetch_weather(config: Config) -> str:
+    """Live weather from HA (HA's MCP doesn't surface the weather domain)."""
+    if not config.ha_control_enabled:
+        return "Weather is unavailable; Home Assistant is not connected."
+    base = config.ha_mcp_url.split("/mcp_server")[0]
+    try:
+        req = urllib.request.Request(
+            f"{base}/api/states/weather.forecast_home",
+            headers={"Authorization": f"Bearer {config.ha_token}"},
+        )
+        st = json.load(urllib.request.urlopen(req, timeout=8))
+        a = st.get("attributes", {})
+        unit = a.get("temperature_unit", "\u00b0F")
+        parts = [f"condition {st.get('state')}"]
+        if a.get("temperature") is not None:
+            parts.append(f"{a['temperature']}{unit}")
+        if a.get("humidity") is not None:
+            parts.append(f"humidity {a['humidity']}%")
+        if a.get("wind_speed") is not None:
+            parts.append(f"wind {a['wind_speed']} {a.get('wind_speed_unit', '')}".strip())
+        return "Current weather: " + ", ".join(parts) + "."
+    except Exception as e:  # noqa: BLE001
+        logger.warning("weather fetch failed: %s", e)
+        return "Sorry, I couldn't get the weather right now."
+
+
 async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     """Run one OpenAI session until it dies or reaches max age, then tear down."""
     service = await build_agent(config, mcp)
@@ -66,6 +94,21 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             audio_out_enabled=True,
         ),
     )
+
+    async def _get_weather(params):  # noqa: ANN001
+        await params.result_callback(_fetch_weather(config))
+
+    async def _end_conversation(params):  # noqa: ANN001
+        await params.result_callback("Okay, goodbye!")
+        ws = getattr(transport.input(), "_websocket", None)
+        if ws is not None:
+            try:
+                await ws.send('{"type":"disconnect"}')
+            except Exception:  # noqa: BLE001
+                logger.exception("end_conversation: failed to signal device")
+
+    service.register_function("get_weather", _get_weather)
+    service.register_function("end_conversation", _end_conversation)
 
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(

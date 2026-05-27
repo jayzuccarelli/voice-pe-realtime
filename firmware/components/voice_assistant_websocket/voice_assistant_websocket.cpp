@@ -38,8 +38,14 @@ void VoiceAssistantWebSocket::loop() {
   if (this->pending_disconnect_) {
     this->pending_disconnect_ = false;
     this->disconnect_websocket_();
-    // After disconnect, continue with stop() cleanup
-    // Clear buffers
+    // After disconnect, continue with stop() cleanup (all on the main loop)
+    if (this->speaker_ != nullptr) this->speaker_->stop();
+    {
+      LockGuard guard(this->audio_mutex_);
+      while (!this->audio_queue_.empty()) this->audio_queue_.pop();
+    }
+    this->playback_buf_.clear();
+    this->playback_off_ = 0;
     this->input_buffer_.clear();
     this->output_buffer_.clear();
     
@@ -58,26 +64,45 @@ void VoiceAssistantWebSocket::loop() {
     return;  // Skip other loop operations after disconnect
   }
   
-  // Try to process queued audio if speaker is running
-  if (this->speaker_ != nullptr && this->speaker_->is_running() && !this->audio_queue_.empty()) {
-    const std::vector<uint8_t> &queued_data = this->audio_queue_.front();
-    size_t queued_written = this->speaker_->play(queued_data.data(), queued_data.size());
-    
-    if (queued_written == queued_data.size()) {
-      // Successfully sent queued data
-      this->audio_queue_.pop();
-      ESP_LOGD(TAG, "Sent queued audio chunk from loop (%zu bytes)", queued_data.size());
-    } else if (queued_written > 0) {
-      // Partially sent - remove sent portion and keep remainder
-      if (queued_written < queued_data.size()) {
-        std::vector<uint8_t> remainder(queued_data.begin() + queued_written, queued_data.end());
-        this->audio_queue_.pop();
-        this->audio_queue_.push(remainder);
-      } else {
+  // Interrupt arrived on the websocket task -> act on it here (main loop).
+  if (this->pending_interrupt_) {
+    this->pending_interrupt_ = false;
+    if (this->speaker_ != nullptr) this->speaker_->stop();
+    {
+      LockGuard guard(this->audio_mutex_);
+      while (!this->audio_queue_.empty()) this->audio_queue_.pop();
+    }
+    this->playback_buf_.clear();
+    this->playback_off_ = 0;
+    this->interrupt_time_ = millis();
+  }
+
+  // Drain queued audio to the speaker. Main loop ONLY (speaker is not
+  // thread-safe and is shared with HA Assist). playback_buf_ holds the chunk
+  // currently being fed, so partial writes don't reorder or reallocate.
+  if (this->speaker_ != nullptr && this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+    if (this->speaker_->is_stopped()) {
+      this->speaker_->start();
+    }
+    if (this->playback_off_ >= this->playback_buf_.size()) {
+      this->playback_buf_.clear();
+      this->playback_off_ = 0;
+      LockGuard guard(this->audio_mutex_);
+      if (!this->audio_queue_.empty()) {
+        this->playback_buf_ = std::move(this->audio_queue_.front());
         this->audio_queue_.pop();
       }
     }
-    // If queued_written == 0, buffer is still full, try again next loop
+    if (this->playback_off_ < this->playback_buf_.size()) {
+      size_t written = this->speaker_->play(this->playback_buf_.data() + this->playback_off_,
+                                            this->playback_buf_.size() - this->playback_off_);
+      this->playback_off_ += written;
+    } else {
+      // Keep the audio chain warm with silence between/ before replies so the
+      // first words don't come out quiet (the codec ramps on idle->active).
+      static const std::vector<uint8_t> silence(960, 0);  // 20ms @ 24kHz/16-bit
+      this->speaker_->play(silence.data(), silence.size());
+    }
   }
   
   // Handle pending start request
@@ -180,6 +205,11 @@ void VoiceAssistantWebSocket::start() {
     if (this->speaker_->is_stopped()) {
       this->speaker_->start();
     }
+    // Warm the DAC/amp with brief silence so the first words of the reply
+    // aren't dropped or quiet (the AIC3204 soft-steps its output up on unmute;
+    // doing that during silence means the real audio plays at full level).
+    std::vector<uint8_t> warmup(OUTPUT_SAMPLE_RATE * 2 * 250 / 1000, 0);  // 250ms @24k/16-bit
+    this->speaker_->play(warmup.data(), warmup.size());
   }
   
   if (this->state_callback_) {
@@ -201,15 +231,8 @@ void VoiceAssistantWebSocket::stop() {
   // The microphone can be shared between multiple components in ESPHome
   // micro_wake_word will continue to work even when voice_assistant_websocket is stopped
   ESP_LOGD(TAG, "Keeping microphone running for micro_wake_word");
-  // Stop speaker if it's running
-  if (this->speaker_ != nullptr) {
-    this->speaker_->stop();
-  }
-  
-  // Clear audio queue
-  while (!this->audio_queue_.empty()) {
-    this->audio_queue_.pop();
-  }
+  // NOTE: speaker stop + audio_queue clear are deferred to loop() (main task),
+  // since stop() can be invoked from the websocket task (disconnect frame).
   
   if (this->state_callback_) {
     this->state_callback_(this->state_);
@@ -326,7 +349,7 @@ void VoiceAssistantWebSocket::send_audio_chunk_(const uint8_t *data, size_t len)
   int sent = esp_websocket_client_send_bin(this->websocket_client_, 
                                             (const char *) data, 
                                             len, 
-                                            portMAX_DELAY);
+                                            portMAX_DELAY);  // atomic frame; partial send corrupts WS masking
   if (sent < 0) {
     ESP_LOGW(TAG, "Failed to send audio chunk");
   }
@@ -534,7 +557,7 @@ void VoiceAssistantWebSocket::interrupt() {
   
   // Send interrupt message as JSON text frame
   const char *interrupt_msg = "{\"type\":\"interrupt\"}";
-  int sent = esp_websocket_client_send_text(this->websocket_client_, interrupt_msg, strlen(interrupt_msg), portMAX_DELAY);
+  int sent = esp_websocket_client_send_text(this->websocket_client_, interrupt_msg, strlen(interrupt_msg), pdMS_TO_TICKS(100));
   
   if (sent < 0) {
     ESP_LOGW(TAG, "Failed to send interrupt message");
@@ -545,9 +568,12 @@ void VoiceAssistantWebSocket::interrupt() {
       this->speaker_->stop();
     }
     // Clear audio queue to free memory and prevent overflow
-    while (!this->audio_queue_.empty()) {
-      this->audio_queue_.pop();
+    {
+      LockGuard guard(this->audio_mutex_);
+      while (!this->audio_queue_.empty()) this->audio_queue_.pop();
     }
+    this->playback_buf_.clear();
+    this->playback_off_ = 0;
     // Set interrupt time to ignore incoming audio for a short period
     // This gives the server time to process the interrupt and stop sending audio
     this->interrupt_time_ = millis();
@@ -615,7 +641,20 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       
     case WEBSOCKET_EVENT_DATA:
       if (event_data->op_code == 0x02) {  // Binary frame
-        this->process_received_audio_(reinterpret_cast<const uint8_t *>(event_data->data_ptr), event_data->data_len);
+        // Websocket task: ONLY hand bytes to the main loop. Speaker work here
+        // races HA Assist on the main loop and corrupts the heap.
+        if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING && event_data->data_len > 0) {
+          bool ignore = this->interrupt_time_ > 0 &&
+                        (millis() - this->interrupt_time_) < INTERRUPT_IGNORE_AUDIO_MS;
+          if (!ignore) {
+            LockGuard guard(this->audio_mutex_);
+            if (this->audio_queue_.size() < MAX_QUEUE_SIZE) {
+              const uint8_t *p = reinterpret_cast<const uint8_t *>(event_data->data_ptr);
+              this->audio_queue_.emplace(p, p + event_data->data_len);
+              this->last_speaker_audio_time_ = millis();
+            }
+          }
+        }
       } else if (event_data->op_code == 0x01) {  // Text frame
         ESP_LOGI(TAG, "Received text message: %.*s", event_data->data_len, event_data->data_ptr);
         
@@ -623,10 +662,8 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
         std::string message((const char *) event_data->data_ptr, event_data->data_len);
         if (message.find("\"type\":\"interrupt\"") != std::string::npos ||
             message.find("\"type\": \"interrupt\"") != std::string::npos) {
-          ESP_LOGI(TAG, "Interrupt received, stopping speaker");
-          if (this->speaker_ != nullptr) {
-            this->speaker_->stop();
-          }
+          ESP_LOGI(TAG, "Interrupt received; deferring speaker stop to loop()");
+          this->pending_interrupt_ = true;
         } else if (message.find("\"type\":\"disconnect\"") != std::string::npos ||
                    message.find("\"type\": \"disconnect\"") != std::string::npos) {
           ESP_LOGI(TAG, "Disconnect message received, stopping voice assistant and going to idle");

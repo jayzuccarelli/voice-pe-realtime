@@ -1,9 +1,10 @@
 """Builds the OpenAI Realtime LLM service for a session.
 
-Configures voice, system prompt, server-side VAD, and — if Home Assistant
-control is enabled — registers the HA MCP tools so the model can act on the
-home. The audio/session shape here is the GA Realtime API (post-Aug 2025):
-voice lives under audio.output, format is implied by the 24 kHz PCM contract.
+Configures voice, system prompt, server-side VAD, and the available tools:
+the Home Assistant MCP tools (if HA control is enabled) plus two custom broker
+tools — `get_weather` (live HA weather, which HA's MCP doesn't surface) and
+`end_conversation` (clean "ok, bye" stop). Handlers for the custom tools are
+registered by the server (they need HA access / the device connection).
 """
 
 from __future__ import annotations
@@ -24,9 +25,33 @@ from .config import Config
 
 logger = logging.getLogger(__name__)
 
+# Custom broker tools, registered with handlers by the server.
+CUSTOM_TOOLS = [
+    {
+        "type": "function",
+        "name": "get_weather",
+        "description": (
+            "Get the current local weather (conditions, temperature, humidity, "
+            "wind) from Home Assistant. Call this whenever the user asks about "
+            "the weather or outdoor conditions."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "type": "function",
+        "name": "end_conversation",
+        "description": (
+            "End the conversation and stop listening. Call this when the user "
+            "says goodbye, bye, stop, that's all, thanks that's it, or otherwise "
+            "signals they are done."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+]
+
 
 async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLLMService:
-    """Create a configured OpenAI Realtime service, with HA tools if available."""
+    """Create a configured OpenAI Realtime service, with HA + custom tools."""
     tools: list[dict] = []
     tools_schema = None
     if mcp is not None:
@@ -45,6 +70,8 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
                 }
             )
         logger.info("Loaded %d Home Assistant tools", len(tools))
+
+    tools.extend(CUSTOM_TOOLS)
 
     session = SessionProperties(
         instructions=config.instructions,
@@ -71,6 +98,6 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
 
     if mcp is not None and tools_schema is not None:
         await mcp.register_tools_schema(tools_schema, service)
-        logger.info("Registered %d Home Assistant tool handlers", len(tools))
+        logger.info("Registered %d Home Assistant tool handlers", len(tools_schema.standard_tools))
 
     return service
