@@ -1751,15 +1751,12 @@ voice_assistant_websocket:
     - lambda: 'id(voice_assistant_phase) = ${voice_assist_listening_for_command_phase_id};'
     - script.execute: control_leds
   on_disconnected:
-    - micro_wake_word.start:
     - lambda: 'id(voice_assistant_phase) = ${voice_assist_idle_phase_id};'
     - script.execute: control_leds
   on_error:
-    - micro_wake_word.start:
     - lambda: 'id(voice_assistant_phase) = ${voice_assist_error_phase_id};'
     - script.execute: control_leds
   on_stopped:
-    - micro_wake_word.start:
     - lambda: 'id(voice_assistant_phase) = ${voice_assist_idle_phase_id};'
     - script.execute: control_leds
 
@@ -1790,9 +1787,20 @@ micro_wake_word:
           # "Hey Mycroft" -> realtime broker (websocket). All other wake words -> HA Assist.
           - if:
               condition:
-                lambda: 'return wake_word == "hey mycroft";'
+                lambda: 'std::string w=wake_word; for(auto&c:w)c=tolower(c); return w.find("mycroft")!=std::string::npos;'
               then:
-                - micro_wake_word.stop:
+                # Do NOT stop micro_wake_word: it owns the shared microphone, and
+                # stopping it cuts the audio feed the websocket component needs.
+                # Play the same wake cue as Hey Jarvis.
+                - if:
+                    condition:
+                      switch.is_on: wake_sound
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: "wake_word_triggered_sound"
+                      - delay: 300ms
                 - voice_assistant_websocket.start: vaws
               else:
                 - script.execute: start_ha_assist
@@ -1845,6 +1853,8 @@ voice_assistant:
   on_client_connected:
     - lambda: id(init_in_progress) = false;
     - micro_wake_word.start:
+    # Always listen for the realtime wake word, regardless of HA's selection.
+    - micro_wake_word.enable_model: hey_mycroft
     - lambda: id(voice_assistant_phase) = ${voice_assist_idle_phase_id};
     - script.execute: control_leds
   on_client_disconnected:

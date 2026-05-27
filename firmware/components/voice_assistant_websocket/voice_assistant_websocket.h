@@ -4,6 +4,7 @@
 #include "esphome/components/microphone/microphone.h"
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/core/automation.h"
+#include "esphome/core/helpers.h"
 #ifdef USE_ESP_IDF
 #include "esp_websocket_client.h"
 #include "esp_http_client.h"
@@ -93,6 +94,14 @@ class VoiceAssistantWebSocket : public Component {
   std::queue<std::vector<uint8_t>> audio_queue_;
   static const size_t MAX_QUEUE_SIZE = 10;  // Max 10 chunks (~40KB) to prevent memory overflow
   static const size_t MIN_FREE_HEAP_BYTES = 15000;  // Minimum free heap required before queuing audio
+
+  // Thread-safe audio handoff: the websocket task only enqueues; loop() drains
+  // to the speaker. Touching the speaker from the websocket task races HA Assist
+  // on the main loop and corrupts the heap (crash-after-one-interaction bug).
+  Mutex audio_mutex_;
+  std::vector<uint8_t> playback_buf_;  // chunk being fed to the speaker (main loop only)
+  size_t playback_off_{0};
+  bool pending_interrupt_{false};      // text-frame interrupt, acted on in loop()
   
   // Timing
   uint32_t last_audio_send_{0};
@@ -106,7 +115,7 @@ class VoiceAssistantWebSocket : public Component {
   
   // Auto-stop tracking
   uint32_t last_speaker_audio_time_{0};  // Last time we received audio from speaker
-  static const uint32_t AUTO_STOP_INACTIVITY_MS = 20000;  // Stop after 20 seconds of speaker inactivity
+  static const uint32_t AUTO_STOP_INACTIVITY_MS = 10000;  // Stop after 10s of speaker inactivity (auto-end the turn)
   
   // Audio conversion buffers
   std::vector<int16_t> mono_buffer_;  // For stereo to mono conversion (input)
