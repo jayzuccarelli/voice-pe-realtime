@@ -21,6 +21,7 @@ class Config:
     # Home Assistant control via MCP (optional). Both must be set to enable it.
     ha_mcp_url: str | None = None
     ha_token: str | None = None
+    music_player: str | None = None  # MA media_player entity for music playback
 
     # OpenAI server-side VAD turn detection.
     vad_threshold: float = 0.5
@@ -50,6 +51,7 @@ class Config:
             ws_port=int(os.environ.get("WS_PORT", "8765")),
             ha_mcp_url=os.environ.get("HA_MCP_URL") or None,
             ha_token=os.environ.get("HA_TOKEN") or None,
+            music_player=os.environ.get("MUSIC_PLAYER") or None,
             vad_threshold=float(os.environ.get("VAD_THRESHOLD", "0.5")),
             vad_prefix_padding_ms=int(os.environ.get("VAD_PREFIX_PADDING_MS", "300")),
             vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "500")),

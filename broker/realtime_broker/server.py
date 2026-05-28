@@ -107,8 +107,27 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             except Exception:  # noqa: BLE001
                 logger.exception("end_conversation: failed to signal device")
 
+    async def _play_music(params):  # noqa: ANN001
+        query = (params.arguments or {}).get("query", "")
+        if not config.music_player:
+            await params.result_callback("Music isn't set up yet — Spotify isn't connected.")
+            return
+        base = config.ha_mcp_url.split("/mcp_server")[0]
+        body = json.dumps({"entity_id": config.music_player, "media_id": query}).encode()
+        try:
+            req = urllib.request.Request(
+                base + "/api/services/music_assistant/play_media", data=body,
+                headers={"Authorization": f"Bearer {config.ha_token}", "Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=15)
+            await params.result_callback(f"Playing {query}.")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("play_music failed: %s", e)
+            await params.result_callback("Sorry, I couldn't start the music.")
+
     service.register_function("get_weather", _get_weather)
     service.register_function("end_conversation", _end_conversation)
+    service.register_function("play_music", _play_music)
 
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(
