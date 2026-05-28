@@ -87,10 +87,24 @@ void VoiceAssistantWebSocket::loop() {
     if (this->playback_off_ >= this->playback_buf_.size()) {
       this->playback_buf_.clear();
       this->playback_off_ = 0;
-      LockGuard guard(this->audio_mutex_);
-      if (!this->audio_queue_.empty()) {
-        this->playback_buf_ = std::move(this->audio_queue_.front());
-        this->audio_queue_.pop();
+      {
+        LockGuard guard(this->audio_mutex_);
+        if (!this->audio_queue_.empty()) {
+          this->playback_buf_ = std::move(this->audio_queue_.front());
+          this->audio_queue_.pop();
+        }
+      }
+      // Boost loudness: OpenAI realtime audio sits ~50% full-scale, so apply a
+      // digital gain with a hard clamp (no wrap/distortion). PLAYBACK_GAIN_X10
+      // is gain*10 (20 = 2.0x).
+      if (!this->playback_buf_.empty()) {
+        static const int PLAYBACK_GAIN_X10 = 20;
+        int16_t *sb = reinterpret_cast<int16_t *>(this->playback_buf_.data());
+        size_t n = this->playback_buf_.size() / 2;
+        for (size_t i = 0; i < n; i++) {
+          int32_t v = static_cast<int32_t>(sb[i]) * PLAYBACK_GAIN_X10 / 10;
+          sb[i] = v > 32767 ? 32767 : (v < -32768 ? -32768 : static_cast<int16_t>(v));
+        }
       }
     }
     if (this->playback_off_ < this->playback_buf_.size()) {
