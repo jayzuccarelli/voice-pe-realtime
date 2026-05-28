@@ -1045,6 +1045,16 @@ script:
   # a simple two-way branch.
   - id: start_ha_assist
     then:
+      # Mutual exclusion: if a "Hey Mycroft" realtime session is open, stop it
+      # first. HA Assist (native) and the websocket session share one mic + one
+      # speaker and must never run at the same time, or they fight over the
+      # speaker (no audio, occasional hard lock).
+      - if:
+          condition:
+            voice_assistant_websocket.is_running: vaws
+          then:
+            - voice_assistant_websocket.stop: vaws
+            - delay: 200ms
       - if:
           condition:
             switch.is_on: timer_ringing
@@ -1789,6 +1799,21 @@ micro_wake_word:
               condition:
                 lambda: 'std::string w=wake_word; for(auto&c:w)c=tolower(c); return w.find("mycroft")!=std::string::npos;'
               then:
+                # Mutual exclusion: HA Assist (native voice_assistant) and this
+                # websocket session share one mic + one speaker. Stop the native
+                # pipeline (and any prior websocket session) before starting, or
+                # they fight over the speaker (no audio / hard lock).
+                - if:
+                    condition:
+                      voice_assistant.is_running:
+                    then:
+                      - voice_assistant.stop:
+                - if:
+                    condition:
+                      voice_assistant_websocket.is_running: vaws
+                    then:
+                      - voice_assistant_websocket.stop: vaws
+                      - delay: 200ms
                 # Do NOT stop micro_wake_word: it owns the shared microphone, and
                 # stopping it cuts the audio feed the websocket component needs.
                 # Play the same wake cue as Hey Jarvis.
