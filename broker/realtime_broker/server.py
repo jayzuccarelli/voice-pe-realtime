@@ -18,9 +18,11 @@ import json
 import logging
 import urllib.request
 
+from pipecat.frames.frames import Frame, StartInterruptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
@@ -36,6 +38,32 @@ from .config import Config
 from .serializer import RawPCMSerializer
 
 logger = logging.getLogger(__name__)
+
+
+class _DeviceInterruptNotifier(FrameProcessor):
+    """On barge-in, tell the device to flush its speaker buffer immediately.
+
+    When the user talks over the bot, Pipecat cancels the OpenAI response and
+    emits StartInterruptionFrame — but the device has its own ~1s audio queue
+    that would keep playing the old reply. The firmware already handles a
+    {"type":"interrupt"} text frame (stop speaker, clear queue, briefly ignore
+    in-flight audio); this just pulls that trigger so the cutoff is crisp.
+    """
+
+    def __init__(self, get_ws) -> None:  # noqa: ANN001
+        super().__init__()
+        self._get_ws = get_ws
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartInterruptionFrame):
+            ws = self._get_ws()
+            if ws is not None:
+                try:
+                    await ws.send('{"type":"interrupt"}')
+                except Exception:  # noqa: BLE001
+                    logger.exception("interrupt notify: failed to signal device")
+        await self.push_frame(frame, direction)
 
 
 async def run(config: Config) -> None:
@@ -184,6 +212,9 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     service.register_function("end_conversation", _end_conversation)
     service.register_function("play_music", _play_music)
 
+    interrupt_notifier = _DeviceInterruptNotifier(
+        lambda: getattr(transport.input(), "_websocket", None)
+    )
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(
         [
@@ -191,6 +222,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             aggregator.user(),
             service,
             aggregator.assistant(),
+            interrupt_notifier,
             transport.output(),
         ]
     )
