@@ -49,10 +49,13 @@ class _DeviceInterruptNotifier(FrameProcessor):
     """On barge-in, tell the device to flush its speaker buffer immediately.
 
     When the user talks over the bot, Pipecat cancels the OpenAI response and
-    emits StartInterruptionFrame — but the device has its own ~1s audio queue
-    that would keep playing the old reply. The firmware already handles a
-    {"type":"interrupt"} text frame (stop speaker, clear queue, briefly ignore
-    in-flight audio); this just pulls that trigger so the cutoff is crisp.
+    emits InterruptionFrame downstream — but the device has its own ~1s audio
+    queue that would keep playing the old reply. The firmware already handles
+    a {"type":"interrupt"} text frame (stop speaker, clear queue, briefly
+    ignore in-flight audio); this just pulls that trigger so the cutoff is
+    crisp. We guard on _bot_speaking because Pipecat also emits
+    InterruptionFrame at session/turn boundaries when no bot speech is in
+    flight, and flushing then would mask the first 500ms of the next reply.
     """
 
     def __init__(self, get_ws) -> None:  # noqa: ANN001
