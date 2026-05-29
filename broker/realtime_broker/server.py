@@ -18,7 +18,12 @@ import json
 import logging
 import urllib.request
 
-from pipecat.frames.frames import Frame, StartInterruptionFrame
+from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
+    Frame,
+    InterruptionFrame,
+)
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -53,14 +58,28 @@ class _DeviceInterruptNotifier(FrameProcessor):
     def __init__(self, get_ws) -> None:  # noqa: ANN001
         super().__init__()
         self._get_ws = get_ws
+        self._bot_speaking = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, StartInterruptionFrame):
+        # Track bot speech state via upstream BotStarted/StoppedSpeakingFrame.
+        if isinstance(frame, BotStartedSpeakingFrame):
+            self._bot_speaking = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            self._bot_speaking = False
+        # A downstream InterruptionFrame WHILE the bot is speaking is a real
+        # barge-in. Pipecat also emits InterruptionFrame at session/turn
+        # boundaries when the bot isn't speaking — flushing the device then
+        # would mask the first 500 ms of the next reply (the firmware's
+        # INTERRUPT_IGNORE_AUDIO_MS window), so we guard on _bot_speaking.
+        elif (isinstance(frame, InterruptionFrame)
+              and direction == FrameDirection.DOWNSTREAM
+              and self._bot_speaking):
             ws = self._get_ws()
             if ws is not None:
                 try:
                     await ws.send('{"type":"interrupt"}')
+                    logger.info("barge-in: signaled device to flush speaker")
                 except Exception:  # noqa: BLE001
                     logger.exception("interrupt notify: failed to signal device")
         await self.push_frame(frame, direction)
