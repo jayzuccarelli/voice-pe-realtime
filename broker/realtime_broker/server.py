@@ -96,7 +96,9 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     )
 
     async def _get_weather(params):  # noqa: ANN001
-        await params.result_callback(_fetch_weather(config))
+        # Run the blocking HA fetch off the event loop so it can't stall audio.
+        weather = await asyncio.to_thread(_fetch_weather, config)
+        await params.result_callback(weather)
 
     async def _end_conversation(params):  # noqa: ANN001
         await params.result_callback("Okay, goodbye!")
@@ -140,7 +142,19 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     finally:
         if not runner_task.done():
             await task.cancel()
+        # Await the runner to fully finish so the websocket server releases the
+        # port before the next session rebinds — otherwise rotation can hit an
+        # intermittent "address already in use".
+        try:
+            await asyncio.wait_for(asyncio.shield(runner_task), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("Runner slow to stop after cancel; forcing")
+            runner_task.cancel()
             try:
-                await asyncio.wait_for(runner_task, timeout=10)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                runner_task.cancel()
+                await runner_task
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001
+            logger.exception("Runner teardown error")
