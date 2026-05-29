@@ -81,6 +81,70 @@ def _fetch_weather(config: Config) -> str:
         return "Sorry, I couldn't get the weather right now."
 
 
+def _start_music(config: Config, query: str, speaker: str | None) -> str:
+    """Play `query` on a Music Assistant speaker via music_assistant.play_media.
+
+    HA's generic media-search tool refuses MA players (they don't advertise the
+    SEARCH_MEDIA feature), so we call MA's own service, which searches Spotify
+    internally. Resolves the spoken speaker name to an MA media_player entity
+    (only those accept this service); falls back to config.music_player.
+    """
+    if not config.ha_control_enabled:
+        return "Music is unavailable; Home Assistant is not connected."
+    base = config.ha_mcp_url.split("/mcp_server")[0]
+    hdr = {"Authorization": f"Bearer {config.ha_token}", "Content-Type": "application/json"}
+    # Only MA media_player entities accept music_assistant.play_media. Get their
+    # ids via a template, then read friendly names from /api/states.
+    tmpl = (
+        "{{ integration_entities('music_assistant') "
+        "| select('match','media_player') | list | to_json }}"
+    )
+    players: dict = {}  # entity_id -> friendly_name
+    try:
+        req = urllib.request.Request(
+            base + "/api/template", data=json.dumps({"template": tmpl}).encode(), headers=hdr
+        )
+        ma_ids = set(json.loads(urllib.request.urlopen(req, timeout=8).read()))
+        states = json.load(
+            urllib.request.urlopen(
+                urllib.request.Request(base + "/api/states", headers=hdr), timeout=8
+            )
+        )
+        for s in states:
+            if s["entity_id"] in ma_ids:
+                players[s["entity_id"]] = s.get("attributes", {}).get("friendly_name")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("MA player lookup failed: %s", e)
+
+    avail = ", ".join(sorted(n for n in players.values() if n)) or "no speakers"
+    if speaker:
+        sp = speaker.lower()
+        target = next(
+            (eid for eid, name in players.items() if name and (name.lower() in sp or sp in name.lower())),
+            None,
+        )
+        if target is None:
+            # A speaker was named but didn't match — don't silently play on the
+            # wrong one; tell the user what's available.
+            return f"I couldn't find a speaker called {speaker}. Available: {avail}."
+    else:
+        target = config.music_player  # no speaker named -> default
+    if not target:
+        return f"Which speaker should I use? Available: {avail}."
+    try:
+        body = json.dumps({"entity_id": target, "media_id": query}).encode()
+        urllib.request.urlopen(
+            urllib.request.Request(
+                base + "/api/services/music_assistant/play_media", data=body, headers=hdr
+            ),
+            timeout=20,
+        )
+        return f"Playing {query}."
+    except Exception as e:  # noqa: BLE001
+        logger.warning("play_music failed: %s", e)
+        return "Sorry, I couldn't start the music."
+
+
 async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     """Run one OpenAI session until it dies or reaches max age, then tear down."""
     service = await build_agent(config, mcp)
@@ -109,8 +173,16 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             except Exception:  # noqa: BLE001
                 logger.exception("end_conversation: failed to signal device")
 
+    async def _play_music(params):  # noqa: ANN001
+        args = params.arguments or {}
+        msg = await asyncio.to_thread(
+            _start_music, config, args.get("query", ""), args.get("speaker")
+        )
+        await params.result_callback(msg)
+
     service.register_function("get_weather", _get_weather)
     service.register_function("end_conversation", _end_conversation)
+    service.register_function("play_music", _play_music)
 
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(

@@ -39,6 +39,28 @@ CUSTOM_TOOLS = [
     },
     {
         "type": "function",
+        "name": "play_music",
+        "description": (
+            "Play music on a speaker via Music Assistant (Spotify). ALWAYS use "
+            "this for any request to play music, a song, artist, album, genre, or "
+            "playlist (e.g. 'play some jazz', 'play Miles Davis on the Den'). Do "
+            "NOT use the generic media search tool for music. Pass what to play as "
+            "`query` and the speaker name (e.g. 'Den') as `speaker`."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to play, e.g. 'relaxing jazz'"},
+                "speaker": {
+                    "type": "string",
+                    "description": "Speaker name, e.g. 'Den'. Optional; defaults to the main speaker.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
         "name": "end_conversation",
         "description": (
             "End the conversation and stop listening. Call this when the user "
