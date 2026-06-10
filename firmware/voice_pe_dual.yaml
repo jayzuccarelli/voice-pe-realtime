@@ -1813,34 +1813,39 @@ micro_wake_word:
               condition:
                 lambda: 'std::string w=wake_word; for(auto&c:w)c=tolower(c); return w.find("mycroft")!=std::string::npos;'
               then:
-                # Mutual exclusion: HA Assist (native voice_assistant) and this
-                # websocket session share one mic + one speaker. Stop the native
-                # pipeline (and any prior websocket session) before starting, or
-                # they fight over the speaker (no audio / hard lock).
-                - if:
-                    condition:
-                      voice_assistant.is_running:
-                    then:
-                      - voice_assistant.stop:
+                # If a realtime session is ALREADY live, ignore the wake word
+                # entirely: the mic is streaming (full duplex), so the user can
+                # just talk — and a stop/start here kills the in-flight turn.
+                # Spurious mid-session wake fires (bot audio / ambient tripping
+                # the detector) were producing 5 reconnects in 18s, each one
+                # cutting off the reply (diagnosed 2026-06-02).
                 - if:
                     condition:
                       voice_assistant_websocket.is_running: vaws
-                    then:
-                      - voice_assistant_websocket.stop: vaws
-                      - delay: 200ms
-                # Do NOT stop micro_wake_word: it owns the shared microphone, and
-                # stopping it cuts the audio feed the websocket component needs.
-                # Play the same wake cue as Hey Jarvis.
-                - if:
-                    condition:
-                      switch.is_on: wake_sound
-                    then:
-                      - script.execute:
-                          id: play_sound
-                          priority: true
-                          sound_file: "wake_word_triggered_sound"
-                      - delay: 300ms
-                - voice_assistant_websocket.start: vaws
+                    then: []
+                    else:
+                      # Mutual exclusion: HA Assist (native voice_assistant) and this
+                      # websocket session share one mic + one speaker. Stop the native
+                      # pipeline before starting, or they fight over the speaker
+                      # (no audio / hard lock).
+                      - if:
+                          condition:
+                            voice_assistant.is_running:
+                          then:
+                            - voice_assistant.stop:
+                      # Do NOT stop micro_wake_word: it owns the shared microphone, and
+                      # stopping it cuts the audio feed the websocket component needs.
+                      # Play the same wake cue as Hey Jarvis.
+                      - if:
+                          condition:
+                            switch.is_on: wake_sound
+                          then:
+                            - script.execute:
+                                id: play_sound
+                                priority: true
+                                sound_file: "wake_word_triggered_sound"
+                            - delay: 300ms
+                      - voice_assistant_websocket.start: vaws
               else:
                 - script.execute: start_ha_assist
 
