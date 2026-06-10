@@ -22,10 +22,31 @@ from pipecat.services.openai.realtime.events import (
     TurnDetection,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.processors.aggregators.llm_context import LLMContext
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+
+class VoicePERealtimeService(OpenAIRealtimeLLMService):
+    """Realtime service tuned for a server-VAD voice device.
+
+    Upstream's _handle_context treats the FIRST context frame as conversation
+    setup: it replays the context as conversation items and issues a bare
+    response.create. With server_vad the audio commit already created the user
+    item and auto-created the response, so that double-fires — OpenAI rejects
+    it (conversation_already_has_active_response) and Pipecat treats any error
+    event as fatal, killing the session's receive loop. Conversation state
+    lives server-side here; the only thing context frames must deliver is new
+    tool results (_process_completed_function_calls sends them and triggers
+    its own response.create).
+    """
+
+    async def _handle_context(self, context: LLMContext) -> None:
+        self._context = context
+        self._llm_needs_conversation_setup = False
+        await self._process_completed_function_calls(send_new_results=True)
 
 # Custom broker tools, registered with handlers by the server.
 CUSTOM_TOOLS = [
@@ -132,7 +153,7 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
         tools=tools or None,
     )
 
-    service = OpenAIRealtimeLLMService(
+    service = VoicePERealtimeService(
         api_key=config.openai_api_key,
         model=config.model,
         session_properties=session,
