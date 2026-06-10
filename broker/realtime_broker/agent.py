@@ -74,6 +74,32 @@ CUSTOM_TOOLS = [
 ]
 
 
+def build_audio_input(config: Config, threshold: float) -> AudioInput:
+    """Full audio.input block for session.create AND mid-session updates.
+
+    Always send the complete block: session.update may replace nested objects
+    wholesale, so a partial update could silently drop noise reduction or
+    transcription.
+    """
+    return AudioInput(
+        turn_detection=TurnDetection(
+            type="server_vad",
+            threshold=threshold,
+            prefix_padding_ms=config.vad_prefix_padding_ms,
+            silence_duration_ms=config.vad_silence_duration_ms,
+        ),
+        # Far-field mic: filter speaker bleed / room noise BEFORE VAD,
+        # so the threshold can stay low enough to hear a normal voice
+        # without the bot's own output tripping it (choppiness).
+        noise_reduction=InputAudioNoiseReduction(type="far_field"),
+        # DEBUG: surface what OpenAI thinks the user said so we can
+        # diagnose self-trigger / "janky" behavior from broker logs.
+        # whisper-1: gpt-4o-transcribe yielded zero transcription
+        # events on gpt-realtime-2.
+        transcription=InputAudioTranscription(model="whisper-1"),
+    )
+
+
 async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLLMService:
     """Create a configured OpenAI Realtime service, with HA + custom tools."""
     tools: list[dict] = []
@@ -100,23 +126,7 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
     session = SessionProperties(
         instructions=config.instructions,
         audio=AudioConfiguration(
-            input=AudioInput(
-                turn_detection=TurnDetection(
-                    type="server_vad",
-                    threshold=config.vad_threshold,
-                    prefix_padding_ms=config.vad_prefix_padding_ms,
-                    silence_duration_ms=config.vad_silence_duration_ms,
-                ),
-                # Far-field mic: filter speaker bleed / room noise BEFORE VAD,
-                # so the threshold can stay low enough to hear a normal voice
-                # without the bot's own output tripping it (choppiness).
-                noise_reduction=InputAudioNoiseReduction(type="far_field"),
-                # DEBUG: surface what OpenAI thinks the user said so we can
-                # diagnose self-trigger / "janky" behavior from broker logs.
-                # whisper-1: gpt-4o-transcribe yielded zero transcription
-                # events on gpt-realtime-2.
-                transcription=InputAudioTranscription(model="whisper-1"),
-            ),
+            input=build_audio_input(config, config.vad_threshold),
             output=AudioOutput(voice=config.voice),
         ),
         tools=tools or None,
