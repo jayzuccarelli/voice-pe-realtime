@@ -18,6 +18,7 @@ import json
 import logging
 import urllib.request
 
+from pipecat.frames.frames import Frame, TranscriptionFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
@@ -25,6 +26,7 @@ from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.websocket.server import (
     WebsocketServerParams,
     WebsocketServerTransport,
@@ -36,6 +38,16 @@ from .config import Config
 from .serializer import RawPCMSerializer
 
 logger = logging.getLogger(__name__)
+
+
+class _UserTranscriptLogger(FrameProcessor):
+    """DEBUG: log what OpenAI thinks the user said (requires input transcription)."""
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TranscriptionFrame):
+            logger.info("USER TRANSCRIPT: %r", frame.text)
+        await self.push_frame(frame, direction)
 
 
 async def run(config: Config) -> None:
@@ -188,6 +200,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     pipeline = Pipeline(
         [
             transport.input(),
+            _UserTranscriptLogger(),
             aggregator.user(),
             service,
             aggregator.assistant(),

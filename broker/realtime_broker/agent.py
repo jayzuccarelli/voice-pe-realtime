@@ -16,6 +16,7 @@ from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
     AudioOutput,
+    InputAudioTranscription,
     SessionProperties,
     TurnDetection,
 )
@@ -104,7 +105,10 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
                     threshold=config.vad_threshold,
                     prefix_padding_ms=config.vad_prefix_padding_ms,
                     silence_duration_ms=config.vad_silence_duration_ms,
-                )
+                ),
+                # DEBUG: surface what OpenAI thinks the user said so we can
+                # diagnose self-trigger / "janky" behavior from broker logs.
+                transcription=InputAudioTranscription(model="gpt-4o-transcribe"),
             ),
             output=AudioOutput(voice=config.voice),
         ),
