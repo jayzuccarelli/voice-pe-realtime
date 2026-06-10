@@ -179,8 +179,12 @@ void VoiceAssistantWebSocket::dump_config() {
 }
 
 void VoiceAssistantWebSocket::start() {
-  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
-    ESP_LOGW(TAG, "Already running");
+  // Guard STARTING too: a second wake during the ~1s connect window would
+  // otherwise tear down the in-flight websocket client (spurious "stopped"
+  // tone + 5s reconnect stall) instead of just being ignored.
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING ||
+      this->state_ == VOICE_ASSISTANT_WEBSOCKET_STARTING) {
+    ESP_LOGW(TAG, "Already running or starting");
     return;
   }
   
@@ -526,8 +530,10 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   // human could also cross. Ch1 is quieter without AGC, so apply the same 4x
   // software gain micro_wake_word uses on this channel, hard-clamped.
   for (size_t i = 0; i < stereo_32bit_samples; i++) {
-    int32_t ns_sample = stereo_32bit[i * 2 + 1] >> 16;
-    int32_t amplified = ns_sample * 4;
+    // >>14 == (sample >> 16) * 4 but keeps 2 more bits of precision from the
+    // 32-bit sample (esphome treats the full word as Q31; micro_wake_word's
+    // gain_factor path effectively does the same math).
+    int32_t amplified = stereo_32bit[i * 2 + 1] >> 14;
     if (amplified > INT16_MAX) amplified = INT16_MAX;
     if (amplified < INT16_MIN) amplified = INT16_MIN;
     mono_16bit[i] = static_cast<int16_t>(amplified);
@@ -629,6 +635,11 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       this->reconnect_attempts_ = 0;
       this->reconnect_pending_ = false;
       this->last_audio_send_ = millis();
+      // Arm the inactivity auto-stop from connect, not from first speaker
+      // audio: a session whose broker never sends a single chunk would
+      // otherwise stay RUNNING forever, and the wake-word guard would
+      // silently swallow every "Hey Mycroft" with no way to recover.
+      this->last_speaker_audio_time_ = millis();
       
       if (this->state_callback_) {
         this->state_callback_(this->state_);

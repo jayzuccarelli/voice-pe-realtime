@@ -19,11 +19,12 @@ import logging
 import urllib.request
 
 from pipecat.frames.frames import (
-    BotStartedSpeakingFrame,
-    BotStoppedSpeakingFrame,
+    CancelFrame,
+    EndFrame,
     Frame,
     InterruptionFrame,
     TranscriptionFrame,
+    TTSAudioRawFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -50,114 +51,121 @@ logger = logging.getLogger(__name__)
 
 
 class _UserTranscriptLogger(FrameProcessor):
-    """DEBUG: log what OpenAI thinks the user said (requires input transcription)."""
+    """DEBUG: log what OpenAI thinks the user said (requires input transcription).
+
+    Consumes the TranscriptionFrame instead of re-pushing it. If one reaches
+    the user aggregator upstream, the aggregator emulates VAD (a spurious
+    pipeline interruption) and then pushes a context frame that makes the
+    service double-fire response.create — OpenAI rejects it
+    (conversation_already_has_active_response) and Pipecat treats any error
+    event as fatal, silently killing the session's receive loop. Nothing
+    upstream of here needs the transcript, so log it and stop it.
+    """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, TranscriptionFrame):
+        if isinstance(frame, TranscriptionFrame) and direction == FrameDirection.UPSTREAM:
             logger.info("USER TRANSCRIPT: %r", frame.text)
+            return
         await self.push_frame(frame, direction)
 
 
-class _AdaptiveVadGate(FrameProcessor):
-    """Raise OpenAI's VAD threshold while the bot is speaking.
+class _BotPlaybackGate(FrameProcessor):
+    """Gate barge-in flushes and the OpenAI VAD threshold on DEVICE playback.
 
-    The XMOS AEC leaves enough residual of the bot's own voice in the mic feed
-    to trip server_vad at any threshold a normal-volume user can also cross
-    (measured: bleed trips 0.6, user is inaudible at 0.7+). No single static
-    threshold works, so switch per state: sensitive while idle, strict while
-    the bot has the floor. Barge-in still works — it just needs a slightly
-    raised voice, which is how people interrupt anyway.
+    Two jobs, both keyed to whether the device speaker is audibly playing bot
+    speech:
 
-    The threshold is restored only after vad_release_delay_ms of continuous
-    silence, because the device buffers ~1s of audio and keeps bleeding echo
-    after the broker has stopped sending.
+    1. Adaptive VAD: the XMOS AEC leaves enough residual of the bot's own
+       voice in the mic feed to trip server_vad at any threshold a
+       normal-volume user can also cross (measured: bleed trips 0.6, user is
+       inaudible at 0.7+). So: sensitive threshold while idle, strict while
+       the bot has the floor. Barge-in still works — it just needs a slightly
+       raised voice.
+
+    2. Barge-in flush: on a real interruption, tell the device to drop its
+       speaker queue ({"type":"interrupt"}) so the cutoff is crisp. Pipecat
+       also emits InterruptionFrame at turn boundaries when nothing is
+       playing; flushing then would mask the first 500ms of the next reply
+       (the firmware's INTERRUPT_IGNORE_AUDIO_MS window), so flush only while
+       playback is live.
+
+    Why model playback instead of using BotStarted/StoppedSpeakingFrame: the
+    output transport paces audio to the device at 2x realtime and BotStopped
+    fires when the SEND queue drains — for an N-second reply the device still
+    holds up to N/2 seconds in its own buffer at that moment. Summing the
+    duration of the audio frames we forward gives the actual time the speaker
+    goes quiet.
     """
 
-    def __init__(self, service, config: Config) -> None:  # noqa: ANN001
+    def __init__(self, service, config: Config, get_ws) -> None:  # noqa: ANN001
         super().__init__()
         self._service = service
         self._config = config
-        self._speaking = False
-        self._release_task: asyncio.Task | None = None
+        self._get_ws = get_ws
+        self._playback_end = 0.0  # event-loop time when the speaker goes quiet
+        self._threshold = config.vad_threshold
+        self._restore_task: asyncio.Task | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, BotStartedSpeakingFrame):
-            if self._release_task is not None:
-                self._release_task.cancel()
-                self._release_task = None
-            if not self._speaking:
-                self._speaking = True
-                await self._set_threshold(self._config.vad_threshold_speaking)
-        elif isinstance(frame, BotStoppedSpeakingFrame) and self._speaking:
-            self._speaking = False
-            if self._release_task is not None:
-                self._release_task.cancel()
-            self._release_task = asyncio.create_task(self._release_later())
+        if isinstance(frame, TTSAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+            now = asyncio.get_running_loop().time()
+            duration = len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
+            self._playback_end = max(self._playback_end, now) + duration
+            await self._set_threshold(self._config.vad_threshold_speaking)
+            if self._restore_task is None:
+                self._restore_task = self.create_task(self._restore_when_quiet())
+        elif isinstance(frame, InterruptionFrame) and direction == FrameDirection.DOWNSTREAM:
+            await self._maybe_flush_device()
+        elif isinstance(frame, (CancelFrame, EndFrame)):
+            if self._restore_task is not None:
+                task, self._restore_task = self._restore_task, None
+                await self.cancel_task(task)
         await self.push_frame(frame, direction)
 
-    async def _release_later(self) -> None:
-        await asyncio.sleep(self._config.vad_release_delay_ms / 1000)
+    async def _restore_when_quiet(self) -> None:
+        delay = self._config.vad_release_delay_ms / 1000
+        loop = asyncio.get_running_loop()
+        while True:
+            wait = self._playback_end + delay - loop.time()
+            if wait <= 0:
+                break
+            await asyncio.sleep(wait)
+        # Clear BEFORE the await below: an audio frame racing the restore then
+        # starts a fresh restore task and re-raises the threshold after us.
+        self._restore_task = None
         await self._set_threshold(self._config.vad_threshold)
 
-    async def _set_threshold(self, threshold: float) -> None:
+    async def _maybe_flush_device(self) -> None:
+        now = asyncio.get_running_loop().time()
+        if now >= self._playback_end:
+            return  # nothing audibly playing; boundary interruption, not barge-in
+        ws = self._get_ws()
+        if ws is None:
+            return
         try:
-            await self._service.send_client_event(
-                oai_events.SessionUpdateEvent(
-                    session=oai_events.SessionProperties(
-                        audio=oai_events.AudioConfiguration(
-                            input=build_audio_input(self._config, threshold)
-                        )
+            await ws.send('{"type":"interrupt"}')
+        except Exception:  # noqa: BLE001
+            logger.exception("barge-in: failed to signal device")
+            return
+        self._playback_end = now  # device drops its queue on the flush
+        logger.info("barge-in: signaled device to flush speaker")
+
+    async def _set_threshold(self, threshold: float) -> None:
+        if threshold == self._threshold:
+            return
+        self._threshold = threshold
+        await self._service.send_client_event(
+            oai_events.SessionUpdateEvent(
+                session=oai_events.SessionProperties(
+                    audio=oai_events.AudioConfiguration(
+                        input=build_audio_input(self._config, threshold)
                     )
                 )
             )
-            logger.info("adaptive VAD: threshold -> %s", threshold)
-        except Exception:  # noqa: BLE001
-            logger.exception("adaptive VAD: session.update failed")
-
-
-class _DeviceInterruptNotifier(FrameProcessor):
-    """On barge-in, tell the device to flush its speaker buffer immediately.
-
-    When the user talks over the bot, Pipecat cancels the OpenAI response and
-    emits InterruptionFrame downstream — but the device has its own ~1s audio
-    queue that would keep playing the old reply. The firmware already handles
-    a {"type":"interrupt"} text frame (stop speaker, clear queue, briefly
-    ignore in-flight audio); this just pulls that trigger so the cutoff is
-    crisp. We guard on _bot_speaking because Pipecat also emits
-    InterruptionFrame at session/turn boundaries when no bot speech is in
-    flight, and flushing then would mask the first 500ms of the next reply.
-    """
-
-    def __init__(self, get_ws) -> None:  # noqa: ANN001
-        super().__init__()
-        self._get_ws = get_ws
-        self._bot_speaking = False
-
-    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        await super().process_frame(frame, direction)
-        # Track bot speech state via upstream BotStarted/StoppedSpeakingFrame.
-        if isinstance(frame, BotStartedSpeakingFrame):
-            self._bot_speaking = True
-        elif isinstance(frame, BotStoppedSpeakingFrame):
-            self._bot_speaking = False
-        # A downstream InterruptionFrame WHILE the bot is speaking is a real
-        # barge-in. Pipecat also emits InterruptionFrame at session/turn
-        # boundaries when the bot isn't speaking — flushing the device then
-        # would mask the first 500 ms of the next reply (the firmware's
-        # INTERRUPT_IGNORE_AUDIO_MS window), so we guard on _bot_speaking.
-        elif (isinstance(frame, InterruptionFrame)
-              and direction == FrameDirection.DOWNSTREAM
-              and self._bot_speaking):
-            ws = self._get_ws()
-            if ws is not None:
-                try:
-                    await ws.send('{"type":"interrupt"}')
-                    logger.info("barge-in: signaled device to flush speaker")
-                except Exception:  # noqa: BLE001
-                    logger.exception("interrupt notify: failed to signal device")
-        await self.push_frame(frame, direction)
+        )
+        logger.info("adaptive VAD: threshold -> %s", threshold)
 
 
 async def run(config: Config) -> None:
@@ -306,24 +314,22 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     service.register_function("end_conversation", _end_conversation)
     service.register_function("play_music", _play_music)
 
-    interrupt_notifier = _DeviceInterruptNotifier(
-        lambda: getattr(transport.input(), "_websocket", None)
+    gate = _BotPlaybackGate(
+        service, config, lambda: getattr(transport.input(), "_websocket", None)
     )
-    vad_gate = _AdaptiveVadGate(service, config)
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(
         [
             transport.input(),
             aggregator.user(),
             # The realtime service pushes user TranscriptionFrames UPSTREAM
-            # (Pipecat >= 0.0.92) and the user aggregator consumes them
-            # without re-pushing, so the only place that sees them is
-            # between the aggregator and the service.
+            # (Pipecat >= 0.0.92); the logger must sit between the aggregator
+            # and the service so it can intercept (and consume) them before
+            # the aggregator reacts to them — see _UserTranscriptLogger.
             _UserTranscriptLogger(),
             service,
             aggregator.assistant(),
-            interrupt_notifier,
-            vad_gate,
+            gate,
             transport.output(),
         ]
     )
@@ -360,11 +366,21 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
                 break
             except asyncio.TimeoutError:
                 pass
+            # Two death modes: the socket itself dies (idle drop — keepalive
+            # flips the state within ~40s), or Pipecat's receive loop exits on
+            # an OpenAI error event while the socket stays OPEN (brain-dead
+            # session: audio goes in, nothing comes back).
             ws = getattr(service, "_websocket", None)
-            if ws is None or ws.state is not State.OPEN:
+            receiver = getattr(service, "_receive_task", None)
+            if (
+                ws is None
+                or ws.state is not State.OPEN
+                or (receiver is not None and receiver.done())
+            ):
                 logger.warning(
-                    "OpenAI socket dead (state=%s); rotating now",
+                    "OpenAI session dead (ws state=%s, receiver done=%s); rotating now",
                     getattr(ws, "state", None),
+                    receiver.done() if receiver is not None else None,
                 )
                 break
     finally:

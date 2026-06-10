@@ -81,7 +81,10 @@ async def main() -> None:
                 else:
                     print(f"  <-- TEXT FRAME: {msg[:200]}")
                     state["text_frames"].append(msg)
-                    if "interrupt" in msg:
+                    # Only count interrupt frames that arrive AFTER we sent
+                    # the interruptor — an early one is a spurious boundary
+                    # flush (a bug), not a successful barge-in.
+                    if "interrupt" in msg and interrupt_sent.is_set():
                         state["interrupt_frame"] = True
                         state["interrupt_frame_t"] = time.monotonic()
 
