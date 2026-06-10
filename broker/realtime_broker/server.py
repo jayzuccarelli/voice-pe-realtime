@@ -38,8 +38,10 @@ from pipecat.transports.websocket.server import (
     WebsocketServerTransport,
 )
 
+from pipecat.services.openai.realtime import events as oai_events
+
 from . import mcp_client
-from .agent import build_agent
+from .agent import build_agent, build_audio_input
 from .config import Config
 from .serializer import RawPCMSerializer
 
@@ -54,6 +56,64 @@ class _UserTranscriptLogger(FrameProcessor):
         if isinstance(frame, TranscriptionFrame):
             logger.info("USER TRANSCRIPT: %r", frame.text)
         await self.push_frame(frame, direction)
+
+
+class _AdaptiveVadGate(FrameProcessor):
+    """Raise OpenAI's VAD threshold while the bot is speaking.
+
+    The XMOS AEC leaves enough residual of the bot's own voice in the mic feed
+    to trip server_vad at any threshold a normal-volume user can also cross
+    (measured: bleed trips 0.6, user is inaudible at 0.7+). No single static
+    threshold works, so switch per state: sensitive while idle, strict while
+    the bot has the floor. Barge-in still works — it just needs a slightly
+    raised voice, which is how people interrupt anyway.
+
+    The threshold is restored only after vad_release_delay_ms of continuous
+    silence, because the device buffers ~1s of audio and keeps bleeding echo
+    after the broker has stopped sending.
+    """
+
+    def __init__(self, service, config: Config) -> None:  # noqa: ANN001
+        super().__init__()
+        self._service = service
+        self._config = config
+        self._speaking = False
+        self._release_task: asyncio.Task | None = None
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, BotStartedSpeakingFrame):
+            if self._release_task is not None:
+                self._release_task.cancel()
+                self._release_task = None
+            if not self._speaking:
+                self._speaking = True
+                await self._set_threshold(self._config.vad_threshold_speaking)
+        elif isinstance(frame, BotStoppedSpeakingFrame) and self._speaking:
+            self._speaking = False
+            if self._release_task is not None:
+                self._release_task.cancel()
+            self._release_task = asyncio.create_task(self._release_later())
+        await self.push_frame(frame, direction)
+
+    async def _release_later(self) -> None:
+        await asyncio.sleep(self._config.vad_release_delay_ms / 1000)
+        await self._set_threshold(self._config.vad_threshold)
+
+    async def _set_threshold(self, threshold: float) -> None:
+        try:
+            await self._service.send_client_event(
+                oai_events.SessionUpdateEvent(
+                    session=oai_events.SessionProperties(
+                        audio=oai_events.AudioConfiguration(
+                            input=build_audio_input(self._config, threshold)
+                        )
+                    )
+                )
+            )
+            logger.info("adaptive VAD: threshold -> %s", threshold)
+        except Exception:  # noqa: BLE001
+            logger.exception("adaptive VAD: session.update failed")
 
 
 class _DeviceInterruptNotifier(FrameProcessor):
@@ -248,6 +308,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     interrupt_notifier = _DeviceInterruptNotifier(
         lambda: getattr(transport.input(), "_websocket", None)
     )
+    vad_gate = _AdaptiveVadGate(service, config)
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(
         [
@@ -259,6 +320,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             service,
             aggregator.assistant(),
             interrupt_notifier,
+            vad_gate,
             transport.output(),
         ]
     )
