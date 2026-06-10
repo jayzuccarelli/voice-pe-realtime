@@ -28,6 +28,14 @@ class Config:
     vad_threshold: float = 0.5
     vad_prefix_padding_ms: int = 300
     vad_silence_duration_ms: int = 500
+    # Adaptive VAD: while the bot is speaking, residual echo of its own voice
+    # (XMOS AEC leaves it at roughly 0.6-0.7 equivalent at the mic) would trip
+    # the idle threshold and chop every reply. Raise the bar while the bot has
+    # the floor; barge-in then just needs a slightly raised voice. The release
+    # delay covers the device's ~1s speaker buffer, which keeps bleeding echo
+    # after the broker has finished sending audio.
+    vad_threshold_speaking: float = 0.85
+    vad_release_delay_ms: int = 1200
 
     # OpenAI caps a Realtime session at 60 min. Proactively rotate a bit before
     # that so the broker never hits the fatal expiry. The device is turn-based,
@@ -56,5 +64,7 @@ class Config:
             vad_threshold=float(os.environ.get("VAD_THRESHOLD", "0.5")),
             vad_prefix_padding_ms=int(os.environ.get("VAD_PREFIX_PADDING_MS", "300")),
             vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "500")),
+            vad_threshold_speaking=float(os.environ.get("VAD_THRESHOLD_SPEAKING", "0.85")),
+            vad_release_delay_ms=int(os.environ.get("VAD_RELEASE_DELAY_MS", "1200")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
         )
