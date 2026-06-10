@@ -1769,10 +1769,11 @@ voice_assistant_websocket:
   on_stopped:
     - lambda: 'id(voice_assistant_phase) = ${voice_assist_idle_phase_id};'
     - script.execute: control_leds
-    # End cue: same chime as the wake word so the user hears the realtime
-    # session stopped listening. on_stopped is what fires for both "bye bye"
-    # (broker disconnect) and the inactivity auto-stop. Small delay lets the
-    # component finish releasing the shared speaker before we play the chime.
+    # End cue: descending "disconnected" tone so the user can hear the
+    # difference between "starting to listen" (wake chime) and "stopped
+    # listening" (this one). on_stopped fires for both "bye bye" (broker
+    # disconnect) and the inactivity auto-stop. Small delay lets the
+    # component finish releasing the shared speaker before we play the cue.
     - if:
         condition:
           switch.is_on: wake_sound
@@ -1781,7 +1782,7 @@ voice_assistant_websocket:
           - script.execute:
               id: play_sound
               priority: true
-              sound_file: "wake_word_triggered_sound"
+              sound_file: "jack_disconnected_sound"
 
 micro_wake_word:
   id: mww

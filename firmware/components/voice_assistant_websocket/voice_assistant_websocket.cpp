@@ -498,12 +498,13 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   if (!this->is_connected() || this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     return;
   }
-  
-  // Block microphone audio if bot is currently speaking
-  if (this->is_bot_speaking()) {
-    return;  // Don't send microphone audio while bot is speaking
-  }
-  
+
+  // Full-duplex barge-in: keep streaming the mic WHILE the bot speaks so OpenAI's
+  // server VAD can hear the user and interrupt. The Voice PE's XMOS XU316 does
+  // hardware AEC, so the bot's own playback is cancelled before it reaches here.
+  // (If self-triggering shows up, the fix is VAD threshold / noise reduction on
+  // the broker side, not re-gating the mic — gating it back makes barge-in impossible.)
+
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
   // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
   // Convert: 32-bit stereo -> 16-bit mono (16kHz) -> resample to 24kHz
