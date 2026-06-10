@@ -37,6 +37,7 @@ from pipecat.transports.websocket.server import (
     WebsocketServerParams,
     WebsocketServerTransport,
 )
+from websockets.protocol import State
 
 from pipecat.services.openai.realtime import events as oai_events
 
@@ -337,12 +338,35 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
 
     task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
     runner_task = asyncio.create_task(PipelineRunner().run(task))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + config.max_session_seconds
     try:
-        # Whichever comes first: the session dies on its own, or it ages out.
-        await asyncio.wait_for(asyncio.shield(runner_task), config.max_session_seconds)
-        logger.warning("Pipeline ended on its own; rebuilding session")
-    except asyncio.TimeoutError:
-        logger.info("Session reached max age (%ds); rotating", config.max_session_seconds)
+        # Whichever comes first: the session dies on its own, it ages out, or
+        # the OpenAI socket dies underneath it. OpenAI drops idle Realtime
+        # sockets well before our max-age rotation, and Pipecat keeps the
+        # stale handle and pumps audio into it — the device hears silence
+        # until the next rotation. Poll the socket and rotate the moment it
+        # goes dead (websockets' keepalive flips state within ~40s).
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.info(
+                    "Session reached max age (%ds); rotating", config.max_session_seconds
+                )
+                break
+            try:
+                await asyncio.wait_for(asyncio.shield(runner_task), min(15, remaining))
+                logger.warning("Pipeline ended on its own; rebuilding session")
+                break
+            except asyncio.TimeoutError:
+                pass
+            ws = getattr(service, "_websocket", None)
+            if ws is None or ws.state is not State.OPEN:
+                logger.warning(
+                    "OpenAI socket dead (state=%s); rotating now",
+                    getattr(ws, "state", None),
+                )
+                break
     finally:
         if not runner_task.done():
             await task.cancel()
