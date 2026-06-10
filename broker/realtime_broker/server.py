@@ -252,11 +252,11 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     pipeline = Pipeline(
         [
             transport.input(),
+            # The realtime service pushes user TranscriptionFrames UPSTREAM
+            # (Pipecat >= 0.0.92), so the logger must sit before it.
+            _UserTranscriptLogger(),
             aggregator.user(),
             service,
-            # Downstream of the service: user TranscriptionFrames are emitted
-            # BY the realtime service, so the logger must sit after it.
-            _UserTranscriptLogger(),
             aggregator.assistant(),
             interrupt_notifier,
             transport.output(),

@@ -16,6 +16,7 @@ from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
     AudioOutput,
+    InputAudioNoiseReduction,
     InputAudioTranscription,
     SessionProperties,
     TurnDetection,
@@ -106,9 +107,15 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
                     prefix_padding_ms=config.vad_prefix_padding_ms,
                     silence_duration_ms=config.vad_silence_duration_ms,
                 ),
+                # Far-field mic: filter speaker bleed / room noise BEFORE VAD,
+                # so the threshold can stay low enough to hear a normal voice
+                # without the bot's own output tripping it (choppiness).
+                noise_reduction=InputAudioNoiseReduction(type="far_field"),
                 # DEBUG: surface what OpenAI thinks the user said so we can
                 # diagnose self-trigger / "janky" behavior from broker logs.
-                transcription=InputAudioTranscription(model="gpt-4o-transcribe"),
+                # whisper-1: gpt-4o-transcribe yielded zero transcription
+                # events on gpt-realtime-2.
+                transcription=InputAudioTranscription(model="whisper-1"),
             ),
             output=AudioOutput(voice=config.voice),
         ),
