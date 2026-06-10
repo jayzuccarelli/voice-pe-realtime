@@ -519,9 +519,18 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   const int32_t *stereo_32bit = reinterpret_cast<const int32_t *>(data.data());
   int16_t *mono_16bit = this->mono_buffer_.data();
   
+  // Use the RIGHT slot = XMOS channel 1 = AEC+IC+NS tap (no AGC). Channel 0
+  // is the AGC tap: AGC re-amplifies the AEC residual of our own playback
+  // back up to speech level (echo RMS ~4 post-AEC vs ~1868 post-AGC), which
+  // made the bot's own voice trip OpenAI's server VAD at any threshold a
+  // human could also cross. Ch1 is quieter without AGC, so apply the same 4x
+  // software gain micro_wake_word uses on this channel, hard-clamped.
   for (size_t i = 0; i < stereo_32bit_samples; i++) {
-    int32_t left_sample = stereo_32bit[i * 2];
-    mono_16bit[i] = static_cast<int16_t>((left_sample >> 16));
+    int32_t ns_sample = stereo_32bit[i * 2 + 1] >> 16;
+    int32_t amplified = ns_sample * 4;
+    if (amplified > INT16_MAX) amplified = INT16_MAX;
+    if (amplified < INT16_MIN) amplified = INT16_MIN;
+    mono_16bit[i] = static_cast<int16_t>(amplified);
   }
   
   // Resample from 16kHz to 24kHz (1.5x upsampling)
