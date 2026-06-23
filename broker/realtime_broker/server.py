@@ -334,17 +334,25 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         ]
     )
 
+    loop = asyncio.get_running_loop()
+    device_connected = False
+    idle_since = loop.time()
+
     @transport.event_handler("on_client_connected")
     async def _on_connect(_transport, client):  # noqa: ANN001
+        nonlocal device_connected
+        device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnect(_transport, client, *args):  # noqa: ANN001
+        nonlocal device_connected, idle_since
+        device_connected = False
+        idle_since = loop.time()
         logger.info("Device disconnected")
 
     task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
     runner_task = asyncio.create_task(PipelineRunner().run(task))
-    loop = asyncio.get_running_loop()
     deadline = loop.time() + config.max_session_seconds
     try:
         # Whichever comes first: the session dies on its own, it ages out, or
@@ -353,15 +361,30 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         # stale handle and pumps audio into it — the device hears silence
         # until the next rotation. Poll the socket and rotate the moment it
         # goes dead (websockets' keepalive flips state within ~40s).
+        #
+        # Both age-based rotations only fire while no device is connected:
+        # rotating mid-conversation kicks the device off (it happened live,
+        # 2026-06-10 23:46). A conversation can outlive max age by at most
+        # its own length; OpenAI's 60-min hard cap is the backstop, and the
+        # dead-socket check below catches that.
         while True:
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                logger.info(
-                    "Session reached max age (%ds); rotating", config.max_session_seconds
-                )
-                break
+            now = loop.time()
+            if not device_connected:
+                if now >= deadline:
+                    logger.info(
+                        "Session reached max age (%ds); rotating",
+                        config.max_session_seconds,
+                    )
+                    break
+                if now - idle_since >= config.idle_refresh_seconds:
+                    logger.info(
+                        "Idle session refresh (no device for %ds); rotating",
+                        int(now - idle_since),
+                    )
+                    break
+            timeout = min(15.0, deadline - now) if now < deadline else 15.0
             try:
-                await asyncio.wait_for(asyncio.shield(runner_task), min(15, remaining))
+                await asyncio.wait_for(asyncio.shield(runner_task), timeout)
                 logger.warning("Pipeline ended on its own; rebuilding session")
                 break
             except asyncio.TimeoutError:
