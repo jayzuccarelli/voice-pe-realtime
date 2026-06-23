@@ -42,6 +42,12 @@ class Config:
     # so a rotation between turns is invisible.
     max_session_seconds: int = 3000  # 50 min
 
+    # An idle Realtime session goes stale server-side WITHOUT the socket dying:
+    # a 47-min-old session accepted audio and returned nothing while ws.state
+    # stayed OPEN (2026-06-10). Refresh the session whenever no device has been
+    # connected for this long — free, and invisible to the user.
+    idle_refresh_seconds: int = 600  # 10 min
+
     @property
     def ha_control_enabled(self) -> bool:
         return bool(self.ha_mcp_url and self.ha_token)
@@ -67,4 +73,5 @@ class Config:
             vad_threshold_speaking=float(os.environ.get("VAD_THRESHOLD_SPEAKING", "0.85")),
             vad_release_delay_ms=int(os.environ.get("VAD_RELEASE_DELAY_MS", "1200")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
+            idle_refresh_seconds=int(os.environ.get("IDLE_REFRESH_SECONDS", "600")),
         )
