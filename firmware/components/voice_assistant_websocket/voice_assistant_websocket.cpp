@@ -179,12 +179,8 @@ void VoiceAssistantWebSocket::dump_config() {
 }
 
 void VoiceAssistantWebSocket::start() {
-  // Guard STARTING too: a second wake during the ~1s connect window would
-  // otherwise tear down the in-flight websocket client (spurious "stopped"
-  // tone + 5s reconnect stall) instead of just being ignored.
-  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING ||
-      this->state_ == VOICE_ASSISTANT_WEBSOCKET_STARTING) {
-    ESP_LOGW(TAG, "Already running or starting");
+  if (this->state_ == VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
+    ESP_LOGW(TAG, "Already running");
     return;
   }
   
@@ -502,13 +498,12 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   if (!this->is_connected() || this->state_ != VOICE_ASSISTANT_WEBSOCKET_RUNNING) {
     return;
   }
-
-  // Full-duplex barge-in: keep streaming the mic WHILE the bot speaks so OpenAI's
-  // server VAD can hear the user and interrupt. The Voice PE's XMOS XU316 does
-  // hardware AEC, so the bot's own playback is cancelled before it reaches here.
-  // (If self-triggering shows up, the fix is VAD threshold / noise reduction on
-  // the broker side, not re-gating the mic — gating it back makes barge-in impossible.)
-
+  
+  // Block microphone audio if bot is currently speaking
+  if (this->is_bot_speaking()) {
+    return;  // Don't send microphone audio while bot is speaking
+  }
+  
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
   // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
   // Convert: 32-bit stereo -> 16-bit mono (16kHz) -> resample to 24kHz
@@ -523,20 +518,9 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
   const int32_t *stereo_32bit = reinterpret_cast<const int32_t *>(data.data());
   int16_t *mono_16bit = this->mono_buffer_.data();
   
-  // Use the RIGHT slot = XMOS channel 1 = AEC+IC+NS tap (no AGC). Channel 0
-  // is the AGC tap: AGC re-amplifies the AEC residual of our own playback
-  // back up to speech level (echo RMS ~4 post-AEC vs ~1868 post-AGC), which
-  // made the bot's own voice trip OpenAI's server VAD at any threshold a
-  // human could also cross. Ch1 is quieter without AGC, so apply the same 4x
-  // software gain micro_wake_word uses on this channel, hard-clamped.
   for (size_t i = 0; i < stereo_32bit_samples; i++) {
-    // >>14 == (sample >> 16) * 4 but keeps 2 more bits of precision from the
-    // 32-bit sample (esphome treats the full word as Q31; micro_wake_word's
-    // gain_factor path effectively does the same math).
-    int32_t amplified = stereo_32bit[i * 2 + 1] >> 14;
-    if (amplified > INT16_MAX) amplified = INT16_MAX;
-    if (amplified < INT16_MIN) amplified = INT16_MIN;
-    mono_16bit[i] = static_cast<int16_t>(amplified);
+    int32_t left_sample = stereo_32bit[i * 2];
+    mono_16bit[i] = static_cast<int16_t>((left_sample >> 16));
   }
   
   // Resample from 16kHz to 24kHz (1.5x upsampling)
@@ -635,11 +619,6 @@ void VoiceAssistantWebSocket::handle_websocket_event_(esp_websocket_event_id_t e
       this->reconnect_attempts_ = 0;
       this->reconnect_pending_ = false;
       this->last_audio_send_ = millis();
-      // Arm the inactivity auto-stop from connect, not from first speaker
-      // audio: a session whose broker never sends a single chunk would
-      // otherwise stay RUNNING forever, and the wake-word guard would
-      // silently swallow every "Hey Mycroft" with no way to recover.
-      this->last_speaker_audio_time_ = millis();
       
       if (this->state_callback_) {
         this->state_callback_(this->state_);
