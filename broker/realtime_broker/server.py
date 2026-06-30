@@ -379,6 +379,15 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         nonlocal device_connected
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
+        # The device opens a fresh websocket per wake, but the OpenAI session is
+        # reused for context. Audio left uncommitted in OpenAI's input buffer
+        # when the previous connection dropped mid-stream gets committed on the
+        # next connect — transcribed as a stray 'Bye.'/'' and answered as a ghost
+        # turn before the real question. Drop that stale audio on every connect.
+        try:
+            await service.send_client_event(oai_events.InputAudioBufferClearEvent())
+        except Exception:  # noqa: BLE001
+            logger.exception("on_connect: failed to clear OpenAI input buffer")
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnect(_transport, client, *args):  # noqa: ANN001
