@@ -24,6 +24,7 @@ import statistics
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -39,6 +40,21 @@ SILENCE_1S = b"\x00\x00" * RATE
 # ----------------------------------------------------------------------------
 # OpenAI TTS / STT helpers (plain HTTP, no extra deps — matches existing tools)
 # ----------------------------------------------------------------------------
+def _send(req: urllib.request.Request, attempts: int = 4) -> bytes:
+    """POST with retry — OpenAI's audio endpoints occasionally blip (429/5xx,
+    even a transient 404). A flaky API call must not fail a scenario."""
+    delay = 1.0
+    for n in range(attempts):
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.read()
+        except (urllib.error.HTTPError, urllib.error.URLError) as e:
+            if n == attempts - 1:
+                raise
+            time.sleep(delay)
+            delay *= 2
+
+
 def synth(text: str, voice: str = "alloy") -> bytes:
     """Text -> raw PCM16/24k/mono, the broker's exact input format."""
     req = urllib.request.Request(
@@ -49,8 +65,7 @@ def synth(text: str, voice: str = "alloy") -> bytes:
         }).encode(),
         headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read()
+    return _send(req)
 
 
 def _wav(pcm: bytes) -> bytes:
@@ -77,8 +92,7 @@ def transcribe(pcm: bytes) -> str:
         headers={"Authorization": f"Bearer {KEY}",
                  "Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read().decode().strip()
+    return _send(req).decode().strip()
 
 
 # ----------------------------------------------------------------------------
