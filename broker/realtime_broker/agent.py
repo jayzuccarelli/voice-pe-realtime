@@ -16,7 +16,6 @@ from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
     AudioOutput,
-    InputAudioNoiseReduction,
     InputAudioTranscription,
     SessionProperties,
     TurnDetection,
@@ -109,10 +108,13 @@ def build_audio_input(config: Config, threshold: float) -> AudioInput:
             prefix_padding_ms=config.vad_prefix_padding_ms,
             silence_duration_ms=config.vad_silence_duration_ms,
         ),
-        # Far-field mic: filter speaker bleed / room noise BEFORE VAD,
-        # so the threshold can stay low enough to hear a normal voice
-        # without the bot's own output tripping it (choppiness).
-        noise_reduction=InputAudioNoiseReduction(type="far_field"),
+        # No server-side noise reduction: the device streams the XMOS
+        # noise-suppressed, no-AGC mic tap (firmware "NS tap, ch1"), which is
+        # already clean but quiet. Re-applying OpenAI's far_field reduction on
+        # top scrubbed that quiet speech to nothing, so server_vad never fired
+        # (device connects, audio flows, no transcript, no reply). Leaving NR
+        # off lets the quiet-but-clean tap reach the VAD intact.
+        noise_reduction=None,
         # DEBUG: surface what OpenAI thinks the user said so we can
         # diagnose self-trigger / "janky" behavior from broker logs.
         # whisper-1: gpt-4o-transcribe yielded zero transcription
