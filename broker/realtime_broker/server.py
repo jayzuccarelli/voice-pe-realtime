@@ -22,6 +22,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    InputAudioRawFrame,
     InterruptionFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -166,6 +167,39 @@ class _BotPlaybackGate(FrameProcessor):
             )
         )
         logger.info("adaptive VAD: threshold -> %s", threshold)
+
+
+class _MicInputGate(FrameProcessor):
+    """Feed OpenAI silence while the device speaker is audibly playing.
+
+    The device streams its mic continuously (open for barge-in), but the XMOS
+    AEC leaves a residual of the bot's own voice in that feed. With no
+    server-side noise reduction (removed because it scrubbed the quiet NS-tap
+    mic to nothing), that residual is loud enough for server_vad to read as
+    user speech, so the bot answers its own echo in a runaway loop. While the
+    speaker is playing — tracked by the playback gate's buffer-accurate model,
+    plus the VAD release margin — replace the incoming mic audio with silence
+    so OpenAI has nothing to trigger on. This makes the assistant turn-based;
+    real barge-in needs echo cancellation, not just an open mic.
+    """
+
+    def __init__(self, gate: "_BotPlaybackGate", config: Config) -> None:
+        super().__init__()
+        self._gate = gate
+        self._config = config
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+            now = asyncio.get_running_loop().time()
+            release = self._config.vad_release_delay_ms / 1000
+            if now < self._gate._playback_end + release:
+                frame = InputAudioRawFrame(
+                    audio=bytes(len(frame.audio)),
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
+                )
+        await self.push_frame(frame, direction)
 
 
 async def run(config: Config) -> None:
@@ -317,10 +351,12 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     gate = _BotPlaybackGate(
         service, config, lambda: getattr(transport.input(), "_websocket", None)
     )
+    mic_gate = _MicInputGate(gate, config)
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(
         [
             transport.input(),
+            mic_gate,
             aggregator.user(),
             # The realtime service pushes user TranscriptionFrames UPSTREAM
             # (Pipecat >= 0.0.92); the logger must sit between the aggregator
