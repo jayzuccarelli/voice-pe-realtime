@@ -191,7 +191,7 @@ class _MicInputGate(FrameProcessor):
     pre-roll/echo tail so her first real input is the actual command.
     """
 
-    POST_CONNECT_MUTE_S = 1.2
+    POST_CONNECT_MUTE_S = 0.0  # disabled: ate the real command; ghost handled elsewhere
 
     def __init__(self, gate: "_BotPlaybackGate", config: Config) -> None:
         super().__init__()
