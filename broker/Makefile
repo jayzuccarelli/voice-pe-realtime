@@ -1,4 +1,4 @@
-# Domus realtime broker — reliability harness.
+# voice-pe realtime broker — reliability harness.
 #
 # `make check` drives the broker end-to-end (synthesizes speech, streams it like
 # the firmware, transcribes the reply, asserts content + latency). Needs
@@ -8,7 +8,7 @@
 # broker is single-client, so pointing this at :8765 kicks the device.
 #
 #   make check                       # against ws://127.0.0.1:8766
-#   make check WS=ws://192.168.0.44:8765   # against the live broker (kicks puck)
+#   make check WS=ws://<broker-ip>:8765    # against the live broker (kicks puck)
 #   make soak N=10                   # repeat the suite N times for flake/latency
 
 WS ?= ws://127.0.0.1:8766

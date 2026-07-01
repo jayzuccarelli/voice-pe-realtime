@@ -1,4 +1,4 @@
-"""End-to-end reliability harness for the Domus realtime broker.
+"""End-to-end reliability harness for the voice-pe realtime broker.
 
 Drives the broker exactly like the Voice PE firmware does — streams PCM16 /
 24 kHz / mono speech up the WebSocket in 20 ms frames with trailing silence —
@@ -79,7 +79,7 @@ def transcribe(pcm: bytes) -> str:
     """PCM16/24k -> text via Whisper. '' if there's no speech."""
     if len(pcm) < RATE:  # < 0.5s, nothing worth sending
         return ""
-    boundary = "----domusharness"
+    boundary = "----voicepeharness"
     body = bytearray()
     for key, val in (("model", "whisper-1"), ("response_format", "text")):
         body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\""
@@ -255,7 +255,7 @@ SCENARIOS = {
 
 
 async def run(url: str, soak: int = 1) -> int:
-    print(f"== Domus broker reliability harness -> {url} ==")
+    print(f"== voice-pe broker reliability harness -> {url} ==")
     if soak > 1:
         print(f"   soak mode: {soak} rounds")
     results: list[tuple[str, bool, str, float | None]] = []
