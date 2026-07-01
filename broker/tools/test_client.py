@@ -1,4 +1,4 @@
-"""Hardware-free test client for the Domus Realtime broker.
+"""Hardware-free test client for the voice-pe realtime broker.
 
 Mimics what the Voice PE firmware does: stream PCM16/24k/mono speech up the
 WebSocket, then receive the response audio back as binary frames. No device

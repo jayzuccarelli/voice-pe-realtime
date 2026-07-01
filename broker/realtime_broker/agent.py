@@ -16,14 +16,36 @@ from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
     AudioOutput,
+    InputAudioTranscription,
     SessionProperties,
     TurnDetection,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+from pipecat.processors.aggregators.llm_context import LLMContext
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+
+class VoicePERealtimeService(OpenAIRealtimeLLMService):
+    """Realtime service tuned for a server-VAD voice device.
+
+    Upstream's _handle_context treats the FIRST context frame as conversation
+    setup: it replays the context as conversation items and issues a bare
+    response.create. With server_vad the audio commit already created the user
+    item and auto-created the response, so that double-fires — OpenAI rejects
+    it (conversation_already_has_active_response) and Pipecat treats any error
+    event as fatal, killing the session's receive loop. Conversation state
+    lives server-side here; the only thing context frames must deliver is new
+    tool results (_process_completed_function_calls sends them and triggers
+    its own response.create).
+    """
+
+    async def _handle_context(self, context: LLMContext) -> None:
+        self._context = context
+        self._llm_needs_conversation_setup = False
+        await self._process_completed_function_calls(send_new_results=True)
 
 # Custom broker tools, registered with handlers by the server.
 CUSTOM_TOOLS = [
@@ -69,7 +91,65 @@ CUSTOM_TOOLS = [
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "type": "function",
+        "name": "wait_for_user",
+        "description": (
+            "Call this when the most recent audio is NOT a request addressed to "
+            "you: a TV or other media, a side conversation between other people, "
+            "background chatter, or any speech not directed at the assistant. "
+            "Calling it means stay silent and keep listening. Produce no spoken "
+            "reply when you call it."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
 ]
+
+# Appended to the configured persona instructions. This device is far-field and
+# its mic hears the whole room (TV, other people), so the model must gate on
+# whether speech is actually addressed to it — the OpenAI-recommended pattern
+# for rejecting non-addressed speech (there is no speaker separation at the API
+# layer).
+BACKGROUND_GUIDANCE = (
+    " IMPORTANT: You are a far-field home assistant; your microphone picks up the "
+    "whole room. Only respond to speech clearly addressed to you. If the audio is "
+    "a TV or other media, a side conversation between other people, background "
+    "chatter, or any speech not directed at you, call the wait_for_user function "
+    "and stay silent. Do not narrate that you are waiting."
+)
+
+
+def build_audio_input(config: Config, threshold: float) -> AudioInput:
+    """Full audio.input block for session.create AND mid-session updates.
+
+    Always send the complete block: session.update may replace nested objects
+    wholesale, so a partial update could silently drop noise reduction or
+    transcription.
+    """
+    return AudioInput(
+        turn_detection=TurnDetection(
+            type="server_vad",
+            threshold=threshold,
+            prefix_padding_ms=config.vad_prefix_padding_ms,
+            silence_duration_ms=config.vad_silence_duration_ms,
+        ),
+        # No server-side noise reduction: the device streams the XMOS
+        # noise-suppressed, no-AGC mic tap (firmware "NS tap, ch1"), which is
+        # already clean but quiet. Re-applying OpenAI's far_field reduction on
+        # top scrubbed that quiet speech to nothing, so server_vad never fired
+        # (device connects, audio flows, no transcript, no reply). Leaving NR
+        # off lets the quiet-but-clean tap reach the VAD intact.
+        noise_reduction=None,
+        # Optionally transcribe each user turn so broker logs show what OpenAI
+        # heard (self-trigger / "janky" diagnosis). Off by default — it bills a
+        # Whisper pass per turn. whisper-1 because gpt-4o-transcribe yielded
+        # zero transcription events on gpt-realtime.
+        transcription=(
+            InputAudioTranscription(model="whisper-1")
+            if config.debug_transcription
+            else None
+        ),
+    )
 
 
 async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLLMService:
@@ -96,22 +176,15 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
     tools.extend(CUSTOM_TOOLS)
 
     session = SessionProperties(
-        instructions=config.instructions,
+        instructions=config.instructions + BACKGROUND_GUIDANCE,
         audio=AudioConfiguration(
-            input=AudioInput(
-                turn_detection=TurnDetection(
-                    type="server_vad",
-                    threshold=config.vad_threshold,
-                    prefix_padding_ms=config.vad_prefix_padding_ms,
-                    silence_duration_ms=config.vad_silence_duration_ms,
-                )
-            ),
+            input=build_audio_input(config, config.vad_threshold),
             output=AudioOutput(voice=config.voice),
         ),
         tools=tools or None,
     )
 
-    service = OpenAIRealtimeLLMService(
+    service = VoicePERealtimeService(
         api_key=config.openai_api_key,
         model=config.model,
         session_properties=session,
