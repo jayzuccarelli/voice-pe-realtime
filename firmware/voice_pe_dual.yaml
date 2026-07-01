@@ -1736,7 +1736,7 @@ external_components:
       ref: dev
     components:
       - voice_kit
-    refresh: 0s
+    refresh: 365d
   # Realtime-broker websocket bridge (this project)
   - source:
       type: local
@@ -1769,10 +1769,11 @@ voice_assistant_websocket:
   on_stopped:
     - lambda: 'id(voice_assistant_phase) = ${voice_assist_idle_phase_id};'
     - script.execute: control_leds
-    # End cue: same chime as the wake word so the user hears the realtime
-    # session stopped listening. on_stopped is what fires for both "bye bye"
-    # (broker disconnect) and the inactivity auto-stop. Small delay lets the
-    # component finish releasing the shared speaker before we play the chime.
+    # End cue: a soft "mute off" tone (distinct from the wake chime) so the
+    # user hears the realtime session stopped listening. on_stopped is what
+    # fires for both "bye bye" (broker disconnect) and the inactivity
+    # auto-stop. Small delay lets the component finish releasing the shared
+    # speaker before we play the cue.
     - if:
         condition:
           switch.is_on: wake_sound
@@ -1781,7 +1782,7 @@ voice_assistant_websocket:
           - script.execute:
               id: play_sound
               priority: true
-              sound_file: "wake_word_triggered_sound"
+              sound_file: "mute_switch_off_sound"
 
 micro_wake_word:
   id: mww
@@ -1791,10 +1792,9 @@ micro_wake_word:
     gain_factor: 4
   stop_after_detection: false
   models:
-    - model: https://github.com/kahrendt/microWakeWord/releases/download/okay_nabu_20241226.3/okay_nabu.json
-      id: okay_nabu
-    - model: hey_jarvis
-      id: hey_jarvis
+    # Single wake word -> realtime broker. The dual-mode build (okay_nabu /
+    # hey_jarvis -> native HA Assist) is preserved in the archive/dual-2wake
+    # snapshot (tag dual-2wake-v0).
     - model: hey_mycroft
       id: hey_mycroft
     - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
@@ -1802,46 +1802,30 @@ micro_wake_word:
       internal: true
   vad:
   on_wake_word_detected:
-    # If the wake word is detected when the device is muted (Possible with the software mute switch): Do nothing
+    # Single wake word -> realtime broker (websocket). If muted, do nothing.
     - if:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # "Hey Mycroft" -> realtime broker (websocket). All other wake words -> HA Assist.
+          # Stop any prior websocket session before starting a new one (they
+          # share one mic + speaker). Do NOT stop micro_wake_word: it owns the
+          # shared microphone that the websocket component feeds from.
           - if:
               condition:
-                lambda: 'std::string w=wake_word; for(auto&c:w)c=tolower(c); return w.find("mycroft")!=std::string::npos;'
+                voice_assistant_websocket.is_running: vaws
               then:
-                # Mutual exclusion: HA Assist (native voice_assistant) and this
-                # websocket session share one mic + one speaker. Stop the native
-                # pipeline (and any prior websocket session) before starting, or
-                # they fight over the speaker (no audio / hard lock).
-                - if:
-                    condition:
-                      voice_assistant.is_running:
-                    then:
-                      - voice_assistant.stop:
-                - if:
-                    condition:
-                      voice_assistant_websocket.is_running: vaws
-                    then:
-                      - voice_assistant_websocket.stop: vaws
-                      - delay: 200ms
-                # Do NOT stop micro_wake_word: it owns the shared microphone, and
-                # stopping it cuts the audio feed the websocket component needs.
-                # Play the same wake cue as Hey Jarvis.
-                - if:
-                    condition:
-                      switch.is_on: wake_sound
-                    then:
-                      - script.execute:
-                          id: play_sound
-                          priority: true
-                          sound_file: "wake_word_triggered_sound"
-                      - delay: 300ms
-                - voice_assistant_websocket.start: vaws
-              else:
-                - script.execute: start_ha_assist
+                - voice_assistant_websocket.stop: vaws
+                - delay: 200ms
+          - if:
+              condition:
+                switch.is_on: wake_sound
+              then:
+                - script.execute:
+                    id: play_sound
+                    priority: true
+                    sound_file: "wake_word_triggered_sound"
+                - delay: 300ms
+          - voice_assistant_websocket.start: vaws
 
 select:
   - platform: template
@@ -1859,19 +1843,13 @@ select:
       # Sets specific wake word probabilities computed for each particular model
       # Note probability cutoffs are set as a quantized uint8 value, each comment has the corresponding floating point cutoff
       # False Accepts per Hour values are tested against all units and channels from the Dinner Party Corpus.
-      # These cutoffs apply only to the specific models included in the firmware: okay_nabu@20241226.3, hey_jarvis@v2, hey_mycroft@v2
+      # These cutoffs apply only to the specific model included in the firmware: hey_mycroft@v2
       lambda: |-
         if (x == "Slightly sensitive") {
-          id(okay_nabu).set_probability_cutoff(217);    // 0.85 -> 0.000 FAPH on DipCo (Manifest's default)
-          id(hey_jarvis).set_probability_cutoff(247);   // 0.97 -> 0.563 FAPH on DipCo (Manifest's default)
           id(hey_mycroft).set_probability_cutoff(253);  // 0.99 -> 0.567 FAPH on DipCo
         } else if (x == "Moderately sensitive") {
-          id(okay_nabu).set_probability_cutoff(176);    // 0.69 -> 0.376 FAPH on DipCo
-          id(hey_jarvis).set_probability_cutoff(235);   // 0.92 -> 0.939 FAPH on DipCo
           id(hey_mycroft).set_probability_cutoff(242);  // 0.95 -> 1.502 FAPH on DipCo (Manifest's default)
         } else if (x == "Very sensitive") {
-          id(okay_nabu).set_probability_cutoff(143);    // 0.56 -> 0.751 FAPH on DipCo
-          id(hey_jarvis).set_probability_cutoff(212);   // 0.83 -> 1.502 FAPH on DipCo
           id(hey_mycroft).set_probability_cutoff(237);  // 0.93 -> 1.878 FAPH on DipCo
         }
 
