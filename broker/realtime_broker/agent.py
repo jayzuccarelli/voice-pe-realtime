@@ -91,7 +91,32 @@ CUSTOM_TOOLS = [
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
+    {
+        "type": "function",
+        "name": "wait_for_user",
+        "description": (
+            "Call this when the most recent audio is NOT a request addressed to "
+            "you: a TV or other media, a side conversation between other people, "
+            "background chatter, or any speech not directed at the assistant. "
+            "Calling it means stay silent and keep listening. Produce no spoken "
+            "reply when you call it."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
 ]
+
+# Appended to the configured persona instructions. This device is far-field and
+# its mic hears the whole room (TV, other people), so the model must gate on
+# whether speech is actually addressed to it — the OpenAI-recommended pattern
+# for rejecting non-addressed speech (there is no speaker separation at the API
+# layer).
+BACKGROUND_GUIDANCE = (
+    " IMPORTANT: You are a far-field home assistant; your microphone picks up the "
+    "whole room. Only respond to speech clearly addressed to you. If the audio is "
+    "a TV or other media, a side conversation between other people, background "
+    "chatter, or any speech not directed at you, call the wait_for_user function "
+    "and stay silent. Do not narrate that you are waiting."
+)
 
 
 def build_audio_input(config: Config, threshold: float) -> AudioInput:
@@ -147,7 +172,7 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
     tools.extend(CUSTOM_TOOLS)
 
     session = SessionProperties(
-        instructions=config.instructions,
+        instructions=config.instructions + BACKGROUND_GUIDANCE,
         audio=AudioConfiguration(
             input=build_audio_input(config, config.vad_threshold),
             output=AudioOutput(voice=config.voice),

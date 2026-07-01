@@ -41,6 +41,7 @@ from pipecat.transports.websocket.server import (
 )
 from websockets.protocol import State
 
+from pipecat.services.llm_service import FunctionCallResultProperties
 from pipecat.services.openai.realtime import events as oai_events
 
 from . import mcp_client
@@ -355,9 +356,18 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         )
         await params.result_callback(msg)
 
+    async def _wait_for_user(params):  # noqa: ANN001
+        # Non-addressed speech (TV, side conversation, background). Acknowledge
+        # the call but suppress the follow-up response (run_llm=False) so the bot
+        # stays silent and keeps listening instead of replying to the room.
+        await params.result_callback(
+            "", properties=FunctionCallResultProperties(run_llm=False)
+        )
+
     service.register_function("get_weather", _get_weather)
     service.register_function("end_conversation", _end_conversation)
     service.register_function("play_music", _play_music)
+    service.register_function("wait_for_user", _wait_for_user)
 
     gate = _BotPlaybackGate(
         service, config, lambda: getattr(transport.input(), "_websocket", None)
