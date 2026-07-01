@@ -12,3 +12,6 @@ stock-voice-pe-backup.bin
 # harness / test audio artifacts
 *.wav
 *.pcm
+
+# internal ops runbook (not for public repo)
+SUNDAY_RUNBOOK.md
