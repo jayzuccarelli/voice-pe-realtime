@@ -140,11 +140,15 @@ def build_audio_input(config: Config, threshold: float) -> AudioInput:
         # (device connects, audio flows, no transcript, no reply). Leaving NR
         # off lets the quiet-but-clean tap reach the VAD intact.
         noise_reduction=None,
-        # DEBUG: surface what OpenAI thinks the user said so we can
-        # diagnose self-trigger / "janky" behavior from broker logs.
-        # whisper-1: gpt-4o-transcribe yielded zero transcription
-        # events on gpt-realtime-2.
-        transcription=InputAudioTranscription(model="whisper-1"),
+        # Optionally transcribe each user turn so broker logs show what OpenAI
+        # heard (self-trigger / "janky" diagnosis). Off by default — it bills a
+        # Whisper pass per turn. whisper-1 because gpt-4o-transcribe yielded
+        # zero transcription events on gpt-realtime.
+        transcription=(
+            InputAudioTranscription(model="whisper-1")
+            if config.debug_transcription
+            else None
+        ),
     )
 
 

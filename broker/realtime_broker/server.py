@@ -182,30 +182,19 @@ class _MicInputGate(FrameProcessor):
     plus the VAD release margin — replace the incoming mic audio with silence
     so OpenAI has nothing to trigger on. This makes the assistant turn-based;
     real barge-in needs echo cancellation, not just an open mic.
-
-    Also drops a short window of mic audio right after each device connect
-    (`mute_until`). The device opens a fresh websocket per wake and streams a
-    pre-roll (audio captured around wake detection) plus, often, the tail of the
-    previous reply still echoing in the room. server_vad endpoints that fragment
-    as a complete turn ('you', 'Bye.', '') and the bot answers a ghost before
-    the real question lands. Muting the first ~1.2s after connect drops the
-    pre-roll/echo tail so her first real input is the actual command.
     """
-
-    POST_CONNECT_MUTE_S = 0.0  # disabled: ate the real command; ghost handled elsewhere
 
     def __init__(self, gate: "_BotPlaybackGate", config: Config) -> None:
         super().__init__()
         self._gate = gate
         self._config = config
-        self.mute_until = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             now = asyncio.get_running_loop().time()
             release = self._config.vad_release_delay_ms / 1000
-            if now < self.mute_until or now < self._gate._playback_end + release:
+            if now < self._gate._playback_end + release:
                 frame = InputAudioRawFrame(
                     audio=bytes(len(frame.audio)),
                     sample_rate=frame.sample_rate,
@@ -238,7 +227,7 @@ def _fetch_weather(config: Config) -> str:
     base = config.ha_mcp_url.split("/mcp_server")[0]
     try:
         req = urllib.request.Request(
-            f"{base}/api/states/weather.forecast_home",
+            f"{base}/api/states/{config.weather_entity}",
             headers={"Authorization": f"Bearer {config.ha_token}"},
         )
         st = json.load(urllib.request.urlopen(req, timeout=8))
@@ -400,9 +389,6 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         nonlocal device_connected
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
-        # Drop the pre-roll / lingering-echo window right after connect so the
-        # bot doesn't answer a wake-tail fragment before the real question.
-        mic_gate.mute_until = loop.time() + _MicInputGate.POST_CONNECT_MUTE_S
         # The device opens a fresh websocket per wake, but the OpenAI session is
         # reused for context. Audio left uncommitted in OpenAI's input buffer
         # when the previous connection dropped mid-stream gets committed on the
