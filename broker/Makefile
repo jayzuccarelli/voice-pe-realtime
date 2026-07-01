@@ -15,9 +15,9 @@ WS ?= ws://127.0.0.1:8766
 N  ?= 5
 
 check:
-	uv run --with websockets broker/tools/harness.py $(WS)
+	uv run --with websockets tools/harness.py $(WS)
 
 soak:
-	uv run --with websockets broker/tools/harness.py $(WS) --soak $(N)
+	uv run --with websockets tools/harness.py $(WS) --soak $(N)
 
 .PHONY: check soak
