@@ -1,9 +1,9 @@
-"""Hardware-free barge-in test for the Domus broker.
+"""Hardware-free barge-in test for the voice-pe broker.
 
 Streams a question, lets the bot start a long reply, then streams an
 INTERRUPTING utterance mid-reply. Proves the broker-side barge-in chain:
 device-mic audio (mid-response) -> OpenAI server VAD -> Pipecat interrupt ->
-_DeviceInterruptNotifier sends {"type":"interrupt"} (which THIS client receives
+_BotPlaybackGate sends {"type":"interrupt"} (which THIS client receives
 as a text frame). No Voice PE device, no human voice needed.
 
 Does NOT test echo/self-trigger (acoustic) or the firmware gate (device-side).
