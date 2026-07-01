@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Flash the dual-mode firmware to a Voice PE connected to THIS machine via USB-C.
+# Flash the single-wake firmware to a Voice PE connected to THIS machine via USB-C.
 # Backs up the stock firmware first (your undo button), then flashes.
 #
 #   ./flash.sh <serial-port>      # e.g. ./flash.sh /dev/ttyACM1
@@ -24,9 +24,9 @@ echo ">> Verifying it's an ESP32-S3 (not some other serial device)..."
 echo ">> [1/2] Backing up stock firmware (16 MB) -> stock-voice-pe-backup.bin"
 "${RUN[@]}" --baud 460800 read_flash 0 0x1000000 /config/stock-voice-pe-backup.bin
 
-echo ">> [2/2] Flashing dual-mode firmware"
+echo ">> [2/2] Flashing firmware"
 "${RUN[@]}" --baud 460800 write_flash 0x0 "/config/$BIN"
 
 echo ">> Done. Device reboots, joins WiFi, connects to the broker."
 echo ">> Adopt it in Home Assistant (ESPHome integration) with the key in secrets.yaml."
-echo ">> Test: 'Hey Mycroft' (realtime) and 'Hey Jarvis' (HA Assist)."
+echo ">> Test: say 'Hey Mycroft', then talk (routes to the realtime broker)."
