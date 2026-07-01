@@ -226,6 +226,23 @@ async def s_reconnect(url):
     return ok, f"reconnect reply={t!r}", r2.first_audio_ms
 
 
+async def s_background_rejection(url):
+    # After a real turn, stream speech that is NOT addressed to the assistant
+    # (TV / news / side conversation). It should stay silent (wait_for_user),
+    # not answer the room. Approximates the "responds to the TV" failure.
+    async with session(url) as c:
+        r1 = await c.ask("In one short sentence, what is the capital of France?")
+        if not r1.got_audio:
+            return False, "first (addressed) turn got no audio", r1.first_audio_ms
+        bg = ("And coming up next on the evening news at eleven, the city council "
+              "voted today to approve the new downtown transit budget. More on that "
+              "story after the break.")
+        r2 = await c.ask(bg, voice="echo")
+        t2 = r2.transcript().lower() if r2.got_audio else ""
+        ok = not r2.got_audio
+        return ok, f"bg_reply={r2.seconds:.1f}s want0 {t2[:50]!r}", None
+
+
 SCENARIOS = {
     "capital_qa": s_capital,
     "follow_up_multiturn": s_follow_up,
@@ -233,6 +250,7 @@ SCENARIOS = {
     "no_reply_to_silence": s_no_reply_to_silence,
     "no_ghost_on_connect": s_no_ghost_on_connect,
     "reconnect": s_reconnect,
+    "background_rejection": s_background_rejection,
 }
 
 
