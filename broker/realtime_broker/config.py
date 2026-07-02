@@ -29,16 +29,20 @@ class Config:
     # Off by default: it adds per-turn cost and is only useful for development.
     debug_transcription: bool = False
 
-    # OpenAI server-side VAD turn detection.
+    # OpenAI server-side VAD turn detection. 800ms end-of-turn silence (up
+    # from OpenAI's 500ms default): with a TV on, 500ms cut real questions at
+    # mid-sentence pauses and the fragments read as background speech. Costs
+    # +0.3s response latency per turn.
     vad_threshold: float = 0.5
     vad_prefix_padding_ms: int = 300
-    vad_silence_duration_ms: int = 500
+    vad_silence_duration_ms: int = 800
     # Adaptive VAD: while the bot is speaking, residual echo of its own voice
     # (XMOS AEC leaves it at roughly 0.6-0.7 equivalent at the mic) would trip
     # the idle threshold and chop every reply. Raise the bar while the bot has
     # the floor; barge-in then just needs a slightly raised voice. The release
-    # delay covers the device's ~1s speaker buffer, which keeps bleeding echo
-    # after the broker has finished sending audio.
+    # delay covers the device's speaker buffer (hard-bounded at ~740ms:
+    # 10-chunk send queue + 3x100ms rings), which keeps bleeding echo after
+    # the broker has finished sending audio.
     vad_threshold_speaking: float = 0.85
     vad_release_delay_ms: int = 1200
 
@@ -77,7 +81,7 @@ class Config:
             in ("1", "true", "yes"),
             vad_threshold=float(os.environ.get("VAD_THRESHOLD", "0.5")),
             vad_prefix_padding_ms=int(os.environ.get("VAD_PREFIX_PADDING_MS", "300")),
-            vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "500")),
+            vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "800")),
             vad_threshold_speaking=float(os.environ.get("VAD_THRESHOLD_SPEAKING", "0.85")),
             vad_release_delay_ms=int(os.environ.get("VAD_RELEASE_DELAY_MS", "1200")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
