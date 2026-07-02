@@ -169,6 +169,10 @@ class _BotPlaybackGate(FrameProcessor):
         if threshold == self._threshold:
             return
         self._threshold = threshold
+        await self._send_vad(threshold)
+        logger.info("adaptive VAD: threshold -> %s", threshold)
+
+    async def _send_vad(self, threshold: float | None) -> None:
         await self._service.send_client_event(
             oai_events.SessionUpdateEvent(
                 session=oai_events.SessionProperties(
@@ -178,7 +182,30 @@ class _BotPlaybackGate(FrameProcessor):
                 )
             )
         )
-        logger.info("adaptive VAD: threshold -> %s", threshold)
+
+    async def reset_vad(self) -> None:
+        """Discard server VAD state after a device disconnect.
+
+        Clearing the input buffer removes the audio BYTES but not the VAD
+        state machine: when the device vanishes mid-utterance, server_vad
+        still holds speech-started, and once post-reconnect silence gives it
+        its window it commits whatever is buffered — the tail fragment that
+        drained from the pipeline after the clear, or nothing at all — and
+        auto-creates a response. The model greets the ghost turn ("I'm here
+        when you're ready"; soak 2026-07-02, 5/5 then 2/6 with a delayed
+        clear alone). Disabling turn detection makes the server drop the
+        pending segment; then let the stale pipeline tail drain, wipe the
+        buffer, and re-enable at the current threshold. Safe window: a
+        reconnect needs a full wake-word ceremony, so no genuine speech
+        arrives within 400ms of a disconnect.
+        """
+        try:
+            await self._send_vad(None)
+            await asyncio.sleep(0.4)
+            await self._service.send_client_event(oai_events.InputAudioBufferClearEvent())
+            await self._send_vad(self._threshold)
+        except Exception:  # noqa: BLE001
+            logger.exception("disconnect: VAD reset failed")
 
 
 class _MicInputGate(FrameProcessor):
@@ -416,14 +443,14 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         device_connected = False
         idle_since = loop.time()
         logger.info("Device disconnected")
-        # Clear uncommitted mic audio NOW, while no more is arriving. The
-        # on-connect clear above lost a race with in-flight appends at least
-        # once (ghost 'Bye.' turn, TV test 2026-07-01 20:49): audio streamed
-        # after the clear but before the real question still got committed.
-        try:
-            await service.send_client_event(oai_events.InputAudioBufferClearEvent())
-        except Exception:  # noqa: BLE001
-            logger.exception("on_disconnect: failed to clear OpenAI input buffer")
+        # A disconnect mid-utterance leaves server VAD holding a
+        # speech-in-progress segment (plus mic-stream tail still draining
+        # through the pipeline). A buffer clear alone can't kill it — see
+        # _BotPlaybackGate.reset_vad, which disables and re-enables turn
+        # detection to drop the segment before it becomes a ghost turn
+        # (stray 'Bye.' in the TV test 2026-07-01; 'I'm here when you're
+        # ready' in the soak 2026-07-02).
+        asyncio.create_task(gate.reset_vad())
 
     task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
     runner_task = asyncio.create_task(PipelineRunner().run(task))

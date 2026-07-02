@@ -128,19 +128,27 @@ BACKGROUND_GUIDANCE = (
 )
 
 
-def build_audio_input(config: Config, threshold: float) -> AudioInput:
+def build_audio_input(config: Config, threshold: float | None) -> AudioInput:
     """Full audio.input block for session.create AND mid-session updates.
 
     Always send the complete block: session.update may replace nested objects
     wholesale, so a partial update could silently drop noise reduction or
     transcription.
+
+    threshold=None disables turn detection entirely (serialized as
+    turn_detection: null), which also discards the server's VAD state —
+    used to drop a speech-in-progress segment after a device disconnect.
     """
     return AudioInput(
-        turn_detection=TurnDetection(
-            type="server_vad",
-            threshold=threshold,
-            prefix_padding_ms=config.vad_prefix_padding_ms,
-            silence_duration_ms=config.vad_silence_duration_ms,
+        turn_detection=(
+            TurnDetection(
+                type="server_vad",
+                threshold=threshold,
+                prefix_padding_ms=config.vad_prefix_padding_ms,
+                silence_duration_ms=config.vad_silence_duration_ms,
+            )
+            if threshold is not None
+            else False
         ),
         # No server-side noise reduction: the device streams the XMOS
         # noise-suppressed, no-AGC mic tap (firmware "NS tap, ch1"), which is
