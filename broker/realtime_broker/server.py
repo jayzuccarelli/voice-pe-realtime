@@ -92,10 +92,11 @@ class _BotPlaybackGate(FrameProcessor):
        (the firmware's INTERRUPT_IGNORE_AUDIO_MS window), so flush only while
        playback is live.
 
-    Why model playback instead of using BotStarted/StoppedSpeakingFrame: the
-    output transport paces audio to the device at 2x realtime and BotStopped
-    fires when the SEND queue drains — for an N-second reply the device still
-    holds up to N/2 seconds in its own buffer at that moment. Summing the
+    Why model playback instead of using BotStarted/StoppedSpeakingFrame:
+    OpenAI delivers TTS audio faster than realtime, the output transport
+    paces it to the device at 1x, and the device buffers up to ~740ms more
+    (10-chunk send queue + 3x100ms ring buffers). BotStopped fires when the
+    SEND queue drains, while the speaker may still be audible. Summing the
     duration of the audio frames we forward gives the actual time the speaker
     goes quiet.
     """
@@ -108,6 +109,12 @@ class _BotPlaybackGate(FrameProcessor):
         self._playback_end = 0.0  # event-loop time when the speaker goes quiet
         self._threshold = config.vad_threshold
         self._restore_task: asyncio.Task | None = None
+        # Max (playback_end - now) seen during the current reply: how far the
+        # forwarded-audio schedule runs ahead of the speaker. OpenAI delivers
+        # faster than realtime, so anything correlating mic audio against
+        # forwarded TTS (the planned echo gate) must index by this schedule,
+        # not by arrival time. Logged per reply to size that misalignment.
+        self._max_backlog = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -115,6 +122,7 @@ class _BotPlaybackGate(FrameProcessor):
             now = asyncio.get_running_loop().time()
             duration = len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
             self._playback_end = max(self._playback_end, now) + duration
+            self._max_backlog = max(self._max_backlog, self._playback_end - now)
             await self._set_threshold(self._config.vad_threshold_speaking)
             if self._restore_task is None:
                 self._restore_task = self.create_task(self._restore_when_quiet())
@@ -137,6 +145,9 @@ class _BotPlaybackGate(FrameProcessor):
         # Clear BEFORE the await below: an audio frame racing the restore then
         # starts a fresh restore task and re-raises the threshold after us.
         self._restore_task = None
+        if self._max_backlog > 0:
+            logger.info("playback: max send-ahead backlog %.2fs this reply", self._max_backlog)
+            self._max_backlog = 0.0
         await self._set_threshold(self._config.vad_threshold)
 
     async def _maybe_flush_device(self) -> None:
@@ -405,6 +416,14 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         device_connected = False
         idle_since = loop.time()
         logger.info("Device disconnected")
+        # Clear uncommitted mic audio NOW, while no more is arriving. The
+        # on-connect clear above lost a race with in-flight appends at least
+        # once (ghost 'Bye.' turn, TV test 2026-07-01 20:49): audio streamed
+        # after the clear but before the real question still got committed.
+        try:
+            await service.send_client_event(oai_events.InputAudioBufferClearEvent())
+        except Exception:  # noqa: BLE001
+            logger.exception("on_disconnect: failed to clear OpenAI input buffer")
 
     task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
     runner_task = asyncio.create_task(PipelineRunner().run(task))
