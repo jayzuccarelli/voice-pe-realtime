@@ -312,14 +312,15 @@ SCENARIOS = {
 }
 
 
-async def run(url: str, soak: int = 1) -> int:
+async def run(url: str, soak: int = 1, only: str | None = None) -> int:
     print(f"== voice-pe broker reliability harness -> {url} ==")
     if soak > 1:
         print(f"   soak mode: {soak} rounds")
+    scenarios = {only: SCENARIOS[only]} if only else SCENARIOS
     results: list[tuple[str, bool, str, float | None]] = []
     latencies: list[float] = []
     for rnd in range(soak):
-        for name, fn in SCENARIOS.items():
+        for name, fn in scenarios.items():
             label = f"{name}#{rnd + 1}" if soak > 1 else name
             t0 = time.monotonic()
             try:
@@ -349,7 +350,12 @@ def main() -> None:
     soak = 1
     if "--soak" in sys.argv:
         soak = int(sys.argv[sys.argv.index("--soak") + 1])
-    raise SystemExit(asyncio.run(run(url, soak)))
+    only = None
+    if "--only" in sys.argv:
+        only = sys.argv[sys.argv.index("--only") + 1]
+        if only not in SCENARIOS:
+            raise SystemExit(f"unknown scenario {only!r}; one of: {', '.join(SCENARIOS)}")
+    raise SystemExit(asyncio.run(run(url, soak, only)))
 
 
 if __name__ == "__main__":
