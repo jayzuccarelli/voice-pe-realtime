@@ -6,10 +6,13 @@ when broker Python actually changes. Exit 2 feeds the failure back to Claude
 so the loop cannot close on red.
 """
 import json
+import os
 import subprocess
 import sys
 
-REPO = "/home/jay/projects/voice-pe-realtime"
+# Repo root, derived from this file's location (<repo>/broker/tools/hook_check.py)
+# so the hook is portable — no hardcoded personal path.
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 data = json.load(sys.stdin)
 fp = (data.get("tool_input") or {}).get("file_path", "")
 if "/broker/" in fp and fp.endswith(".py"):
