@@ -4,6 +4,8 @@
 secrets.yaml
 __pycache__/
 *.pyc
+.venv/
+venv/
 .esphome/
 build/
 *.bin
