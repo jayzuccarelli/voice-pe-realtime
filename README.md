@@ -33,15 +33,15 @@ Speech-to-speech on a $59 puck is easy to demo and hard to keep up. This repo tr
 
 - **Session rotation** — OpenAI caps a Realtime session at ~60 min and treats expiry as fatal. The broker rotates the session *before* the cap (and rebuilds after any death) under a still-connected device, so long-lived pucks never drop. Proven continuous across forced rotations.
 - **Idle refresh** — a stale idle session (socket open, silently dead) is refreshed proactively.
-- **Turn hygiene** — the input buffer is cleared on connect (no ghost "Bye." turns), and background speech (a TV, a side conversation) is gated with the OpenAI-recommended `wait_for_user` pattern so the assistant answers *you*, not the room.
+- **Turn hygiene** — a device that vanishes mid-utterance (Wi-Fi blip, session timeout) leaves OpenAI's server VAD holding a speech-in-progress segment that would come back as a ghost turn on the next wake. Clearing the input buffer isn't enough (the bytes go, the VAD state doesn't); the broker disables and re-enables turn detection on disconnect to drop the segment for real. Background speech (a TV, a side conversation) is gated with the OpenAI-recommended `wait_for_user` pattern — with an explicit follow-up bias, so "are you sure about that?" right after an answer gets answered instead of ignored.
 - **A real test harness** — `make check` drives the broker end-to-end exactly like the firmware (streams PCM, transcribes the spoken reply, asserts content + first-audio latency). No hardware needed.
 
 ```bash
-cd broker && OPENAI_API_KEY=... make check          # 7 scenarios, pass/fail + p50/p95 latency
+cd broker && OPENAI_API_KEY=... make check          # 10 scenarios, pass/fail + p50/p95 latency
 cd broker && OPENAI_API_KEY=... make soak N=20      # repeat for flake/latency
 ```
 
-Scenarios: basic Q&A, multi-turn context, HA tool call, no-reply-to-silence, no-ghost-on-connect, reconnect, background-speech rejection. Point it at an isolated broker (`WS=ws://127.0.0.1:8766`) so it never kicks a live device.
+Scenarios: basic Q&A, multi-turn context, HA tool call, no-reply-to-silence, no-ghost-on-connect, reconnect, background-speech rejection, follow-up-challenge after an answer, TV-line-after-answer (false-accept counter-metric), mid-speech disconnect (ghost-turn regression). `--only <name>` runs one scenario. Point it at an isolated broker (`WS=ws://127.0.0.1:8766`) so it never kicks a live device.
 
 ## Quick start (broker)
 
@@ -89,7 +89,7 @@ The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmwa
 - ✅ Background-speech gating (`wait_for_user`)
 - ✅ End-to-end reliability harness (`make check`)
 - ⏳ **Smart routing** — one wake word, fast local intents handled on-device, everything else escalated to the LLM (the elegant form of "local + cloud")
-- ⏳ **Barge-in** — true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem)
+- ⏳ **Barge-in** — true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem — an echo-residual calibration rig ships in `broker/tools/`, see `M2_RUNBOOK.md`)
 - ⏳ **Beamforming** — tap the XMOS array's focused channel to reject off-axis room noise (a TV, another speaker)
 
 ## Prior art & focus
