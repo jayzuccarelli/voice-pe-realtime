@@ -46,6 +46,20 @@ class Config:
     vad_threshold_speaking: float = 0.85
     vad_release_delay_ms: int = 1200
 
+    # NCC echo gate (barge-in M1). While the bot speaks, correlate each mic
+    # window against the TTS audio actually scheduled on the speaker; echo
+    # residual scores high, a user talking over it does not.
+    #   off    — byte-identical to pre-gate behavior: mic is silence-fed for
+    #            the whole playback window (turn-based, no barge-in).
+    #   shadow — silence-feed unchanged (safe on a live house), but compute
+    #            and log per-window NCC so the gate calibrates at zero risk.
+    #   on     — pass mic audio during playback, silencing only windows that
+    #            correlate as echo (>= ncc_threshold). Barge-in.
+    ncc_gate: str = "off"
+    # Echo-vs-user decision threshold. Set from M2 real-residual calibration
+    # (tools/M2_RUNBOOK.md) before ever running "on".
+    ncc_threshold: float = 0.55
+
     # OpenAI caps a Realtime session at 60 min. Proactively rotate a bit before
     # that so the broker never hits the fatal expiry. The device is turn-based,
     # so a rotation between turns is invisible.
@@ -84,6 +98,8 @@ class Config:
             vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "800")),
             vad_threshold_speaking=float(os.environ.get("VAD_THRESHOLD_SPEAKING", "0.85")),
             vad_release_delay_ms=int(os.environ.get("VAD_RELEASE_DELAY_MS", "1200")),
+            ncc_gate=os.environ.get("NCC_GATE", "off"),
+            ncc_threshold=float(os.environ.get("NCC_THRESHOLD", "0.55")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
             idle_refresh_seconds=int(os.environ.get("IDLE_REFRESH_SECONDS", "600")),
         )

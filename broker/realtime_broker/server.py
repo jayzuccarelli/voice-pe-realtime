@@ -17,6 +17,9 @@ import asyncio
 import json
 import logging
 import urllib.request
+from collections import deque
+
+import numpy as np
 
 from pipecat.frames.frames import (
     CancelFrame,
@@ -47,7 +50,8 @@ from pipecat.services.openai.realtime import events as oai_events
 from . import mcp_client
 from .agent import build_agent, build_audio_input
 from .config import Config
-from .serializer import RawPCMSerializer
+from .ncc import max_ncc
+from .serializer import SAMPLE_RATE, RawPCMSerializer
 
 logger = logging.getLogger(__name__)
 
@@ -116,14 +120,23 @@ class _BotPlaybackGate(FrameProcessor):
         # forwarded TTS (the planned echo gate) must index by this schedule,
         # not by arrival time. Logged per reply to size that misalignment.
         self._max_backlog = 0.0
+        # Echo-gate reference ring: (schedule_start_time, pcm) per forwarded
+        # TTS frame, indexed by the playback schedule above — NOT arrival
+        # time. Read by _MicInputGate via ref_segment().
+        self.ref_ring: deque[tuple[float, bytes]] = deque()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, TTSAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             now = asyncio.get_running_loop().time()
             duration = len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
-            self._playback_end = max(self._playback_end, now) + duration
+            start = max(self._playback_end, now)
+            self._playback_end = start + duration
             self._max_backlog = max(self._max_backlog, self._playback_end - now)
+            if self._config.ncc_gate != "off":
+                self.ref_ring.append((start, frame.audio))
+                while self.ref_ring and self.ref_ring[0][0] < now - 6.0:
+                    self.ref_ring.popleft()
             await self._set_threshold(self._config.vad_threshold_speaking)
             if self._restore_task is None:
                 self._restore_task = self.create_task(self._restore_when_quiet())
@@ -164,7 +177,22 @@ class _BotPlaybackGate(FrameProcessor):
             logger.exception("barge-in: failed to signal device")
             return
         self._playback_end = now  # device drops its queue on the flush
+        # Flushed audio never reaches the speaker: drop its ring entries or
+        # the gate would keep matching mic audio against phantom echo.
+        while self.ref_ring and self.ref_ring[-1][0] > now:
+            self.ref_ring.pop()
         logger.info("barge-in: signaled device to flush speaker")
+
+    def ref_segment(self, t0: float, t1: float) -> np.ndarray | None:
+        """Forwarded-TTS audio scheduled to play anywhere inside [t0, t1]."""
+        parts = [
+            pcm
+            for start, pcm in self.ref_ring
+            if start + len(pcm) / (2 * SAMPLE_RATE) >= t0 and start <= t1
+        ]
+        if not parts:
+            return None
+        return np.frombuffer(b"".join(parts), np.int16).astype(np.float64)
 
     async def _set_threshold(self, threshold: float) -> None:
         if threshold == self._threshold:
@@ -233,36 +261,151 @@ class _BotPlaybackGate(FrameProcessor):
 
 
 class _MicInputGate(FrameProcessor):
-    """Feed OpenAI silence while the device speaker is audibly playing.
+    """Gate the mic feed while the device speaker is audibly playing.
 
     The device streams its mic continuously (open for barge-in), but the XMOS
     AEC leaves a residual of the bot's own voice in that feed. With no
     server-side noise reduction (removed because it scrubbed the quiet NS-tap
     mic to nothing), that residual is loud enough for server_vad to read as
-    user speech, so the bot answers its own echo in a runaway loop. While the
-    speaker is playing — tracked by the playback gate's buffer-accurate model,
-    plus the VAD release margin — replace the incoming mic audio with silence
-    so OpenAI has nothing to trigger on. This makes the assistant turn-based;
-    real barge-in needs echo cancellation, not just an open mic.
+    user speech, so the bot answers its own echo in a runaway loop.
+
+    NCC_GATE=off — replace all mic audio with silence for the whole playback
+    window (plus VAD release margin). Turn-based; the pre-gate behavior.
+
+    NCC_GATE=shadow — same silence-feed, but also correlate each 320ms mic
+    window against the TTS actually scheduled on the speaker (the playback
+    gate's ref_ring — schedule-indexed, because OpenAI delivers ~3x realtime
+    and an arrival-indexed ring misses echo on replies >4s) and log the
+    score. Zero behavior change; produces the would-open counts the shadow
+    soak needs.
+
+    NCC_GATE=on — pass mic audio through during playback, silencing only
+    audio whose window correlates as echo. Frames ride a 400ms delay line so
+    the verdict for each frame can use a completed analysis window (a short
+    barge word like "stop" must not be eaten before its window scores).
+    Windows the ring can't cover default to echo — fail toward the safe
+    turn-based behavior, never toward a self-trigger.
     """
+
+    WINDOW_S = 0.32
+    LOOKAHEAD_S = 0.40
 
     def __init__(self, gate: "_BotPlaybackGate", config: Config) -> None:
         super().__init__()
         self._gate = gate
         self._config = config
+        self._mode = config.ncc_gate
+        self._win = bytearray()
+        self._win_start: float | None = None
+        self._speak_since: float | None = None
+        self._scores: deque[tuple[float, float, bool]] = deque(maxlen=64)
+        self._delay: deque[tuple[float, InputAudioRawFrame]] = deque()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
-        if isinstance(frame, InputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
-            now = asyncio.get_running_loop().time()
-            release = self._config.vad_release_delay_ms / 1000
-            if now < self._gate._playback_end + release:
-                frame = InputAudioRawFrame(
-                    audio=bytes(len(frame.audio)),
-                    sample_rate=frame.sample_rate,
-                    num_channels=frame.num_channels,
-                )
+        if not (
+            isinstance(frame, InputAudioRawFrame)
+            and direction == FrameDirection.DOWNSTREAM
+        ):
+            await self.push_frame(frame, direction)
+            return
+
+        now = asyncio.get_running_loop().time()
+        release = self._config.vad_release_delay_ms / 1000
+        speaking = now < self._gate._playback_end + release
+
+        if speaking and self._mode != "off":
+            if self._speak_since is None:
+                self._speak_since = now
+            self._accumulate(frame, now)
+        elif not speaking:
+            self._speak_since = None
+
+        if self._mode == "on":
+            if speaking:
+                self._delay.append((now, frame))
+                while self._delay and now - self._delay[0][0] >= self.LOOKAHEAD_S:
+                    t0, f = self._delay.popleft()
+                    await self.push_frame(self._gated(f, t0), direction)
+                return
+            # Playback window over: whatever is still delayed is post-release
+            # tail — deliver it ungated, then this frame.
+            while self._delay:
+                _, f = self._delay.popleft()
+                await self.push_frame(f, direction)
+            self._win.clear()
+            self._win_start = None
+            await self.push_frame(frame, direction)
+            return
+
+        # off / shadow: silence-feed during playback (pre-gate behavior)
+        if speaking:
+            frame = InputAudioRawFrame(
+                audio=bytes(len(frame.audio)),
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
+        elif self._win:
+            self._win.clear()
+            self._win_start = None
         await self.push_frame(frame, direction)
+
+    def _accumulate(self, frame: InputAudioRawFrame, now: float) -> None:
+        if self._win_start is None:
+            self._win_start = now - len(frame.audio) / (2 * SAMPLE_RATE)
+        self._win.extend(frame.audio)
+        length_s = len(self._win) / (2 * SAMPLE_RATE)
+        if length_s >= self.WINDOW_S:
+            self._score_window(bytes(self._win), self._win_start, self._win_start + length_s)
+            self._win.clear()
+            self._win_start = None
+
+    def _score_window(self, pcm: bytes, t0: float, t1: float) -> None:
+        # The window that straddles playback onset mixes pre-reply silence
+        # with echo onset and scores low no matter what — it opened the gate
+        # to ~300ms of raw echo and self-triggered the bot (m1 dev test).
+        # Nobody barges into a reply's first 350ms; call it echo.
+        if self._speak_since is not None and t0 < self._speak_since + 0.35:
+            self._scores.append((t0, t1, True))
+            return
+        mic = np.frombuffer(pcm, np.int16).astype(np.float64)
+        # Generous slack around the schedule: network + device queue put the
+        # acoustic echo slightly behind the schedule clock, never ahead.
+        seg = self._gate.ref_segment(t0 - 0.9, t1 + 0.2)
+        ncc = None
+        if seg is not None and len(seg) >= len(mic):
+            ncc = max_ncc(mic, seg)
+        is_echo = ncc is None or ncc >= self._config.ncc_threshold
+        self._scores.append((t0, t1, is_echo))
+        if self._mode == "shadow":
+            rms = int(np.sqrt((mic * mic).mean()))
+            logger.info(
+                "ncc_gate shadow: ncc=%s rms=%d would_open=%s",
+                "n/a" if ncc is None else f"{ncc:.3f}",
+                rms,
+                not is_echo,
+            )
+
+    def _gated(self, frame: InputAudioRawFrame, t0: float) -> InputAudioRawFrame:
+        t1 = t0 + len(frame.audio) / (2 * SAMPLE_RATE)
+        covered = False
+        for ws_, we_, echo in self._scores:
+            if ws_ < t1 and we_ > t0:
+                covered = True
+                if echo:
+                    return InputAudioRawFrame(
+                        audio=bytes(len(frame.audio)),
+                        sample_rate=frame.sample_rate,
+                        num_channels=frame.num_channels,
+                    )
+        if not covered:
+            # No completed window covers this frame — fail safe (silence).
+            return InputAudioRawFrame(
+                audio=bytes(len(frame.audio)),
+                sample_rate=frame.sample_rate,
+                num_channels=frame.num_channels,
+            )
+        return frame
 
 
 async def run(config: Config) -> None:

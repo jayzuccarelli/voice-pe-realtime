@@ -17,6 +17,7 @@ Exit code is non-zero if any scenario fails, so it drops straight into CI /
 """
 from __future__ import annotations
 
+import array
 import asyncio
 import json
 import os
@@ -26,6 +27,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -298,6 +300,135 @@ async def s_mid_speech_disconnect(url):
         return ok, f"post-drop reply={t!r}", r.first_audio_ms
 
 
+# ----------------------------------------------------------------------------
+# Barge-in scenarios (NCC_GATE=on brokers ONLY — see BARGEIN_SCENARIOS below).
+# Simulates the acoustic loop the puck will produce once the firmware mic
+# gate is removed: while the bot's reply streams down, an attenuated delayed
+# copy streams back up as "mic" audio (synthetic AEC residual). The NCC gate
+# must eat the echo (no self-trigger) but pass a real voice shouting over it
+# (barge-in interrupts).
+# ----------------------------------------------------------------------------
+def _scale(pcm: bytes, num: int, den: int) -> bytes:
+    a = array.array("h", pcm)
+    for i in range(len(a)):
+        a[i] = a[i] * num // den
+    return a.tobytes()
+
+
+def _mix(a_pcm: bytes, b_pcm: bytes) -> bytes:
+    a = array.array("h", a_pcm)
+    b = array.array("h", b_pcm)
+    for i in range(min(len(a), len(b))):
+        s = a[i] + b[i]
+        a[i] = max(-32768, min(32767, s))
+    return a.tobytes()
+
+
+async def _echo_loop(url: str, barge: bool):
+    """Full-duplex synthetic-echo session.
+
+    Returns (reply_seconds, ghost: bool, interrupted: bool, barge_ms).
+    """
+    question = synth("Count slowly from one to fifteen, one number at a time, nothing else.")
+    barge_pcm = _scale(synth("Stop! Stop talking now. Please stop.", voice="echo"), 3, 2) if barge else b""
+
+    reply = bytearray()
+    last_rx = [0.0]
+    interrupted = [False]
+    echo_q: deque[bytes] = deque()
+    stop = asyncio.Event()
+
+    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+        c = Client(ws)
+        await c._stream(question)
+
+        async def receiver() -> None:
+            while not stop.is_set():
+                try:
+                    msg = await asyncio.wait_for(ws.recv(), timeout=0.25)
+                except asyncio.TimeoutError:
+                    continue
+                except websockets.ConnectionClosed:
+                    return
+                if isinstance(msg, (bytes, bytearray)):
+                    if not reply:
+                        # acoustic-path delay: echo starts ~100ms behind
+                        for _ in range(5):
+                            echo_q.append(bytes(CHUNK))
+                    reply.extend(msg)
+                    last_rx[0] = time.monotonic()
+                    att = _scale(bytes(msg), 3, 5)  # loud residual (0.6x)
+                    for i in range(0, len(att) - CHUNK + 1, CHUNK):
+                        echo_q.append(att[i : i + CHUNK])
+                elif "interrupt" in str(msg):
+                    interrupted[0] = True
+
+        async def sender() -> None:
+            barge_pos = 0
+            barge_started = [None]
+            # Absolute 20ms clock: a per-tick sleep(0.02) drifts a few ms per
+            # chunk and walks the synthetic echo out of the gate's lag-search
+            # window after ~4s. Real device echo lag is fixed; the rig's
+            # must be too.
+            t0 = time.monotonic()
+            n = 0
+            while not stop.is_set():
+                chunk = echo_q.popleft() if echo_q else bytes(CHUNK)
+                if barge and len(reply) > 2 * RATE * 2 and barge_pos < len(barge_pcm):
+                    if barge_started[0] is None:
+                        barge_started[0] = time.monotonic()
+                        sender.barge_t0 = barge_started[0]
+                    chunk = _mix(chunk, barge_pcm[barge_pos : barge_pos + CHUNK])
+                    barge_pos += CHUNK
+                await ws.send(chunk)
+                n += 1
+                await asyncio.sleep(max(0.0, t0 + n * 0.02 - time.monotonic()))
+
+        rx = asyncio.create_task(receiver())
+        tx = asyncio.create_task(sender())
+        t0 = time.monotonic()
+        ghost = False
+        barge_ms = None
+        try:
+            if barge:
+                # success = broker flushes the device (interrupt frame) soon
+                # after the barge utterance starts
+                while time.monotonic() - t0 < 40:
+                    await asyncio.sleep(0.1)
+                    if interrupted[0]:
+                        break
+                if interrupted[0] and getattr(sender, "barge_t0", None):
+                    barge_ms = (time.monotonic() - sender.barge_t0) * 1000
+            else:
+                # wait for the reply to finish (2.5s idle), then 3 more
+                # seconds of echo-free line: any NEW audio is a self-trigger
+                while time.monotonic() - t0 < 40:
+                    await asyncio.sleep(0.25)
+                    if reply and time.monotonic() - last_rx[0] > 2.5:
+                        break
+                settled = len(reply)
+                await asyncio.sleep(3.0)
+                ghost = len(reply) - settled > RATE  # >0.5s of new audio
+        finally:
+            stop.set()
+            for t in (rx, tx):
+                t.cancel()
+    return len(reply) / 2 / RATE, ghost, interrupted[0], barge_ms
+
+
+async def s_ncc_echo_no_selftrigger(url):
+    reply_s, ghost, _, _ = await _echo_loop(url, barge=False)
+    ok = reply_s > 3 and not ghost
+    return ok, f"reply={reply_s:.1f}s ghost_after_echo={ghost}", None
+
+
+async def s_ncc_echo_barge(url):
+    reply_s, _, interrupted, barge_ms = await _echo_loop(url, barge=True)
+    ok = interrupted and barge_ms is not None and barge_ms < 2000
+    lat = f"{barge_ms:.0f}ms" if barge_ms is not None else "n/a"
+    return ok, f"interrupted={interrupted} barge_latency={lat} reply={reply_s:.1f}s", None
+
+
 SCENARIOS = {
     "capital_qa": s_capital,
     "follow_up_multiturn": s_follow_up,
@@ -311,12 +442,27 @@ SCENARIOS = {
     "mid_speech_disconnect": s_mid_speech_disconnect,
 }
 
+# Run ONLY against an NCC_GATE=on broker (--bargein or --only <name>). In
+# off/shadow modes the mic is silence-fed during playback, so the barge
+# scenario cannot pass by design.
+BARGEIN_SCENARIOS = {
+    "ncc_echo_no_selftrigger": s_ncc_echo_no_selftrigger,
+    "ncc_echo_barge": s_ncc_echo_barge,
+}
+
+ALL_SCENARIOS = {**SCENARIOS, **BARGEIN_SCENARIOS}
+
 
 async def run(url: str, soak: int = 1, only: str | None = None) -> int:
     print(f"== voice-pe broker reliability harness -> {url} ==")
     if soak > 1:
         print(f"   soak mode: {soak} rounds")
-    scenarios = {only: SCENARIOS[only]} if only else SCENARIOS
+    if only:
+        scenarios = {only: ALL_SCENARIOS[only]}
+    elif "--bargein" in sys.argv:
+        scenarios = BARGEIN_SCENARIOS
+    else:
+        scenarios = SCENARIOS
     results: list[tuple[str, bool, str, float | None]] = []
     latencies: list[float] = []
     for rnd in range(soak):
@@ -359,8 +505,10 @@ def main() -> None:
     only = None
     if "--only" in sys.argv:
         only = sys.argv[sys.argv.index("--only") + 1]
-        if only not in SCENARIOS:
-            raise SystemExit(f"unknown scenario {only!r}; one of: {', '.join(SCENARIOS)}")
+        if only not in ALL_SCENARIOS:
+            raise SystemExit(
+                f"unknown scenario {only!r}; one of: {', '.join(ALL_SCENARIOS)}"
+            )
     raise SystemExit(asyncio.run(run(url, soak, only)))
 
 
