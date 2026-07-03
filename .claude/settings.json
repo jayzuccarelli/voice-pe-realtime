@@ -4,7 +4,7 @@
       {
         "matcher": "Edit|Write|MultiEdit",
         "hooks": [
-          {"type": "command", "command": "python3 /home/jay/projects/voice-pe-realtime/broker/tools/hook_check.py"}
+          {"type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/broker/tools/hook_check.py\""}
         ]
       }
     ]
