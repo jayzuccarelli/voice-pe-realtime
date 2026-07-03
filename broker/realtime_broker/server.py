@@ -92,10 +92,11 @@ class _BotPlaybackGate(FrameProcessor):
        (the firmware's INTERRUPT_IGNORE_AUDIO_MS window), so flush only while
        playback is live.
 
-    Why model playback instead of using BotStarted/StoppedSpeakingFrame: the
-    output transport paces audio to the device at 2x realtime and BotStopped
-    fires when the SEND queue drains — for an N-second reply the device still
-    holds up to N/2 seconds in its own buffer at that moment. Summing the
+    Why model playback instead of using BotStarted/StoppedSpeakingFrame:
+    OpenAI delivers TTS audio faster than realtime, the output transport
+    paces it to the device at 1x, and the device buffers up to ~740ms more
+    (10-chunk send queue + 3x100ms ring buffers). BotStopped fires when the
+    SEND queue drains, while the speaker may still be audible. Summing the
     duration of the audio frames we forward gives the actual time the speaker
     goes quiet.
     """
@@ -108,6 +109,13 @@ class _BotPlaybackGate(FrameProcessor):
         self._playback_end = 0.0  # event-loop time when the speaker goes quiet
         self._threshold = config.vad_threshold
         self._restore_task: asyncio.Task | None = None
+        self._reset_task: asyncio.Task | None = None  # in-flight reset_vad
+        # Max (playback_end - now) seen during the current reply: how far the
+        # forwarded-audio schedule runs ahead of the speaker. OpenAI delivers
+        # faster than realtime, so anything correlating mic audio against
+        # forwarded TTS (the planned echo gate) must index by this schedule,
+        # not by arrival time. Logged per reply to size that misalignment.
+        self._max_backlog = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -115,6 +123,7 @@ class _BotPlaybackGate(FrameProcessor):
             now = asyncio.get_running_loop().time()
             duration = len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
             self._playback_end = max(self._playback_end, now) + duration
+            self._max_backlog = max(self._max_backlog, self._playback_end - now)
             await self._set_threshold(self._config.vad_threshold_speaking)
             if self._restore_task is None:
                 self._restore_task = self.create_task(self._restore_when_quiet())
@@ -137,6 +146,9 @@ class _BotPlaybackGate(FrameProcessor):
         # Clear BEFORE the await below: an audio frame racing the restore then
         # starts a fresh restore task and re-raises the threshold after us.
         self._restore_task = None
+        if self._max_backlog > 0:
+            logger.info("playback: max send-ahead backlog %.2fs this reply", self._max_backlog)
+            self._max_backlog = 0.0
         await self._set_threshold(self._config.vad_threshold)
 
     async def _maybe_flush_device(self) -> None:
@@ -158,6 +170,17 @@ class _BotPlaybackGate(FrameProcessor):
         if threshold == self._threshold:
             return
         self._threshold = threshold
+        if self._reset_task is not None:
+            # A VAD reset is in flight: sending server_vad config now would
+            # re-enable turn detection before the reset's buffer clear and
+            # resurrect the ghost turn it exists to kill. Just record the
+            # threshold; the reset's final re-enable applies it.
+            logger.info("adaptive VAD: threshold -> %s (deferred, reset in flight)", threshold)
+            return
+        await self._send_vad(threshold)
+        logger.info("adaptive VAD: threshold -> %s", threshold)
+
+    async def _send_vad(self, threshold: float | None) -> None:
         await self._service.send_client_event(
             oai_events.SessionUpdateEvent(
                 session=oai_events.SessionProperties(
@@ -167,7 +190,46 @@ class _BotPlaybackGate(FrameProcessor):
                 )
             )
         )
-        logger.info("adaptive VAD: threshold -> %s", threshold)
+
+    async def reset_vad(self, drain: float = 0.4) -> None:
+        """Discard server VAD state left over from a dead connection.
+
+        Clearing the input buffer removes the audio BYTES but not the VAD
+        state machine: when the device vanishes mid-utterance, server_vad
+        still holds speech-started, and once post-reconnect silence gives it
+        its window it commits whatever is buffered — the tail fragment that
+        drained from the pipeline after the clear, or nothing at all — and
+        auto-creates a response. The model greets the ghost turn ("I'm here
+        when you're ready"; soak 2026-07-02, 5/5 then 2/6 with a delayed
+        clear alone). Disabling turn detection makes the server drop the
+        pending segment; then let the stale pipeline tail drain (`drain`
+        seconds — 0 on connect, when any tail drained long ago), wipe the
+        buffer, and re-enable at the current threshold.
+
+        Single-flight: if a reset is already in flight, joining callers
+        no-op — the running one clears and re-enables for everyone. In
+        particular a fast reconnect's on-connect reset must NOT preempt the
+        disconnect reset mid-drain, or the clear fires before the stale
+        tail lands and the ghost returns. _set_threshold defers its
+        session.update while a reset holds the floor. Safe window: a
+        reconnect needs a full wake-word ceremony, so no genuine speech
+        arrives within `drain` of a disconnect.
+        """
+        if self._reset_task is not None:
+            return
+        task = asyncio.current_task()
+        self._reset_task = task
+        try:
+            await self._send_vad(None)
+            if drain:
+                await asyncio.sleep(drain)
+            await self._service.send_client_event(oai_events.InputAudioBufferClearEvent())
+            await self._send_vad(self._threshold)
+        except Exception:  # noqa: BLE001
+            logger.exception("VAD reset failed")
+        finally:
+            if self._reset_task is task:
+                self._reset_task = None
 
 
 class _MicInputGate(FrameProcessor):
@@ -389,22 +451,41 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         nonlocal device_connected
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
-        # The device opens a fresh websocket per wake, but the OpenAI session is
-        # reused for context. Audio left uncommitted in OpenAI's input buffer
-        # when the previous connection dropped mid-stream gets committed on the
-        # next connect — transcribed as a stray 'Bye.'/'' and answered as a ghost
-        # turn before the real question. Drop that stale audio on every connect.
-        try:
-            await service.send_client_event(oai_events.InputAudioBufferClearEvent())
-        except Exception:  # noqa: BLE001
-            logger.exception("on_connect: failed to clear OpenAI input buffer")
+        # The device opens a fresh websocket per wake, but the OpenAI session
+        # is reused for context. Anything left from the previous connection —
+        # uncommitted buffer audio AND a speech-in-progress VAD segment —
+        # would surface as a ghost turn before the real question (stray
+        # 'Bye.', TV test 2026-07-01). Full reset, no drain: any stale
+        # pipeline tail finished draining while no device was connected, and
+        # the reset's few client events land well before wake-ack ends and
+        # real speech starts.
+        asyncio.create_task(gate.reset_vad(drain=0.0))
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnect(_transport, client, *args):  # noqa: ANN001
         nonlocal device_connected, idle_since
+        # When a new connection kicks a lingering old one (re-wake after a
+        # WiFi blip: the dead socket never closed), Pipecat swaps the
+        # transport's websocket to the NEW client before the old handler
+        # exits and fires this event for the OLD one. The device is still
+        # here — don't flag it disconnected, and above all don't reset VAD
+        # and clear the buffer while the user's real question streams in.
+        # The on-connect reset already dealt with the stale state.
+        current = getattr(transport.input(), "_websocket", None)
+        if current is not None and current is not client:
+            logger.info("Stale connection closed; device still connected")
+            return
         device_connected = False
         idle_since = loop.time()
         logger.info("Device disconnected")
+        # A disconnect mid-utterance leaves server VAD holding a
+        # speech-in-progress segment (plus mic-stream tail still draining
+        # through the pipeline). A buffer clear alone can't kill it — see
+        # _BotPlaybackGate.reset_vad, which disables and re-enables turn
+        # detection to drop the segment before it becomes a ghost turn
+        # (stray 'Bye.' in the TV test 2026-07-01; 'I'm here when you're
+        # ready' in the soak 2026-07-02).
+        asyncio.create_task(gate.reset_vad())
 
     task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
     runner_task = asyncio.create_task(PipelineRunner().run(task))
