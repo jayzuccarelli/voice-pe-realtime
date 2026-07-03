@@ -83,8 +83,14 @@ def main() -> None:
     ref = load_ref(Path(sys.argv[1]))
     mic = load_pcm(Path(sys.argv[2]))
     print(f"ref {len(ref)/RATE:.1f}s   capture {len(mic)/RATE:.1f}s")
-    if len(mic) < len(ref) // 2:
-        raise SystemExit("capture shorter than half the reference — bad take")
+    if len(mic) < len(ref):
+        # np.correlate silently swaps operands when the first array is the
+        # shorter one, which would produce a garbage global lag and a false
+        # "residual uncorrelated" verdict. The capture must cover the clip.
+        raise SystemExit(
+            "capture shorter than the reference — bad take, retake it "
+            f"(capture {len(mic)/RATE:.1f}s < ref {len(ref)/RATE:.1f}s)"
+        )
 
     lag = global_lag(ref, mic)
     print(f"global alignment: ref starts at {lag/RATE:.2f}s into the capture")
