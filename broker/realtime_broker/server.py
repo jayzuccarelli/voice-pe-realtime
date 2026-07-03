@@ -184,15 +184,30 @@ class _BotPlaybackGate(FrameProcessor):
         logger.info("barge-in: signaled device to flush speaker")
 
     def ref_segment(self, t0: float, t1: float) -> np.ndarray | None:
-        """Forwarded-TTS audio scheduled to play anywhere inside [t0, t1]."""
-        parts = [
-            pcm
+        """Forwarded-TTS audio scheduled to play anywhere inside [t0, t1].
+
+        Reconstructed on the playback-schedule timeline: if TTS paused
+        mid-reply (a schedule gap), the gap is filled with silence rather
+        than concatenated away, so the returned reference stays time-aligned
+        with the mic window the caller correlates against.
+        """
+        entries = [
+            (start, pcm)
             for start, pcm in self.ref_ring
             if start + len(pcm) / (2 * SAMPLE_RATE) >= t0 and start <= t1
         ]
-        if not parts:
+        if not entries:
             return None
-        return np.frombuffer(b"".join(parts), np.int16).astype(np.float64)
+        base = entries[0][0]
+        end = max(s + len(p) / (2 * SAMPLE_RATE) for s, p in entries)
+        out = np.zeros(int(round((end - base) * SAMPLE_RATE)), np.float64)
+        for start, pcm in entries:
+            off = int(round((start - base) * SAMPLE_RATE))
+            samples = np.frombuffer(pcm, np.int16).astype(np.float64)
+            n = min(len(samples), len(out) - off)
+            if n > 0:
+                out[off : off + n] = samples[:n]
+        return out
 
     async def _set_threshold(self, threshold: float) -> None:
         if threshold == self._threshold:
@@ -252,12 +267,20 @@ class _BotPlaybackGate(FrameProcessor):
             if drain:
                 await asyncio.sleep(drain)
             await self._service.send_client_event(oai_events.InputAudioBufferClearEvent())
-            await self._send_vad(self._threshold)
         except Exception:  # noqa: BLE001
-            logger.exception("VAD reset failed")
+            logger.exception("VAD reset: disable/clear failed")
         finally:
-            if self._reset_task is task:
-                self._reset_task = None
+            self._reset_task = None
+            # ALWAYS re-enable turn detection, even if the disable/clear above
+            # raised. A transient send error between disabling VAD and
+            # re-enabling it would otherwise leave server_vad OFF — the
+            # session stops auto-committing turns and goes deaf until the next
+            # wake. Best-effort: if this also fails, the next bot reply's
+            # _set_threshold re-sends the VAD config.
+            try:
+                await self._send_vad(self._threshold)
+            except Exception:  # noqa: BLE001
+                logger.exception("VAD reset: re-enable failed")
 
 
 class _MicInputGate(FrameProcessor):
@@ -301,6 +324,20 @@ class _MicInputGate(FrameProcessor):
         self._scores: deque[tuple[float, float, bool]] = deque(maxlen=64)
         self._delay: deque[tuple[float, InputAudioRawFrame]] = deque()
 
+    def reset(self) -> None:
+        """Drop per-connection state on device disconnect.
+
+        The mic gate lives for the whole session (across device connects), so
+        without this a reconnect inherits the previous connection's queued
+        _delay frames and stale echo verdicts — in NCC_GATE=on those stale
+        echo frames would flush into the next turn as a ghost.
+        """
+        self._win.clear()
+        self._win_start = None
+        self._speak_since = None
+        self._scores.clear()
+        self._delay.clear()
+
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if not (
@@ -328,11 +365,13 @@ class _MicInputGate(FrameProcessor):
                     t0, f = self._delay.popleft()
                     await self.push_frame(self._gated(f, t0), direction)
                 return
-            # Playback window over: whatever is still delayed is post-release
-            # tail — deliver it ungated, then this frame.
+            # Playback window over: the still-delayed frames were captured
+            # DURING playback, so gate them by their scored verdicts (an
+            # uncovered window fails safe to silence) rather than passing raw
+            # echo through. This frame is past the release margin — ungated.
             while self._delay:
-                _, f = self._delay.popleft()
-                await self.push_frame(f, direction)
+                t0, f = self._delay.popleft()
+                await self.push_frame(self._gated(f, t0), direction)
             self._win.clear()
             self._win_start = None
             await self.push_frame(frame, direction)
@@ -621,6 +660,9 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         device_connected = False
         idle_since = loop.time()
         logger.info("Device disconnected")
+        # Drop any mic-gate state queued for the connection that just died, so
+        # a reconnect can't inherit its delayed frames / stale echo verdicts.
+        mic_gate.reset()
         # A disconnect mid-utterance leaves server VAD holding a
         # speech-in-progress segment (plus mic-stream tail still draining
         # through the pipeline). A buffer clear alone can't kill it — see

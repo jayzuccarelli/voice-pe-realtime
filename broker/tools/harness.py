@@ -311,7 +311,9 @@ async def s_mid_speech_disconnect(url):
 def _scale(pcm: bytes, num: int, den: int) -> bytes:
     a = array.array("h", pcm)
     for i in range(len(a)):
-        a[i] = a[i] * num // den
+        # Clamp — gain > 1 (the barge path uses 3/2) overflows int16 on loud
+        # samples, and array('h') assignment raises OverflowError.
+        a[i] = max(-32768, min(32767, a[i] * num // den))
     return a.tobytes()
 
 
