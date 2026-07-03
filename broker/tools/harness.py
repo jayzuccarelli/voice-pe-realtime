@@ -243,6 +243,61 @@ async def s_background_rejection(url):
         return ok, f"bg_reply={r2.seconds:.1f}s want0 {t2[:50]!r}", None
 
 
+async def s_challenge_follow_up(url):
+    # Both real turns the TV test swallowed (2026-07-01) were follow-ups to
+    # the bot's own answer. A bare challenge ("are you sure?") has no topic
+    # words at all — the hardest addressed-speech case for the background
+    # gate. The bot must answer, not wait_for_user it away.
+    async with session(url) as c:
+        r1 = await c.ask("In one short sentence, what is the capital of France?")
+        if not r1.got_audio:
+            return False, "setup turn got no audio", r1.first_audio_ms
+        r2 = await c.ask("Are you sure about that?")
+        t = r2.transcript().lower() if r2.got_audio else ""
+        return r2.got_audio, f"challenge reply={t!r}", r2.first_audio_ms
+
+
+async def s_tv_line_after_answer(url):
+    # Counter-metric to the follow-up bias in BACKGROUND_GUIDANCE: a
+    # conversational TV line in a different voice right after the bot
+    # answers — the exact false-accept from the TV test ("It's good, huh?",
+    # 2026-07-01 20:49:56). Want silence. Pre-declared tradeoff: swallowing
+    # a real follow-up is worse than answering a TV line, so under --soak
+    # this scenario is allowed to be the flakier of the pair — but it must
+    # not fail while challenge_follow_up also fails.
+    async with session(url) as c:
+        r1 = await c.ask("In one short sentence, what is the capital of France?")
+        if not r1.got_audio:
+            return False, "setup turn got no audio", r1.first_audio_ms
+        tv = ("Oh man, it's good, huh? I told you this show gets better. "
+              "Hang on, I'm gonna grab another drink before it starts.")
+        r2 = await c.ask(tv, voice="echo")
+        t2 = r2.transcript().lower() if r2.got_audio else ""
+        ok = not r2.got_audio
+        return ok, f"tv_reply={r2.seconds:.1f}s want0 {t2[:50]!r}", None
+
+
+async def s_mid_speech_disconnect(url):
+    # Drop the connection mid-word (WiFi blip / firmware auto-stop), leaving
+    # uncommitted audio in OpenAI's input buffer, then reconnect. Gate for
+    # the on-disconnect buffer clear: the orphaned audio must not come back
+    # as a ghost turn (the stray 'Bye.' answered before the real question,
+    # TV test 2026-07-01 20:49), and the session must still answer.
+    pcm = synth("What is the capital of France? Also, could you tell me")
+    half = (len(pcm) // 2) // CHUNK * CHUNK
+    async with websockets.connect(url, max_size=None, open_timeout=10) as ws:
+        await Client(ws)._stream(pcm[:half])  # hard drop mid-word, no silence
+    async with session(url) as c:
+        quiet = await c.listen(3.0)
+        if quiet.got_audio:
+            t = quiet.transcript().lower()
+            return False, f"ghost reply after reconnect: {t[:60]!r}", None
+        r = await c.ask("In one short sentence, what is two plus two?")
+        t = r.transcript().lower() if r.got_audio else ""
+        ok = r.got_audio and any(w in t for w in ("four", "4"))
+        return ok, f"post-drop reply={t!r}", r.first_audio_ms
+
+
 SCENARIOS = {
     "capital_qa": s_capital,
     "follow_up_multiturn": s_follow_up,
@@ -251,17 +306,21 @@ SCENARIOS = {
     "no_ghost_on_connect": s_no_ghost_on_connect,
     "reconnect": s_reconnect,
     "background_rejection": s_background_rejection,
+    "challenge_follow_up": s_challenge_follow_up,
+    "tv_line_after_answer": s_tv_line_after_answer,
+    "mid_speech_disconnect": s_mid_speech_disconnect,
 }
 
 
-async def run(url: str, soak: int = 1) -> int:
+async def run(url: str, soak: int = 1, only: str | None = None) -> int:
     print(f"== voice-pe broker reliability harness -> {url} ==")
     if soak > 1:
         print(f"   soak mode: {soak} rounds")
+    scenarios = {only: SCENARIOS[only]} if only else SCENARIOS
     results: list[tuple[str, bool, str, float | None]] = []
     latencies: list[float] = []
     for rnd in range(soak):
-        for name, fn in SCENARIOS.items():
+        for name, fn in scenarios.items():
             label = f"{name}#{rnd + 1}" if soak > 1 else name
             t0 = time.monotonic()
             try:
@@ -286,12 +345,23 @@ async def run(url: str, soak: int = 1) -> int:
 
 
 def main() -> None:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flag_values = {
+        sys.argv.index(f) + 1 for f in ("--soak", "--only") if f in sys.argv
+    }
+    args = [
+        a for i, a in enumerate(sys.argv)
+        if i > 0 and i not in flag_values and not a.startswith("--")
+    ]
     url = args[0] if args else "ws://127.0.0.1:8766"
     soak = 1
     if "--soak" in sys.argv:
         soak = int(sys.argv[sys.argv.index("--soak") + 1])
-    raise SystemExit(asyncio.run(run(url, soak)))
+    only = None
+    if "--only" in sys.argv:
+        only = sys.argv[sys.argv.index("--only") + 1]
+        if only not in SCENARIOS:
+            raise SystemExit(f"unknown scenario {only!r}; one of: {', '.join(SCENARIOS)}")
+    raise SystemExit(asyncio.run(run(url, soak, only)))
 
 
 if __name__ == "__main__":

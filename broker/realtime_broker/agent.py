@@ -95,11 +95,13 @@ CUSTOM_TOOLS = [
         "type": "function",
         "name": "wait_for_user",
         "description": (
-            "Call this when the most recent audio is NOT a request addressed to "
-            "you: a TV or other media, a side conversation between other people, "
-            "background chatter, or any speech not directed at the assistant. "
-            "Calling it means stay silent and keep listening. Produce no spoken "
-            "reply when you call it."
+            "Call this ONLY when the most recent audio is clearly NOT addressed "
+            "to you: TV or other media dialogue, or a conversation between other "
+            "people. If you just answered and the next utterance could be a "
+            "follow-up, reaction, or challenge to your answer ('are you sure?', "
+            "'okay, and what about...'), it IS addressed to you — answer it "
+            "instead of calling this. Calling it means stay silent and keep "
+            "listening. Produce no spoken reply when you call it."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
@@ -115,23 +117,38 @@ BACKGROUND_GUIDANCE = (
     "whole room. Only respond to speech clearly addressed to you. If the audio is "
     "a TV or other media, a side conversation between other people, background "
     "chatter, or any speech not directed at you, call the wait_for_user function "
-    "and stay silent. Do not narrate that you are waiting."
+    "and stay silent. Do not narrate that you are waiting. One strong exception: "
+    "right after you answer, the next utterance is usually the same user "
+    "following up. A follow-up question, reaction, or challenge to what you just "
+    "said ('are you sure?', 'okay, and...', 'what about tomorrow?') is addressed "
+    "to you even when it does not name you — answer it. When torn between "
+    "answering a plausible follow-up and staying silent, answer: a wrongly "
+    "ignored user must repeat themselves, which is worse than a wrongly "
+    "answered TV line."
 )
 
 
-def build_audio_input(config: Config, threshold: float) -> AudioInput:
+def build_audio_input(config: Config, threshold: float | None) -> AudioInput:
     """Full audio.input block for session.create AND mid-session updates.
 
     Always send the complete block: session.update may replace nested objects
     wholesale, so a partial update could silently drop noise reduction or
     transcription.
+
+    threshold=None disables turn detection entirely (serialized as
+    turn_detection: null), which also discards the server's VAD state —
+    used to drop a speech-in-progress segment after a device disconnect.
     """
     return AudioInput(
-        turn_detection=TurnDetection(
-            type="server_vad",
-            threshold=threshold,
-            prefix_padding_ms=config.vad_prefix_padding_ms,
-            silence_duration_ms=config.vad_silence_duration_ms,
+        turn_detection=(
+            TurnDetection(
+                type="server_vad",
+                threshold=threshold,
+                prefix_padding_ms=config.vad_prefix_padding_ms,
+                silence_duration_ms=config.vad_silence_duration_ms,
+            )
+            if threshold is not None
+            else False
         ),
         # No server-side noise reduction: the device streams the XMOS
         # noise-suppressed, no-AGC mic tap (firmware "NS tap, ch1"), which is
