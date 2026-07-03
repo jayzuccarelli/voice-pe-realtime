@@ -43,7 +43,13 @@ async def main() -> None:
 
     out = Path(args.out_dir)
     out.mkdir(exist_ok=True)
-    counter = 0
+    # Resume numbering after existing captures — a fresh run must never
+    # overwrite takes recorded by a previous one mid-calibration-session.
+    counter = max(
+        (int(p.stem.split("_")[1]) for p in out.glob("capture_*.pcm")
+         if p.stem.split("_")[1].isdigit()),
+        default=0,
+    )
 
     async def handle(ws) -> None:
         nonlocal counter
@@ -62,7 +68,7 @@ async def main() -> None:
                         pcm.write(msg)
                         meta.write(json.dumps({"t": round(t, 4), "n": len(msg)}) + "\n")
                         nbytes += len(msg)
-                        if t - last_report >= 1.0:
+                        if t - last_report >= 1.0 and msg:
                             samples = array.array("h", msg)
                             rms = int(math.sqrt(sum(s * s for s in samples) / len(samples)))
                             print(f"[m2]   t={t:5.1f}s  {nbytes/2/RATE:5.1f}s audio  rms={rms}")
