@@ -41,7 +41,7 @@ cd broker && OPENAI_API_KEY=... make check          # 10 scenarios, pass/fail + 
 cd broker && OPENAI_API_KEY=... make soak N=20      # repeat for flake/latency
 ```
 
-Scenarios: basic Q&A, multi-turn context, HA tool call, no-reply-to-silence, no-ghost-on-connect, reconnect, background-speech rejection, follow-up-challenge after an answer, TV-line-after-answer (false-accept counter-metric), mid-speech disconnect (ghost-turn regression). `--only <name>` runs one scenario. Point it at an isolated broker (`WS=ws://127.0.0.1:8766`) so it never kicks a live device.
+Scenarios: basic Q&A, multi-turn context, HA tool call, no-reply-to-silence, no-ghost-on-connect, reconnect, background-speech rejection, follow-up-challenge after an answer, TV-line-after-answer (false-accept counter-metric), mid-speech disconnect (ghost-turn regression). `--only <name>` runs one scenario; `--bargein` runs the synthetic-echo barge-in suite (needs an `NCC_GATE=on` broker). ALWAYS point the harness at an isolated broker (`WS=ws://127.0.0.1:8766`) — never the live one: it kicks the connected device, bills real turns, and pollutes the live session's conversation context. This applies to agents and CI too. The broker reuses one OpenAI session across connections, so scenario runs in one broker process share context — restart the broker between suites when a scenario depends on a clean history.
 
 ## Quick start (broker)
 
