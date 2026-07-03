@@ -1,13 +1,16 @@
 # Attribution
 
-This project's architecture and firmware were informed by, and the firmware
-component derives from, **[fjfricke/ha-openai-realtime](https://github.com/fjfricke/ha-openai-realtime)**
-(MIT License) — a proof-of-concept that first demonstrated bridging a Home
-Assistant Voice PE to the OpenAI Realtime API over WebSocket.
+The ESPHome firmware component in
+`firmware/components/voice_assistant_websocket/` derives from
+**[fjfricke/ha-openai-realtime](https://github.com/fjfricke/ha-openai-realtime)**
+(MIT License) — the proof-of-concept that first bridged a Home Assistant
+Voice PE to the OpenAI Realtime API over WebSocket. That project's MIT license
+and copyright are preserved in
+`firmware/components/voice_assistant_websocket/LICENSE`.
 
-The broker here is a substantial rewrite (clean module structure, SSE-based
-Home Assistant MCP control, persistent-session context, reproducible build),
-but credit for the original approach belongs to that project.
+The broker is an independent rewrite (clean module structure, SSE-based Home
+Assistant MCP control, persistent-session context, reproducible build), but
+the original bridging approach came from that project.
 
 Built on:
 - [Pipecat](https://github.com/pipecat-ai/pipecat) — voice-agent framework (BSD-2-Clause)
