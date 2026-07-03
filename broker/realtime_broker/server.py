@@ -109,6 +109,7 @@ class _BotPlaybackGate(FrameProcessor):
         self._playback_end = 0.0  # event-loop time when the speaker goes quiet
         self._threshold = config.vad_threshold
         self._restore_task: asyncio.Task | None = None
+        self._reset_task: asyncio.Task | None = None  # in-flight reset_vad
         # Max (playback_end - now) seen during the current reply: how far the
         # forwarded-audio schedule runs ahead of the speaker. OpenAI delivers
         # faster than realtime, so anything correlating mic audio against
@@ -169,6 +170,13 @@ class _BotPlaybackGate(FrameProcessor):
         if threshold == self._threshold:
             return
         self._threshold = threshold
+        if self._reset_task is not None:
+            # A VAD reset is in flight: sending server_vad config now would
+            # re-enable turn detection before the reset's buffer clear and
+            # resurrect the ghost turn it exists to kill. Just record the
+            # threshold; the reset's final re-enable applies it.
+            logger.info("adaptive VAD: threshold -> %s (deferred, reset in flight)", threshold)
+            return
         await self._send_vad(threshold)
         logger.info("adaptive VAD: threshold -> %s", threshold)
 
@@ -183,8 +191,8 @@ class _BotPlaybackGate(FrameProcessor):
             )
         )
 
-    async def reset_vad(self) -> None:
-        """Discard server VAD state after a device disconnect.
+    async def reset_vad(self, drain: float = 0.4) -> None:
+        """Discard server VAD state left over from a dead connection.
 
         Clearing the input buffer removes the audio BYTES but not the VAD
         state machine: when the device vanishes mid-utterance, server_vad
@@ -194,18 +202,34 @@ class _BotPlaybackGate(FrameProcessor):
         auto-creates a response. The model greets the ghost turn ("I'm here
         when you're ready"; soak 2026-07-02, 5/5 then 2/6 with a delayed
         clear alone). Disabling turn detection makes the server drop the
-        pending segment; then let the stale pipeline tail drain, wipe the
-        buffer, and re-enable at the current threshold. Safe window: a
+        pending segment; then let the stale pipeline tail drain (`drain`
+        seconds — 0 on connect, when any tail drained long ago), wipe the
+        buffer, and re-enable at the current threshold.
+
+        Single-flight: if a reset is already in flight, joining callers
+        no-op — the running one clears and re-enables for everyone. In
+        particular a fast reconnect's on-connect reset must NOT preempt the
+        disconnect reset mid-drain, or the clear fires before the stale
+        tail lands and the ghost returns. _set_threshold defers its
+        session.update while a reset holds the floor. Safe window: a
         reconnect needs a full wake-word ceremony, so no genuine speech
-        arrives within 400ms of a disconnect.
+        arrives within `drain` of a disconnect.
         """
+        if self._reset_task is not None:
+            return
+        task = asyncio.current_task()
+        self._reset_task = task
         try:
             await self._send_vad(None)
-            await asyncio.sleep(0.4)
+            if drain:
+                await asyncio.sleep(drain)
             await self._service.send_client_event(oai_events.InputAudioBufferClearEvent())
             await self._send_vad(self._threshold)
         except Exception:  # noqa: BLE001
-            logger.exception("disconnect: VAD reset failed")
+            logger.exception("VAD reset failed")
+        finally:
+            if self._reset_task is task:
+                self._reset_task = None
 
 
 class _MicInputGate(FrameProcessor):
@@ -427,19 +451,30 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         nonlocal device_connected
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
-        # The device opens a fresh websocket per wake, but the OpenAI session is
-        # reused for context. Audio left uncommitted in OpenAI's input buffer
-        # when the previous connection dropped mid-stream gets committed on the
-        # next connect — transcribed as a stray 'Bye.'/'' and answered as a ghost
-        # turn before the real question. Drop that stale audio on every connect.
-        try:
-            await service.send_client_event(oai_events.InputAudioBufferClearEvent())
-        except Exception:  # noqa: BLE001
-            logger.exception("on_connect: failed to clear OpenAI input buffer")
+        # The device opens a fresh websocket per wake, but the OpenAI session
+        # is reused for context. Anything left from the previous connection —
+        # uncommitted buffer audio AND a speech-in-progress VAD segment —
+        # would surface as a ghost turn before the real question (stray
+        # 'Bye.', TV test 2026-07-01). Full reset, no drain: any stale
+        # pipeline tail finished draining while no device was connected, and
+        # the reset's few client events land well before wake-ack ends and
+        # real speech starts.
+        asyncio.create_task(gate.reset_vad(drain=0.0))
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnect(_transport, client, *args):  # noqa: ANN001
         nonlocal device_connected, idle_since
+        # When a new connection kicks a lingering old one (re-wake after a
+        # WiFi blip: the dead socket never closed), Pipecat swaps the
+        # transport's websocket to the NEW client before the old handler
+        # exits and fires this event for the OLD one. The device is still
+        # here — don't flag it disconnected, and above all don't reset VAD
+        # and clear the buffer while the user's real question streams in.
+        # The on-connect reset already dealt with the stale state.
+        current = getattr(transport.input(), "_websocket", None)
+        if current is not None and current is not client:
+            logger.info("Stale connection closed; device still connected")
+            return
         device_connected = False
         idle_since = loop.time()
         logger.info("Device disconnected")

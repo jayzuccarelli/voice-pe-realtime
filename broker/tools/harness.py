@@ -345,7 +345,13 @@ async def run(url: str, soak: int = 1, only: str | None = None) -> int:
 
 
 def main() -> None:
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flag_values = {
+        sys.argv.index(f) + 1 for f in ("--soak", "--only") if f in sys.argv
+    }
+    args = [
+        a for i, a in enumerate(sys.argv)
+        if i > 0 and i not in flag_values and not a.startswith("--")
+    ]
     url = args[0] if args else "ws://127.0.0.1:8766"
     soak = 1
     if "--soak" in sys.argv:
