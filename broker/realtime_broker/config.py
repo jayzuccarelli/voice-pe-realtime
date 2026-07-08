@@ -46,6 +46,16 @@ class Config:
     vad_threshold_speaking: float = 0.85
     vad_release_delay_ms: int = 1200
 
+    # Turn hygiene: bound how long one wake keeps the conversation open so TV
+    # speech can't spiral a session for minutes. After each reply the user has
+    # followup_window_seconds (measured from when the SPEAKER goes quiet, not
+    # response.done) to take another turn before the broker disconnects the
+    # device and the wake word re-arms; max_turns_per_wake caps committed user
+    # turns per WS connection. Either set to 0 disables that bound (both 0 =
+    # exactly the pre-hygiene behavior) — the no-redeploy rollback lever.
+    followup_window_seconds: float = 6.0
+    max_turns_per_wake: int = 8
+
     # OpenAI caps a Realtime session at 60 min. Proactively rotate a bit before
     # that so the broker never hits the fatal expiry. The device is turn-based,
     # so a rotation between turns is invisible.
@@ -84,6 +94,8 @@ class Config:
             vad_silence_duration_ms=int(os.environ.get("VAD_SILENCE_DURATION_MS", "800")),
             vad_threshold_speaking=float(os.environ.get("VAD_THRESHOLD_SPEAKING", "0.85")),
             vad_release_delay_ms=int(os.environ.get("VAD_RELEASE_DELAY_MS", "1200")),
+            followup_window_seconds=float(os.environ.get("FOLLOWUP_WINDOW_SECONDS", "6.0")),
+            max_turns_per_wake=int(os.environ.get("MAX_TURNS_PER_WAKE", "8")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
             idle_refresh_seconds=int(os.environ.get("IDLE_REFRESH_SECONDS", "600")),
         )
