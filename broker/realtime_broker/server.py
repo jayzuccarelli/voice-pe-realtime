@@ -433,6 +433,17 @@ class _TurnHygiene(FrameProcessor):
                 # wake must still get bounded — grace + window — instead of
                 # streaming mic audio to OpenAI until rotation.
                 reason = f"follow-up window expired ({self._turns} turns)"
+            elif (
+                window <= 0
+                and budget > 0
+                and self._turns == 0
+                and now >= self._connect_time + _INITIAL_GRACE_SECONDS
+            ):
+                # Budget-only config (window disabled): the budget branch can't
+                # fire at 0 turns, so without this a silent false wake would
+                # stream mic audio until rotation. Grace stays the floor
+                # whenever any hygiene knob is on.
+                reason = "initial grace expired with no committed turn"
             else:
                 continue
             ws = self._get_ws()
