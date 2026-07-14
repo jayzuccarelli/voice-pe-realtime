@@ -96,8 +96,4 @@ The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmwa
 - ⏳ **Barge-in** — true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem — an echo-residual calibration rig ships in `broker/tools/`, see `M2_RUNBOOK.md`)
 - ⏳ **Beamforming** — tap the XMOS array's focused channel to reject off-axis room noise (a TV, another speaker)
 
-## Prior art & focus
-
-Others have put OpenAI Realtime on the Voice PE — see [NOTICE.md](NOTICE.md) for credits. This project's focus is **reliability** (proven session rotation, a real test harness), **deep HA tool integration**, and a roadmap toward smart local/cloud routing and barge-in. Honest limitation: the OpenAI Realtime API has no speaker separation, so in a loud room the assistant can still pick up other voices — the real fix for that is device-side beamforming (on the roadmap).
-
-MIT licensed.
+MIT licensed. Attribution in [NOTICE.md](NOTICE.md).
