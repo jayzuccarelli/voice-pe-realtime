@@ -93,7 +93,7 @@ The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmwa
 - ✅ Background-speech gating (`wait_for_user`)
 - ✅ End-to-end reliability harness (`make check`)
 - ⏳ **Smart routing** — one wake word, fast local intents handled on-device, everything else escalated to the LLM (the elegant form of "local + cloud")
-- ⏳ **Barge-in** — true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem — an echo-residual calibration rig ships in `broker/tools/`, see `M2_RUNBOOK.md`)
+- ⏳ **Barge-in** — true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem — an echo-residual calibration rig ships in `broker/tools/`)
 - ⏳ **Beamforming** — tap the XMOS array's focused channel to reject off-axis room noise (a TV, another speaker)
 
 MIT licensed. Attribution in [NOTICE.md](NOTICE.md).

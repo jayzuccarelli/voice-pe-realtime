@@ -6,7 +6,7 @@ sending NOTHING back. Because no bot audio is ever sent, the firmware's
 mic gate never engages and the mic streams for the whole session.
 
 Run it on the port the puck targets (the live broker must be stopped
-first — see M2_RUNBOOK.md), wake the puck, and play the reference clip
+first), wake the puck, and play the reference clip
 through the puck's media_player via m2_play_ref.py. What lands here is
 the XMOS ch1 post-AEC residual of that playback — the real signal the
 NCC gate would see.
