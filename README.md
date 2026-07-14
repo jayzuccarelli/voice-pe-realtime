@@ -74,8 +74,12 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 | `HA_MCP_URL` / `HA_TOKEN` | — | enable HA control (both required) |
 | `MUSIC_PLAYER` | — | default Music Assistant speaker |
 | `VAD_*` | sane defaults | OpenAI server-VAD tuning |
+| `FOLLOWUP_WINDOW_SECONDS` | `6.0` | after each reply, how long the mic stays open for a follow-up before the broker disconnects the device (wake word re-arms) |
+| `MAX_TURNS_PER_WAKE` | `8` | user turns allowed per wake, so TV speech can't spiral a session |
 | `MAX_SESSION_SECONDS` | `3000` | rotate before the 60-min cap |
 | `IDLE_REFRESH_SECONDS` | `600` | refresh a stale idle session |
+
+Turn hygiene (`FOLLOWUP_WINDOW_SECONDS` / `MAX_TURNS_PER_WAKE`): set either to `0` to disable that bound — both `0` restores the old unbounded behavior, the no-redeploy rollback lever.
 
 ## Firmware
 

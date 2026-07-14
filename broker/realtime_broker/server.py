@@ -22,10 +22,14 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallsStartedFrame,
     InputAudioRawFrame,
     InterruptionFrame,
+    LLMFullResponseEndFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -265,6 +269,201 @@ class _MicInputGate(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+# Fixed allowance from client connect until the first committed user turn. A
+# silent false wake (TV says the wake word, nobody follows up) would otherwise
+# stream mic audio to OpenAI until session rotation: the firmware's 10s
+# auto-stop only arms after the first bot audio chunk, which a silent wake
+# never produces. Internal constant on purpose — a safety floor, not a knob.
+_INITIAL_GRACE_SECONDS = 10.0
+
+
+class _TurnHygiene(FrameProcessor):
+    """Bound how long one wake keeps the conversation open (JAY-84).
+
+    TV speech can keep re-tripping server_vad and spiral a single wake into a
+    minutes-long open-mic session. Two structural bounds, both broker-side
+    (the close reuses end_conversation's {"type":"disconnect"} control frame,
+    so the firmware plays the existing end cue and re-arms the wake word;
+    zero firmware changes):
+
+    - Follow-up window: after each reply the user gets
+      config.followup_window_seconds — measured from when the SPEAKER goes
+      quiet (the playback gate's clock + VAD release), not response.done — to
+      take another turn. Expiry with nothing in flight -> disconnect. A real
+      follow-up starts a fresh window after its reply, so natural
+      conversation is untouched.
+    - Turn budget: config.max_turns_per_wake committed user turns per WS
+      connection; once reached, disconnect as soon as the current reply
+      finishes playing (never mid-speech). Caps the model-fooled-by-TV
+      spiral even when each TV line lands inside the window.
+
+    Either knob at 0 disables that bound (both 0 = exactly the pre-hygiene
+    behavior) — the no-redeploy rollback lever. The OpenAI session stays
+    alive either way; context carries to the next wake as today.
+
+    Must sit between the service and the assistant context aggregator: the
+    aggregator CONSUMES LLMFullResponseEndFrame and FunctionCallsStartedFrame
+    (llm_response_universal.py) instead of re-pushing them, so downstream of
+    it a response end is invisible.
+    """
+
+    def __init__(self, gate: "_BotPlaybackGate", config: Config, get_ws) -> None:  # noqa: ANN001
+        super().__init__()
+        self._gate = gate  # single source of truth for the playback clock
+        self._config = config
+        self._get_ws = get_ws
+        self._device_connected = False
+        self._connect_time = 0.0
+        self._turns = 0  # committed user turns this WS connection
+        self._user_speaking = False  # UserStarted seen without UserStopped
+        self._awaiting_response = False  # a response should still arrive/finish
+        self._awaiting_since = 0.0  # when awaiting was last (re)armed
+        self._tool_followup = False  # a tool call will trigger a 2nd response
+        self._watch_task: asyncio.Task | None = None  # single-flight closer
+        self._gen = 0  # bumps per device connect; stale watchers self-identify
+        self._conn_ws = None  # the socket this connection's state belongs to
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, UserStartedSpeakingFrame) and direction == FrameDirection.DOWNSTREAM:
+            self._user_speaking = True
+        elif isinstance(frame, UserStoppedSpeakingFrame) and direction == FrameDirection.DOWNSTREAM:
+            # server_vad committed the turn and auto-creates the response.
+            self._user_speaking = False
+            self._awaiting_response = True
+            self._awaiting_since = asyncio.get_running_loop().time()
+            self._tool_followup = False  # fresh response cycle; drop stale state
+            self._turns += 1
+        elif isinstance(frame, FunctionCallsStartedFrame) and direction == FrameDirection.DOWNSTREAM:
+            # Keyed on FunctionCallsStartedFrame, not FunctionCallInProgressFrame:
+            # in-progress is broadcast from a function-runner TASK
+            # (llm_service._run_parallel_function_calls), so it can land after
+            # response.done's LLMFullResponseEndFrame; started is pushed inline
+            # from the receive loop, strictly before it.
+            if any(fc.function_name != "wait_for_user" for fc in frame.function_calls):
+                # HA tools / get_weather / play_music trigger a second
+                # response.create for the verbalization — stay awaiting until
+                # THAT response ends. wait_for_user has run_llm=False (no
+                # follow-up response), so an ignored TV line clears awaiting
+                # on this response's end; playback_end is already past, so
+                # the window expires promptly instead of being extended.
+                self._tool_followup = True
+                self._awaiting_since = asyncio.get_running_loop().time()
+        elif isinstance(frame, LLMFullResponseEndFrame) and direction == FrameDirection.DOWNSTREAM:
+            if self._tool_followup:
+                self._tool_followup = False  # verbalization response still coming
+                self._awaiting_since = asyncio.get_running_loop().time()
+            else:
+                self._awaiting_response = False
+        elif isinstance(frame, (CancelFrame, EndFrame)):
+            if self._watch_task is not None:
+                task, self._watch_task = self._watch_task, None
+                await self.cancel_task(task)
+        await self.push_frame(frame, direction)
+
+    def on_device_connect(self) -> None:
+        # Fresh wake = fresh budget and window. The connect handler runs for
+        # the NEW client before a kicked stale socket's disconnect fires (and
+        # that handler's stale guard returns early), so old-connection
+        # teardown can't clobber this state.
+        self._device_connected = True
+        self._connect_time = asyncio.get_running_loop().time()
+        self._turns = 0
+        self._user_speaking = False
+        self._awaiting_response = False
+        self._tool_followup = False
+        self._gen += 1
+        # Stamp the socket this connection's state belongs to (pipecat swaps
+        # transport._websocket before this handler's task runs) — the watcher
+        # re-checks it before sending, so a tick that interleaves between the
+        # swap and this reset can't fire the OLD connection's expiry at the
+        # NEW socket and kill a fresh wake.
+        self._conn_ws = self._get_ws()
+        if self._watch_task is not None:
+            # Always cancel-and-recreate rather than reuse: an old watcher can
+            # be parked in ws.send on a half-dead kicked socket for seconds —
+            # skipping creation here would leave the new connection with NO
+            # watcher once it finishes (window + budget silently off).
+            task, self._watch_task = self._watch_task, None
+            asyncio.create_task(self.cancel_task(task))
+        if self._config.followup_window_seconds > 0 or self._config.max_turns_per_wake > 0:
+            self._watch_task = self.create_task(self._watch())
+
+    async def on_device_disconnect(self) -> None:
+        self._device_connected = False
+        if self._watch_task is not None:
+            task, self._watch_task = self._watch_task, None
+            await self.cancel_task(task)
+
+    async def _watch(self) -> None:
+        # ~0.5s tick; single-flight like the gate's _restore_task. Exits (and
+        # clears itself) after signaling the close: the firmware closes the WS
+        # in response, and the next wake's on_device_connect starts a fresh
+        # watcher. end_conversation needs no special-casing — its disconnect
+        # makes the device drop, and on_device_disconnect cancels us.
+        loop = asyncio.get_running_loop()
+        release = self._config.vad_release_delay_ms / 1000
+        window = self._config.followup_window_seconds
+        budget = self._config.max_turns_per_wake
+        my_gen = self._gen  # a newer connection's watcher supersedes us
+        while True:
+            await asyncio.sleep(0.5)
+            if self._gen != my_gen:
+                return  # superseded; the new watcher owns _watch_task now
+            now = loop.time()
+            if self._awaiting_response and now - self._awaiting_since > 60.0:
+                # Fail-open guard: OpenAI can kill a response without a
+                # response.done reaching the pipeline, and a hung tool's
+                # verbalization response may never materialize — either would
+                # hold the window open forever. 60s is far above any real
+                # response/tool latency (play_music's HA path ~20s); don't
+                # shorten it below that.
+                logger.warning("turn hygiene: response overdue >60s; clearing awaiting")
+                self._awaiting_response = False
+            if not self._device_connected or self._user_speaking or self._awaiting_response:
+                continue
+            quiet_since = self._gate._playback_end + release  # speaker + echo tail
+            if budget > 0 and self._turns >= budget and now >= quiet_since:
+                reason = f"turn budget reached ({self._turns}/{budget})"
+            elif window > 0 and now >= max(
+                quiet_since, self._connect_time + _INITIAL_GRACE_SECONDS
+            ) + window:
+                # max() folds in the initial grace: before the first committed
+                # turn playback_end is stale (or zero), and a silent false
+                # wake must still get bounded — grace + window — instead of
+                # streaming mic audio to OpenAI until rotation.
+                reason = f"follow-up window expired ({self._turns} turns)"
+            elif (
+                window <= 0
+                and budget > 0
+                and self._turns == 0
+                and now >= self._connect_time + _INITIAL_GRACE_SECONDS
+            ):
+                # Budget-only config (window disabled): the budget branch can't
+                # fire at 0 turns, so without this a silent false wake would
+                # stream mic audio until rotation. Grace stays the floor
+                # whenever any hygiene knob is on.
+                reason = "initial grace expired with no committed turn"
+            else:
+                continue
+            ws = self._get_ws()
+            if ws is None:
+                continue  # transport already dropped it; disconnect event cleans up
+            if ws is not self._conn_ws:
+                continue  # socket swapped mid-tick (re-wake); fresh state incoming
+            try:
+                await ws.send('{"type":"disconnect"}')
+            except Exception:  # noqa: BLE001
+                logger.exception("turn hygiene: failed to signal device")
+            else:
+                logger.info("turn hygiene: %s; disconnecting device", reason)
+            if self._gen == my_gen:
+                # Only clear our own handle — a re-wake during the send above
+                # already replaced _watch_task with the new watcher's.
+                self._watch_task = None
+            return
+
+
 async def run(config: Config) -> None:
     """Serve forever, rotating the OpenAI session before its 60-min cap."""
     mcp = None
@@ -424,6 +623,9 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         service, config, lambda: getattr(transport.input(), "_websocket", None)
     )
     mic_gate = _MicInputGate(gate, config)
+    hygiene = _TurnHygiene(
+        gate, config, lambda: getattr(transport.input(), "_websocket", None)
+    )
     aggregator = LLMContextAggregatorPair(LLMContext())
     pipeline = Pipeline(
         [
@@ -436,6 +638,10 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             # the aggregator reacts to them — see _UserTranscriptLogger.
             _UserTranscriptLogger(),
             service,
+            # Turn hygiene must observe the service's raw downstream frames;
+            # the assistant aggregator below consumes response-end and
+            # function-call frames — see _TurnHygiene.
+            hygiene,
             aggregator.assistant(),
             gate,
             transport.output(),
@@ -460,6 +666,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         # the reset's few client events land well before wake-ack ends and
         # real speech starts.
         asyncio.create_task(gate.reset_vad(drain=0.0))
+        hygiene.on_device_connect()
 
     @transport.event_handler("on_client_disconnected")
     async def _on_disconnect(_transport, client, *args):  # noqa: ANN001
@@ -486,6 +693,10 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         # (stray 'Bye.' in the TV test 2026-07-01; 'I'm here when you're
         # ready' in the soak 2026-07-02).
         asyncio.create_task(gate.reset_vad())
+        # Cancel the hygiene watcher for a REAL disconnect only — the stale
+        # guard above already returned for a kicked old socket, so it can't
+        # cancel the new connection's window/budget state.
+        await hygiene.on_device_disconnect()
 
     task = PipelineTask(pipeline, idle_timeout_secs=None, cancel_on_idle_timeout=False)
     runner_task = asyncio.create_task(PipelineRunner().run(task))
