@@ -8,7 +8,7 @@ mic gate never engages and the mic streams for the whole session.
 Run it on the port the puck targets (the live broker must be stopped
 first), wake the puck, and play the reference clip
 through the puck's media_player via m2_play_ref.py. What lands here is
-the XMOS ch1 post-AEC residual of that playback — the real signal the
+the XMOS ch1 post-AEC residual of that playback, the real signal the
 NCC gate would see.
 
     docker stop voicepe
@@ -43,7 +43,7 @@ async def main() -> None:
 
     out = Path(args.out_dir)
     out.mkdir(exist_ok=True)
-    # Resume numbering after existing captures — a fresh run must never
+    # Resume numbering after existing captures: a fresh run must never
     # overwrite takes recorded by a previous one mid-calibration-session.
     counter = max(
         (int(p.stem.split("_")[1]) for p in out.glob("capture_*.pcm")
@@ -80,7 +80,7 @@ async def main() -> None:
         print(f"[m2] device disconnected: {nbytes/2/RATE:.1f}s captured in {pcm_path}")
 
     async with websockets.serve(handle, args.host, args.port, max_size=None):
-        print(f"[m2] capture server on ws://{args.host}:{args.port} — wake the puck when ready")
+        print(f"[m2] capture server on ws://{args.host}:{args.port}, wake the puck when ready")
         await asyncio.Future()
 
 

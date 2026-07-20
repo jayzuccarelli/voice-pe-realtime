@@ -82,7 +82,7 @@ async def main() -> None:
                     print(f"  <-- TEXT FRAME: {msg[:200]}")
                     state["text_frames"].append(msg)
                     # Only count interrupt frames that arrive AFTER we sent
-                    # the interruptor — an early one is a spurious boundary
+                    # the interruptor: an early one is a spurious boundary
                     # flush (a bug), not a successful barge-in.
                     if "interrupt" in msg and interrupt_sent.is_set():
                         state["interrupt_frame"] = True

@@ -1,3 +1,11 @@
+# Derived from esphome/home-assistant-voice-pe, file `home-assistant-voice.yaml`.
+# Copyright (c) 2019 ESPHome. Licensed under the ESPHome License, which applies
+# MIT terms to non-C++ files such as this one.
+# Upstream: https://github.com/esphome/home-assistant-voice-pe
+#
+# Modified here to add a dual-mode path that streams audio to a server-side
+# realtime broker alongside the stock Assist pipeline.
+
 substitutions:
   # Phases of the Voice Assistant
   # The voice assistant is ready to be triggered by a wake word
@@ -14,7 +22,7 @@ substitutions:
   voice_assist_not_ready_phase_id: '10'
   # The voice assistant encountered an error
   voice_assist_error_phase_id: '11'
-  # Change this to true in case you ahve a hidden SSID at home.
+  # Change this to true in case you have a hidden SSID at home.
   hidden_ssid: "false"
   # Substitutions for audio files
   jack_connected_sound_file: https://github.com/esphome/home-assistant-voice-pe/raw/dev/sounds/jack_connected.flac

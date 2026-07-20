@@ -7,7 +7,7 @@ from esphome.const import CONF_ID, CONF_MICROPHONE, CONF_SPEAKER
 from esphome.core import CORE
 from esphome.components.esp32 import add_idf_component
 
-CODEOWNERS = ["@openai-realtime-voice-agent"]
+CODEOWNERS = ["@jayzuccarelli"]
 DEPENDENCIES = ["microphone", "speaker"]
 
 voice_assistant_websocket_ns = cg.esphome_ns.namespace("voice_assistant_websocket")

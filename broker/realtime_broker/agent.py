@@ -2,7 +2,7 @@
 
 Configures voice, system prompt, server-side VAD, and the available tools:
 the Home Assistant MCP tools (if HA control is enabled) plus two custom broker
-tools — `get_weather` (live HA weather, which HA's MCP doesn't surface) and
+tools, `get_weather` (live HA weather, which HA's MCP doesn't surface) and
 `end_conversation` (clean "ok, bye" stop). Handlers for the custom tools are
 registered by the server (they need HA access / the device connection).
 """
@@ -34,7 +34,7 @@ class VoicePERealtimeService(OpenAIRealtimeLLMService):
     Upstream's _handle_context treats the FIRST context frame as conversation
     setup: it replays the context as conversation items and issues a bare
     response.create. With server_vad the audio commit already created the user
-    item and auto-created the response, so that double-fires — OpenAI rejects
+    item and auto-created the response, so that double-fires, OpenAI rejects
     it (conversation_already_has_active_response) and Pipecat treats any error
     event as fatal, killing the session's receive loop. Conversation state
     lives server-side here; the only thing context frames must deliver is new
@@ -99,7 +99,7 @@ CUSTOM_TOOLS = [
             "to you: TV or other media dialogue, or a conversation between other "
             "people. If you just answered and the next utterance could be a "
             "follow-up, reaction, or challenge to your answer ('are you sure?', "
-            "'okay, and what about...'), it IS addressed to you — answer it "
+            "'okay, and what about...'), it IS addressed to you, answer it "
             "instead of calling this. Calling it means stay silent and keep "
             "listening. Produce no spoken reply when you call it."
         ),
@@ -109,7 +109,7 @@ CUSTOM_TOOLS = [
 
 # Appended to the configured persona instructions. This device is far-field and
 # its mic hears the whole room (TV, other people), so the model must gate on
-# whether speech is actually addressed to it — the OpenAI-recommended pattern
+# whether speech is actually addressed to it: the OpenAI-recommended pattern
 # for rejecting non-addressed speech (there is no speaker separation at the API
 # layer).
 BACKGROUND_GUIDANCE = (
@@ -121,7 +121,7 @@ BACKGROUND_GUIDANCE = (
     "right after you answer, the next utterance is usually the same user "
     "following up. A follow-up question, reaction, or challenge to what you just "
     "said ('are you sure?', 'okay, and...', 'what about tomorrow?') is addressed "
-    "to you even when it does not name you — answer it. When torn between "
+    "to you even when it does not name you, answer it. When torn between "
     "answering a plausible follow-up and staying silent, answer: a wrongly "
     "ignored user must repeat themselves, which is worse than a wrongly "
     "answered TV line."
@@ -136,7 +136,7 @@ def build_audio_input(config: Config, threshold: float | None) -> AudioInput:
     transcription.
 
     threshold=None disables turn detection entirely (serialized as
-    turn_detection: null), which also discards the server's VAD state —
+    turn_detection: null), which also discards the server's VAD state,
     used to drop a speech-in-progress segment after a device disconnect.
     """
     return AudioInput(
@@ -158,7 +158,7 @@ def build_audio_input(config: Config, threshold: float | None) -> AudioInput:
         # off lets the quiet-but-clean tap reach the VAD intact.
         noise_reduction=None,
         # Optionally transcribe each user turn so broker logs show what OpenAI
-        # heard (self-trigger / "janky" diagnosis). Off by default — it bills a
+        # heard (self-trigger / "janky" diagnosis). Off by default: it bills a
         # Whisper pass per turn. whisper-1 because gpt-4o-transcribe yielded
         # zero transcription events on gpt-realtime.
         transcription=(

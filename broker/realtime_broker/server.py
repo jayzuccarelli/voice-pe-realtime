@@ -62,7 +62,7 @@ class _UserTranscriptLogger(FrameProcessor):
     Consumes the TranscriptionFrame instead of re-pushing it. If one reaches
     the user aggregator upstream, the aggregator emulates VAD (a spurious
     pipeline interruption) and then pushes a context frame that makes the
-    service double-fire response.create — OpenAI rejects it
+    service double-fire response.create, OpenAI rejects it
     (conversation_already_has_active_response) and Pipecat treats any error
     event as fatal, silently killing the session's receive loop. Nothing
     upstream of here needs the transcript, so log it and stop it.
@@ -86,7 +86,7 @@ class _BotPlaybackGate(FrameProcessor):
        voice in the mic feed to trip server_vad at any threshold a
        normal-volume user can also cross (measured: bleed trips 0.6, user is
        inaudible at 0.7+). So: sensitive threshold while idle, strict while
-       the bot has the floor. Barge-in still works — it just needs a slightly
+       the bot has the floor. Barge-in still works, it just needs a slightly
        raised voice.
 
     2. Barge-in flush: on a real interruption, tell the device to drop its
@@ -201,17 +201,17 @@ class _BotPlaybackGate(FrameProcessor):
         Clearing the input buffer removes the audio BYTES but not the VAD
         state machine: when the device vanishes mid-utterance, server_vad
         still holds speech-started, and once post-reconnect silence gives it
-        its window it commits whatever is buffered — the tail fragment that
-        drained from the pipeline after the clear, or nothing at all — and
+        its window it commits whatever is buffered, the tail fragment that
+        drained from the pipeline after the clear, or nothing at all, and
         auto-creates a response. The model greets the ghost turn ("I'm here
         when you're ready"; soak 2026-07-02, 5/5 then 2/6 with a delayed
         clear alone). Disabling turn detection makes the server drop the
         pending segment; then let the stale pipeline tail drain (`drain`
-        seconds — 0 on connect, when any tail drained long ago), wipe the
+        seconds, 0 on connect, when any tail drained long ago), wipe the
         buffer, and re-enable at the current threshold.
 
         Single-flight: if a reset is already in flight, joining callers
-        no-op — the running one clears and re-enables for everyone. In
+        no-op, the running one clears and re-enables for everyone. In
         particular a fast reconnect's on-connect reset must NOT preempt the
         disconnect reset mid-drain, or the clear fires before the stale
         tail lands and the ghost returns. _set_threshold defers its
@@ -244,8 +244,8 @@ class _MicInputGate(FrameProcessor):
     server-side noise reduction (removed because it scrubbed the quiet NS-tap
     mic to nothing), that residual is loud enough for server_vad to read as
     user speech, so the bot answers its own echo in a runaway loop. While the
-    speaker is playing — tracked by the playback gate's buffer-accurate model,
-    plus the VAD release margin — replace the incoming mic audio with silence
+    speaker is playing, tracked by the playback gate's buffer-accurate model,
+    plus the VAD release margin, replace the incoming mic audio with silence
     so OpenAI has nothing to trigger on. This makes the assistant turn-based;
     real barge-in needs echo cancellation, not just an open mic.
     """
@@ -273,12 +273,12 @@ class _MicInputGate(FrameProcessor):
 # silent false wake (TV says the wake word, nobody follows up) would otherwise
 # stream mic audio to OpenAI until session rotation: the firmware's 10s
 # auto-stop only arms after the first bot audio chunk, which a silent wake
-# never produces. Internal constant on purpose — a safety floor, not a knob.
+# never produces. Internal constant on purpose: a safety floor, not a knob.
 _INITIAL_GRACE_SECONDS = 10.0
 
 
 class _TurnHygiene(FrameProcessor):
-    """Bound how long one wake keeps the conversation open (JAY-84).
+    """Bound how long one wake keeps the conversation open (turn hygiene).
 
     TV speech can keep re-tripping server_vad and spiral a single wake into a
     minutes-long open-mic session. Two structural bounds, both broker-side
@@ -287,8 +287,8 @@ class _TurnHygiene(FrameProcessor):
     zero firmware changes):
 
     - Follow-up window: after each reply the user gets
-      config.followup_window_seconds — measured from when the SPEAKER goes
-      quiet (the playback gate's clock + VAD release), not response.done — to
+      config.followup_window_seconds, measured from when the SPEAKER goes
+      quiet (the playback gate's clock + VAD release), not response.done, to
       take another turn. Expiry with nothing in flight -> disconnect. A real
       follow-up starts a fresh window after its reply, so natural
       conversation is untouched.
@@ -298,7 +298,7 @@ class _TurnHygiene(FrameProcessor):
       spiral even when each TV line lands inside the window.
 
     Either knob at 0 disables that bound (both 0 = exactly the pre-hygiene
-    behavior) — the no-redeploy rollback lever. The OpenAI session stays
+    behavior): the no-redeploy rollback lever. The OpenAI session stays
     alive either way; context carries to the next wake as today.
 
     Must sit between the service and the assistant context aggregator: the
@@ -342,7 +342,7 @@ class _TurnHygiene(FrameProcessor):
             # from the receive loop, strictly before it.
             if any(fc.function_name != "wait_for_user" for fc in frame.function_calls):
                 # HA tools / get_weather / play_music trigger a second
-                # response.create for the verbalization — stay awaiting until
+                # response.create for the verbalization: stay awaiting until
                 # THAT response ends. wait_for_user has run_llm=False (no
                 # follow-up response), so an ignored TV line clears awaiting
                 # on this response's end; playback_end is already past, so
@@ -374,14 +374,14 @@ class _TurnHygiene(FrameProcessor):
         self._tool_followup = False
         self._gen += 1
         # Stamp the socket this connection's state belongs to (pipecat swaps
-        # transport._websocket before this handler's task runs) — the watcher
+        # transport._websocket before this handler's task runs): the watcher
         # re-checks it before sending, so a tick that interleaves between the
         # swap and this reset can't fire the OLD connection's expiry at the
         # NEW socket and kill a fresh wake.
         self._conn_ws = self._get_ws()
         if self._watch_task is not None:
             # Always cancel-and-recreate rather than reuse: an old watcher can
-            # be parked in ws.send on a half-dead kicked socket for seconds —
+            # be parked in ws.send on a half-dead kicked socket for seconds :
             # skipping creation here would leave the new connection with NO
             # watcher once it finishes (window + budget silently off).
             task, self._watch_task = self._watch_task, None
@@ -399,7 +399,7 @@ class _TurnHygiene(FrameProcessor):
         # ~0.5s tick; single-flight like the gate's _restore_task. Exits (and
         # clears itself) after signaling the close: the firmware closes the WS
         # in response, and the next wake's on_device_connect starts a fresh
-        # watcher. end_conversation needs no special-casing — its disconnect
+        # watcher. end_conversation needs no special-casing: its disconnect
         # makes the device drop, and on_device_disconnect cancels us.
         loop = asyncio.get_running_loop()
         release = self._config.vad_release_delay_ms / 1000
@@ -414,7 +414,7 @@ class _TurnHygiene(FrameProcessor):
             if self._awaiting_response and now - self._awaiting_since > 60.0:
                 # Fail-open guard: OpenAI can kill a response without a
                 # response.done reaching the pipeline, and a hung tool's
-                # verbalization response may never materialize — either would
+                # verbalization response may never materialize: either would
                 # hold the window open forever. 60s is far above any real
                 # response/tool latency (play_music's HA path ~20s); don't
                 # shorten it below that.
@@ -430,7 +430,7 @@ class _TurnHygiene(FrameProcessor):
             ) + window:
                 # max() folds in the initial grace: before the first committed
                 # turn playback_end is stale (or zero), and a silent false
-                # wake must still get bounded — grace + window — instead of
+                # wake must still get bounded: grace + window: instead of
                 # streaming mic audio to OpenAI until rotation.
                 reason = f"follow-up window expired ({self._turns} turns)"
             elif (
@@ -458,7 +458,7 @@ class _TurnHygiene(FrameProcessor):
             else:
                 logger.info("turn hygiene: %s; disconnecting device", reason)
             if self._gen == my_gen:
-                # Only clear our own handle — a re-wake during the send above
+                # Only clear our own handle: a re-wake during the send above
                 # already replaced _watch_task with the new watcher's.
                 self._watch_task = None
             return
@@ -550,7 +550,7 @@ def _start_music(config: Config, query: str, speaker: str | None) -> str:
             None,
         )
         if target is None:
-            # A speaker was named but didn't match — don't silently play on the
+            # A speaker was named but didn't match: don't silently play on the
             # wrong one; tell the user what's available.
             return f"I couldn't find a speaker called {speaker}. Available: {avail}."
     else:
@@ -635,12 +635,12 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             # The realtime service pushes user TranscriptionFrames UPSTREAM
             # (Pipecat >= 0.0.92); the logger must sit between the aggregator
             # and the service so it can intercept (and consume) them before
-            # the aggregator reacts to them — see _UserTranscriptLogger.
+            # the aggregator reacts to them: see _UserTranscriptLogger.
             _UserTranscriptLogger(),
             service,
             # Turn hygiene must observe the service's raw downstream frames;
             # the assistant aggregator below consumes response-end and
-            # function-call frames — see _TurnHygiene.
+            # function-call frames: see _TurnHygiene.
             hygiene,
             aggregator.assistant(),
             gate,
@@ -658,8 +658,8 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
         # The device opens a fresh websocket per wake, but the OpenAI session
-        # is reused for context. Anything left from the previous connection —
-        # uncommitted buffer audio AND a speech-in-progress VAD segment —
+        # is reused for context. Anything left from the previous connection :
+        # uncommitted buffer audio AND a speech-in-progress VAD segment :
         # would surface as a ghost turn before the real question (stray
         # 'Bye.', TV test 2026-07-01). Full reset, no drain: any stale
         # pipeline tail finished draining while no device was connected, and
@@ -675,7 +675,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         # WiFi blip: the dead socket never closed), Pipecat swaps the
         # transport's websocket to the NEW client before the old handler
         # exits and fires this event for the OLD one. The device is still
-        # here — don't flag it disconnected, and above all don't reset VAD
+        # here: don't flag it disconnected, and above all don't reset VAD
         # and clear the buffer while the user's real question streams in.
         # The on-connect reset already dealt with the stale state.
         current = getattr(transport.input(), "_websocket", None)
@@ -687,13 +687,13 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         logger.info("Device disconnected")
         # A disconnect mid-utterance leaves server VAD holding a
         # speech-in-progress segment (plus mic-stream tail still draining
-        # through the pipeline). A buffer clear alone can't kill it — see
+        # through the pipeline). A buffer clear alone can't kill it: see
         # _BotPlaybackGate.reset_vad, which disables and re-enables turn
         # detection to drop the segment before it becomes a ghost turn
         # (stray 'Bye.' in the TV test 2026-07-01; 'I'm here when you're
         # ready' in the soak 2026-07-02).
         asyncio.create_task(gate.reset_vad())
-        # Cancel the hygiene watcher for a REAL disconnect only — the stale
+        # Cancel the hygiene watcher for a REAL disconnect only: the stale
         # guard above already returned for a kicked old socket, so it can't
         # cancel the new connection's window/budget state.
         await hygiene.on_device_disconnect()
@@ -705,7 +705,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         # Whichever comes first: the session dies on its own, it ages out, or
         # the OpenAI socket dies underneath it. OpenAI drops idle Realtime
         # sockets well before our max-age rotation, and Pipecat keeps the
-        # stale handle and pumps audio into it — the device hears silence
+        # stale handle and pumps audio into it: the device hears silence
         # until the next rotation. Poll the socket and rotate the moment it
         # goes dead (websockets' keepalive flips state within ~40s).
         #
@@ -736,7 +736,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
                 break
             except asyncio.TimeoutError:
                 pass
-            # Two death modes: the socket itself dies (idle drop — keepalive
+            # Two death modes: the socket itself dies (idle drop: keepalive
             # flips the state within ~40s), or Pipecat's receive loop exits on
             # an OpenAI error event while the socket stays OPEN (brain-dead
             # session: audio goes in, nothing comes back).
@@ -757,7 +757,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         if not runner_task.done():
             await task.cancel()
         # Await the runner to fully finish so the websocket server releases the
-        # port before the next session rebinds — otherwise rotation can hit an
+        # port before the next session rebinds: otherwise rotation can hit an
         # intermittent "address already in use".
         try:
             await asyncio.wait_for(asyncio.shield(runner_task), timeout=10)
