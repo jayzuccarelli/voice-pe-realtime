@@ -93,7 +93,7 @@ async def main() -> None:
         write_wav("response.wav", bytes(out))
         print("wrote response.wav")
     else:
-        print("NO AUDIO RETURNED — check broker logs")
+        print("NO AUDIO RETURNED, check broker logs")
 
 
 if __name__ == "__main__":
