@@ -52,7 +52,7 @@ class Config:
     # response.done) to take another turn before the broker disconnects the
     # device and the wake word re-arms; max_turns_per_wake caps committed user
     # turns per WS connection. Either set to 0 disables that bound (both 0 =
-    # exactly the pre-hygiene behavior) — the no-redeploy rollback lever.
+    # exactly the pre-hygiene behavior): the no-redeploy rollback lever.
     followup_window_seconds: float = 6.0
     max_turns_per_wake: int = 8
 
@@ -64,7 +64,7 @@ class Config:
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
     # stayed OPEN (2026-06-10). Refresh the session whenever no device has been
-    # connected for this long — free, and invisible to the user.
+    # connected for this long: free, and invisible to the user.
     idle_refresh_seconds: int = 600  # 10 min
 
     @property
