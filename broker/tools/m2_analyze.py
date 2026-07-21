@@ -88,7 +88,7 @@ def main() -> None:
         # shorter one, which would produce a garbage global lag and a false
         # "residual uncorrelated" verdict. The capture must cover the clip.
         raise SystemExit(
-            "capture shorter than the reference, bad take, retake it "
+            "capture shorter than the reference. Bad take, retake it "
             f"(capture {len(mic)/RATE:.1f}s < ref {len(ref)/RATE:.1f}s)"
         )
 
