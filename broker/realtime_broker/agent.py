@@ -16,8 +16,10 @@ from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
     AudioOutput,
+    ClientEvent,
     InputAudioTranscription,
     SessionProperties,
+    SessionUpdateEvent,
     TurnDetection,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
@@ -42,10 +44,26 @@ class VoicePERealtimeService(OpenAIRealtimeLLMService):
     its own response.create).
     """
 
+    def __init__(self, *args, reasoning_effort: str | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._reasoning_effort = reasoning_effort
+
     async def _handle_context(self, context: LLMContext) -> None:
         self._context = context
         self._llm_needs_conversation_setup = False
         await self._process_completed_function_calls(send_new_results=True)
+
+    async def send_client_event(self, event: ClientEvent) -> None:
+        # Pipecat 0.0.97's SessionProperties has no `reasoning` field and
+        # pydantic serializes by declared type, so a subclass field would be
+        # dropped — inject into the wire dict instead. Applies to every
+        # session.update (initial setup and mid-session).
+        if self._reasoning_effort and isinstance(event, SessionUpdateEvent):
+            dump = event.model_dump(exclude_none=True)
+            dump["session"]["reasoning"] = {"effort": self._reasoning_effort}
+            await self._ws_send(dump)
+            return
+        await super().send_client_event(event)
 
 # Custom broker tools, registered with handlers by the server.
 CUSTOM_TOOLS = [
@@ -206,6 +224,7 @@ async def build_agent(config: Config, mcp: MCPClient | None) -> OpenAIRealtimeLL
         model=config.model,
         session_properties=session,
         start_audio_paused=False,
+        reasoning_effort=config.reasoning_effort,
     )
 
     if mcp is not None and tools_schema is not None:
