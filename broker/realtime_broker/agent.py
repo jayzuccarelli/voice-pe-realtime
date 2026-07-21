@@ -99,7 +99,7 @@ CUSTOM_TOOLS = [
             "to you: TV or other media dialogue, or a conversation between other "
             "people. If you just answered and the next utterance could be a "
             "follow-up, reaction, or challenge to your answer ('are you sure?', "
-            "'okay, and what about...'), it IS addressed to you, answer it "
+            "'okay, and what about...'), it IS addressed to you. Answer it "
             "instead of calling this. Calling it means stay silent and keep "
             "listening. Produce no spoken reply when you call it."
         ),
@@ -121,7 +121,7 @@ BACKGROUND_GUIDANCE = (
     "right after you answer, the next utterance is usually the same user "
     "following up. A follow-up question, reaction, or challenge to what you just "
     "said ('are you sure?', 'okay, and...', 'what about tomorrow?') is addressed "
-    "to you even when it does not name you, answer it. When torn between "
+    "to you even when it does not name you. Answer it. When torn between "
     "answering a plausible follow-up and staying silent, answer: a wrongly "
     "ignored user must repeat themselves, which is worse than a wrongly "
     "answered TV line."

@@ -1,7 +1,8 @@
 """Proves the broker rotates the OpenAI Realtime session SEAMLESSLY mid-call.
 
 OpenAI caps a Realtime session at ~60 min and treats expiry as fatal, a failure
-mode the original proof-of-concept didn't handle (fjfricke/ha-openai-realtime#8). Our broker rotates proactively
+mode the original proof-of-concept didn't handle
+(fjfricke/ha-openai-realtime#8). Our broker rotates proactively
 before the cap and rebuilds the session under a still-connected device. This
 test forces that path: start a broker with a tiny MAX_SESSION_SECONDS, hold ONE
 device connection open across several rotations, and assert every turn still

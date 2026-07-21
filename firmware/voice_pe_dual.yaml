@@ -1,10 +1,11 @@
 # Derived from esphome/home-assistant-voice-pe, file `home-assistant-voice.yaml`.
 # Copyright (c) 2019 ESPHome. Licensed under the ESPHome License, which applies
-# MIT terms to non-C++ files such as this one.
+# MIT terms to non-C++ files such as this one. Full license text, including the
+# MIT permission notice, is in `firmware/LICENSE.esphome`.
 # Upstream: https://github.com/esphome/home-assistant-voice-pe
 #
-# Modified here to add a dual-mode path that streams audio to a server-side
-# realtime broker alongside the stock Assist pipeline.
+# Modified here to route the wake word to a server-side realtime broker instead
+# of the stock Assist pipeline. See the models block for which wake word.
 
 substitutions:
   # Phases of the Voice Assistant

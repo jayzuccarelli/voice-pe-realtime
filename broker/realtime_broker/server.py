@@ -381,7 +381,7 @@ class _TurnHygiene(FrameProcessor):
         self._conn_ws = self._get_ws()
         if self._watch_task is not None:
             # Always cancel-and-recreate rather than reuse: an old watcher can
-            # be parked in ws.send on a half-dead kicked socket for seconds :
+            # be parked in ws.send on a half-dead kicked socket for seconds.
             # skipping creation here would leave the new connection with NO
             # watcher once it finishes (window + budget silently off).
             task, self._watch_task = self._watch_task, None
@@ -430,7 +430,7 @@ class _TurnHygiene(FrameProcessor):
             ) + window:
                 # max() folds in the initial grace: before the first committed
                 # turn playback_end is stale (or zero), and a silent false
-                # wake must still get bounded: grace + window: instead of
+                # wake must still get bounded (grace + window) instead of
                 # streaming mic audio to OpenAI until rotation.
                 reason = f"follow-up window expired ({self._turns} turns)"
             elif (
@@ -658,8 +658,8 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
         # The device opens a fresh websocket per wake, but the OpenAI session
-        # is reused for context. Anything left from the previous connection :
-        # uncommitted buffer audio AND a speech-in-progress VAD segment :
+        # is reused for context. Anything left from the previous connection
+        # (uncommitted buffer audio AND a speech-in-progress VAD segment)
         # would surface as a ghost turn before the real question (stray
         # 'Bye.', TV test 2026-07-01). Full reset, no drain: any stale
         # pipeline tail finished draining while no device was connected, and

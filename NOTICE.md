@@ -10,9 +10,10 @@ and copyright are preserved in
 
 The device YAML in `firmware/voice_pe_dual.yaml` is derived from
 **[esphome/home-assistant-voice-pe](https://github.com/esphome/home-assistant-voice-pe)**
-(`home-assistant-voice.yaml`, Copyright (c) 2019 ESPHome), modified to add the
-dual-mode path that streams to the broker. The ESPHome License applies MIT terms
-to non-C++ files such as YAML.
+(`home-assistant-voice.yaml`, Copyright (c) 2019 ESPHome), modified to route the
+wake word to the broker instead of the stock Assist pipeline. The ESPHome License
+applies MIT terms to non-C++ files such as YAML; its full text, including the MIT
+permission notice, is preserved in `firmware/LICENSE.esphome`.
 
 The broker is an independent rewrite (clean module structure, SSE-based Home
 Assistant MCP control, persistent-session context, reproducible build), but

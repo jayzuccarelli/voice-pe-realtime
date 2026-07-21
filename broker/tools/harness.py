@@ -329,7 +329,7 @@ SCENARIOS = {
 
 
 # ----------------------------------------------------------------------------
-# Turn-hygiene scenarios (turn hygiene): run with --hygiene against an ISOLATED
+# Turn-hygiene scenarios: run with --hygiene against an ISOLATED
 # broker on 8766 started with FOLLOWUP_WINDOW_SECONDS=6 MAX_TURNS_PER_WAKE=2.
 # Kept out of SCENARIOS: the legacy set assumes the feature is off (W=0),
 # because synth/whisper turnaround between turns can approach the 6s window.
@@ -441,7 +441,7 @@ async def run(url: str, soak: int = 1, only: str | None = None, hygiene: bool = 
             t0 = time.monotonic()
             try:
                 ok, detail, lat = await fn(url)
-            except Exception as e:  # noqa: BLE001 — a crash IS a failed scenario
+            except Exception as e:  # noqa: BLE001  (a crash IS a failed scenario)
                 ok, detail, lat = False, f"EXCEPTION {type(e).__name__}: {e}", None
             dt = time.monotonic() - t0
             if lat is not None:
