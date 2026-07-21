@@ -1,5 +1,5 @@
 # Pinned for reproducibility. Pipecat emits the GA Realtime session JSON, so a
-# silent minor bump could change the wire shape — bump deliberately.
+# silent minor bump could change the wire shape, so bump deliberately.
 pipecat-ai[mcp,openai,websocket]==0.0.97
 python-dotenv==1.2.1
 websockets==15.0.1
