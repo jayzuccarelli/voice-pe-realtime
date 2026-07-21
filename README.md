@@ -79,7 +79,7 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 | `MAX_SESSION_SECONDS` | `3000` | rotate before the 60-min cap |
 | `IDLE_REFRESH_SECONDS` | `600` | refresh a stale idle session |
 
-Turn hygiene (`FOLLOWUP_WINDOW_SECONDS` / `MAX_TURNS_PER_WAKE`): set either to `0` to disable that bound, both `0` restores the old unbounded behavior, the no-redeploy rollback lever.
+Turn hygiene (`FOLLOWUP_WINDOW_SECONDS` / `MAX_TURNS_PER_WAKE`): set either to `0` to disable that bound. Setting both to `0` restores the old unbounded behavior, which is the no-redeploy rollback lever.
 
 ## Firmware
 
