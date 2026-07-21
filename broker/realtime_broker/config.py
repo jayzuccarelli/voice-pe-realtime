@@ -14,6 +14,11 @@ class Config:
     model: str = "gpt-realtime"
     voice: str = "marin"
     instructions: str = "You are a helpful voice assistant."
+    # Reasoning effort for reasoning-line Realtime models (gpt-realtime-2.1+):
+    # minimal/low/medium/high/xhigh. The server default (low) makes the model
+    # deliberate and pad its spoken replies; "minimal" suits command-and-control.
+    # None = field not sent, required for non-reasoning models (gpt-realtime).
+    reasoning_effort: str | None = None
 
     ws_host: str = "0.0.0.0"
     ws_port: int = 8765
@@ -80,6 +85,7 @@ class Config:
             openai_api_key=api_key,
             model=os.environ.get("MODEL", "gpt-realtime"),
             voice=os.environ.get("VOICE", "marin"),
+            reasoning_effort=os.environ.get("REASONING_EFFORT") or None,
             instructions=os.environ.get("INSTRUCTIONS", cls.instructions),
             ws_host=os.environ.get("WS_HOST", "0.0.0.0"),
             ws_port=int(os.environ.get("WS_PORT", "8765")),

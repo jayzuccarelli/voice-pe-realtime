@@ -68,6 +68,7 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 |---|---|---|
 | `OPENAI_API_KEY` | — | required |
 | `MODEL` | `gpt-realtime` | Realtime model |
+| `REASONING_EFFORT` | unset | reasoning effort for reasoning-line models (`gpt-realtime-2.1`+): `minimal`/`low`/`medium`/`high`/`xhigh`; leave unset for non-reasoning models |
 | `VOICE` | `marin` | Realtime voice |
 | `INSTRUCTIONS` | generic | system prompt / persona |
 | `WS_HOST` / `WS_PORT` | `0.0.0.0` / `8765` | where the device connects |
