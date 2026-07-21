@@ -1,6 +1,6 @@
 # voice-pe-realtime
 
-Self-hosted, real-time speech-to-speech for the [Home Assistant Voice PE](https://www.home-assistant.io/voice-pe/) — talk to your home with ChatGPT-Voice-style latency, and have it actually *do* things.
+Self-hosted, real-time speech-to-speech for the [Home Assistant Voice PE](https://www.home-assistant.io/voice-pe/): talk to your home with ChatGPT-Voice-style latency, and have it actually *do* things.
 
 Instead of the turn-based `wake → STT → LLM → TTS` Assist pipeline, the Voice PE streams audio straight to a small server-side **broker** that holds an **OpenAI Realtime** session and controls Home Assistant over **MCP**. One round trip, natural voice, real actions.
 
@@ -25,16 +25,16 @@ The canonical pattern: **the agent runs server-side; the device is a thin full-d
 
 ## Why
 
-The stock Voice PE pipeline runs STT → LLM → TTS sequentially — a latency floor that feels clunky next to ChatGPT Voice. Routing audio through a persistent Realtime session collapses that to a single round trip with a natural voice, while MCP gives the model first-class control of the home.
+The stock Voice PE pipeline runs STT → LLM → TTS sequentially, a latency floor that feels clunky next to ChatGPT Voice. Routing audio through a persistent Realtime session collapses that to a single round trip with a natural voice, while MCP gives the model first-class control of the home.
 
 ## Reliability
 
 Speech-to-speech on a $59 puck is easy to demo and hard to keep up. This repo treats robustness as the feature:
 
-- **Session rotation** — OpenAI caps a Realtime session at ~60 min and treats expiry as fatal. The broker rotates the session *before* the cap (and rebuilds after any death) under a still-connected device, so long-lived pucks never drop. Proven continuous across forced rotations.
-- **Idle refresh** — a stale idle session (socket open, silently dead) is refreshed proactively.
-- **Turn hygiene** — a device that vanishes mid-utterance (Wi-Fi blip, session timeout) leaves OpenAI's server VAD holding a speech-in-progress segment that would come back as a ghost turn on the next wake. Clearing the input buffer isn't enough (the bytes go, the VAD state doesn't); the broker disables and re-enables turn detection on disconnect to drop the segment for real. Background speech (a TV, a side conversation) is gated with the OpenAI-recommended `wait_for_user` pattern — with an explicit follow-up bias, so "are you sure about that?" right after an answer gets answered instead of ignored.
-- **A real test harness** — `make check` drives the broker end-to-end exactly like the firmware (streams PCM, transcribes the spoken reply, asserts content + first-audio latency). No hardware needed.
+- **Session rotation**: OpenAI caps a Realtime session at ~60 min and treats expiry as fatal. The broker rotates the session *before* the cap (and rebuilds after any death) under a still-connected device, so long-lived pucks never drop. Proven continuous across forced rotations.
+- **Idle refresh**: a stale idle session (socket open, silently dead) is refreshed proactively.
+- **Turn hygiene**: a device that vanishes mid-utterance (Wi-Fi blip, session timeout) leaves OpenAI's server VAD holding a speech-in-progress segment that would come back as a ghost turn on the next wake. Clearing the input buffer isn't enough (the bytes go, the VAD state doesn't); the broker disables and re-enables turn detection on disconnect to drop the segment for real. Background speech (a TV, a side conversation) is gated with the OpenAI-recommended `wait_for_user` pattern, with an explicit follow-up bias, so "are you sure about that?" right after an answer gets answered instead of ignored.
+- **A real test harness**: `make check` drives the broker end-to-end exactly like the firmware (streams PCM, transcribes the spoken reply, asserts content + first-audio latency). No hardware needed.
 
 ```bash
 cd broker && OPENAI_API_KEY=... make check          # 10 scenarios, pass/fail + p50/p95 latency
@@ -66,24 +66,24 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 
 | Env | Default | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | — | required |
+| `OPENAI_API_KEY` | none | required |
 | `MODEL` | `gpt-realtime` | Realtime model |
 | `VOICE` | `marin` | Realtime voice |
 | `INSTRUCTIONS` | generic | system prompt / persona |
 | `WS_HOST` / `WS_PORT` | `0.0.0.0` / `8765` | where the device connects |
-| `HA_MCP_URL` / `HA_TOKEN` | — | enable HA control (both required) |
-| `MUSIC_PLAYER` | — | default Music Assistant speaker |
+| `HA_MCP_URL` / `HA_TOKEN` | none | enable HA control (both required) |
+| `MUSIC_PLAYER` | none | default Music Assistant speaker |
 | `VAD_*` | sane defaults | OpenAI server-VAD tuning |
 | `FOLLOWUP_WINDOW_SECONDS` | `6.0` | after each reply, how long the mic stays open for a follow-up before the broker disconnects the device (wake word re-arms) |
 | `MAX_TURNS_PER_WAKE` | `8` | user turns allowed per wake, so TV speech can't spiral a session |
 | `MAX_SESSION_SECONDS` | `3000` | rotate before the 60-min cap |
 | `IDLE_REFRESH_SECONDS` | `600` | refresh a stale idle session |
 
-Turn hygiene (`FOLLOWUP_WINDOW_SECONDS` / `MAX_TURNS_PER_WAKE`): set either to `0` to disable that bound — both `0` restores the old unbounded behavior, the no-redeploy rollback lever.
+Turn hygiene (`FOLLOWUP_WINDOW_SECONDS` / `MAX_TURNS_PER_WAKE`): set either to `0` to disable that bound. Setting both to `0` restores the old unbounded behavior, which is the no-redeploy rollback lever.
 
 ## Firmware
 
-The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmware/`](firmware/). Flashing replaces the stock firmware; back up first (`esptool read_flash`) — the ESP32-S3 ROM bootloader makes bricking effectively impossible.
+The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmware/`](firmware/). Flashing replaces the stock firmware; back up first (`esptool read_flash`): the ESP32-S3 ROM bootloader makes bricking effectively impossible.
 
 ## Status & roadmap
 
@@ -92,8 +92,8 @@ The Voice PE runs ESPHome firmware that streams PCM to this broker. See [`firmwa
 - ✅ Session rotation before the 60-min Realtime cap (no dropouts)
 - ✅ Background-speech gating (`wait_for_user`)
 - ✅ End-to-end reliability harness (`make check`)
-- ⏳ **Smart routing** — one wake word, fast local intents handled on-device, everything else escalated to the LLM (the elegant form of "local + cloud")
-- ⏳ **Barge-in** — true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem — an echo-residual calibration rig ships in `broker/tools/`)
-- ⏳ **Beamforming** — tap the XMOS array's focused channel to reject off-axis room noise (a TV, another speaker)
+- ⏳ **Smart routing**: one wake word, fast local intents handled on-device, everything else escalated to the LLM (the elegant form of "local + cloud")
+- ⏳ **Barge-in**: true open-mic interruption using the Voice PE's hardware AEC (experimental; the acoustic self-trigger loop is the open problem, an echo-residual calibration rig ships in `broker/tools/`)
+- ⏳ **Beamforming**: tap the XMOS array's focused channel to reject off-axis room noise (a TV, another speaker)
 
 MIT licensed. Attribution in [NOTICE.md](NOTICE.md).
