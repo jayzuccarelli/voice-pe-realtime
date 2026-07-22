@@ -46,7 +46,9 @@ def _wav(pcm: bytes) -> bytes:
 
 
 def synth_ref(path: Path, voice: str) -> None:
-    key = os.environ["OPENAI_API_KEY"]
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY is required")
     req = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
         data=json.dumps({
