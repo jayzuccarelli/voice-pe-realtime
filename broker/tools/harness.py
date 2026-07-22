@@ -40,7 +40,9 @@ import websockets
 
 RATE = 24000
 CHUNK = int(RATE * 0.02) * 2  # 20 ms of PCM16
-KEY = os.environ["OPENAI_API_KEY"]
+KEY = os.environ.get("OPENAI_API_KEY")
+if not KEY:
+    raise SystemExit("OPENAI_API_KEY is required")
 SILENCE_1S = b"\x00\x00" * RATE
 
 
