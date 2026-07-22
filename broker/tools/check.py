@@ -1,4 +1,4 @@
-"""Canonical verifier for the Domus Realtime broker.
+"""Canonical verifier for the realtime broker.
 
 Closes the loop with NO device and NO being home: synthesizes spoken
 questions, streams them into the live broker exactly as the Voice PE
@@ -76,7 +76,7 @@ def wav_bytes(pcm: bytes) -> bytes:
 
 def transcribe(pcm: bytes) -> str:
     # multipart/form-data with the wav + model field.
-    boundary = "----domuscheck"
+    boundary = "----brokercheck"
     parts = []
     parts.append(f"--{boundary}\r\nContent-Disposition: form-data; "
                  'name="model"\r\n\r\ngpt-4o-transcribe\r\n')
