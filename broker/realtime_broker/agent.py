@@ -47,6 +47,16 @@ class VoicePERealtimeService(OpenAIRealtimeLLMService):
         self._llm_needs_conversation_setup = False
         await self._process_completed_function_calls(send_new_results=True)
 
+    async def _handle_evt_error(self, evt) -> None:  # noqa: ANN001
+        # A device-wake response.cancel can race response.done; OpenAI then
+        # answers with response_cancel_not_active. Upstream treats every error
+        # event as fatal (ErrorFrame -> session rebuild), which would turn a
+        # harmless race into a dropped conversation. Swallow just that code.
+        if getattr(getattr(evt, "error", None), "code", None) == "response_cancel_not_active":
+            logger.debug("Ignoring benign response.cancel race (no active response)")
+            return
+        await super()._handle_evt_error(evt)
+
 # Custom broker tools, registered with handlers by the server.
 CUSTOM_TOOLS = [
     {
