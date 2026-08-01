@@ -425,13 +425,113 @@ HYGIENE_SCENARIOS = {
 }
 
 
-async def run(url: str, soak: int = 1, only: str | None = None, hygiene: bool = False) -> int:
+# ----------------------------------------------------------------------------
+# Wake-interrupt scenarios — run with --wake. Exercise the firmware's
+# mid-session wake path: a {"type":"interrupt"} TEXT frame on the open socket
+# (what voice_assistant_websocket.interrupt sends) instead of a reconnect.
+# Fine against prod hygiene values (W=6/MAX=8): the wake resets the window and
+# re-arms the 10s initial grace, so synth turnaround can't race the close.
+# ----------------------------------------------------------------------------
+async def w_wake_cuts_reply(url):
+    # Interrupt as soon as reply audio starts flowing; the tail already in
+    # flight must stay short (broker flushes its send-ahead), and the same
+    # socket must answer a fresh question afterwards.
+    follow = synth("In one short sentence, what is two plus two?")
+    async with session(url) as c:
+        await c._stream(synth("Slowly and in detail, tell me a short story about a lighthouse."))
+        await c._stream(SILENCE_1S)
+        c._send_done = time.monotonic()
+        # wait for first reply audio
+        first = None
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                msg = await asyncio.wait_for(c.ws.recv(), timeout=deadline - time.monotonic())
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                first = time.monotonic()
+                break
+        if first is None:
+            return False, "no reply audio to interrupt", None
+        await c.ws.send('{"type":"interrupt"}')
+        tail = bytearray()
+        while True:  # collect the in-flight tail; 1.2s idle = tail over
+            try:
+                msg = await asyncio.wait_for(c.ws.recv(), timeout=1.2)
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                tail.extend(msg)
+        tail_s = len(tail) / 2 / RATE
+        if tail_s > 3.0:
+            return False, f"reply kept flowing {tail_s:.1f}s after interrupt (want <3s)", None
+        r = await c.ask_pcm(follow)
+        t = r.transcript().lower() if r.got_audio else ""
+        ok = r.got_audio and any(w in t for w in ("four", "4"))
+        return ok, f"tail={tail_s:.1f}s post-wake reply={t!r}", r.first_audio_ms
+
+
+async def w_wake_while_idle(url):
+    # Wake with nothing in flight (bot idle, listening). Must not error the
+    # session (response.cancel is guarded/swallowed) and must answer next turn.
+    follow = synth("In one short sentence, what is the capital of France?")
+    async with session(url) as c:
+        r1 = await c.ask("In one short sentence, what is two plus two?")
+        if not r1.got_audio:
+            return False, "setup turn got no audio", r1.first_audio_ms
+        await c.ws.send('{"type":"interrupt"}')
+        r = await c.ask_pcm(follow)
+        t = r.transcript().lower() if r.got_audio else ""
+        ok = r.got_audio and "paris" in t
+        return ok, f"post-idle-wake reply={t!r}", r.first_audio_ms
+
+
+async def w_wake_bare_no_followup(url):
+    # The complaint scenario: bot mid-reply, user says the wake word and then
+    # NOTHING. The reply must stop and stay stopped (explicit response.cancel:
+    # server_vad never heard the user, so it would not cancel on its own).
+    async with session(url) as c:
+        await c._stream(synth("Slowly and in detail, tell me a short story about a lighthouse."))
+        await c._stream(SILENCE_1S)
+        first = None
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                msg = await asyncio.wait_for(c.ws.recv(), timeout=deadline - time.monotonic())
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                first = time.monotonic()
+                break
+        if first is None:
+            return False, "no reply audio to interrupt", None
+        await c.ws.send('{"type":"interrupt"}')
+        await asyncio.sleep(3.0)  # let any in-flight tail land
+        quiet = await c.listen(3.5)  # silence, like a user who said nothing
+        ok = not quiet.got_audio
+        return ok, f"audio_after_bare_wake={quiet.seconds:.1f}s (want 0)", None
+
+
+WAKE_SCENARIOS = {
+    "wake_cuts_reply": w_wake_cuts_reply,
+    "wake_while_idle": w_wake_while_idle,
+    "wake_bare_no_followup": w_wake_bare_no_followup,
+}
+
+
+async def run(
+    url: str, soak: int = 1, only: str | None = None,
+    hygiene: bool = False, wake: bool = False,
+) -> int:
     print(f"== voice-pe broker reliability harness -> {url} ==")
     if hygiene:
         print("   hygiene mode: broker must run FOLLOWUP_WINDOW_SECONDS=6 MAX_TURNS_PER_WAKE=2")
+    if wake:
+        print("   wake mode: mid-session {\"type\":\"interrupt\"} control frames")
     if soak > 1:
         print(f"   soak mode: {soak} rounds")
-    scenario_set = HYGIENE_SCENARIOS if hygiene else SCENARIOS
+    scenario_set = WAKE_SCENARIOS if wake else HYGIENE_SCENARIOS if hygiene else SCENARIOS
     scenarios = {only: scenario_set[only]} if only else scenario_set
     results: list[tuple[str, bool, str, float | None]] = []
     latencies: list[float] = []
@@ -470,16 +570,17 @@ def main() -> None:
     ]
     url = args[0] if args else "ws://127.0.0.1:8766"
     hygiene = "--hygiene" in sys.argv
+    wake = "--wake" in sys.argv
     soak = 1
     if "--soak" in sys.argv:
         soak = int(sys.argv[sys.argv.index("--soak") + 1])
     only = None
     if "--only" in sys.argv:
         only = sys.argv[sys.argv.index("--only") + 1]
-        valid = HYGIENE_SCENARIOS if hygiene else SCENARIOS
+        valid = WAKE_SCENARIOS if wake else HYGIENE_SCENARIOS if hygiene else SCENARIOS
         if only not in valid:
             raise SystemExit(f"unknown scenario {only!r}; one of: {', '.join(valid)}")
-    raise SystemExit(asyncio.run(run(url, soak, only, hygiene)))
+    raise SystemExit(asyncio.run(run(url, soak, only, hygiene, wake)))
 
 
 if __name__ == "__main__":

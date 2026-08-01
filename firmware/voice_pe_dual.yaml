@@ -1807,25 +1807,35 @@ micro_wake_word:
         condition:
           switch.is_off: master_mute_switch
         then:
-          # Stop any prior websocket session before starting a new one (they
-          # share one mic + speaker). Do NOT stop micro_wake_word: it owns the
-          # shared microphone that the websocket component feeds from.
           - if:
               condition:
                 voice_assistant_websocket.is_running: vaws
               then:
-                - voice_assistant_websocket.stop: vaws
-                - delay: 200ms
-          - if:
-              condition:
-                switch.is_on: wake_sound
-              then:
-                - script.execute:
-                    id: play_sound
-                    priority: true
-                    sound_file: "wake_word_triggered_sound"
-                - delay: 300ms
-          - voice_assistant_websocket.start: vaws
+                # Mid-session wake = barge-in, not a restart. Keep the socket:
+                # interrupt cuts local playback and tells the broker to drop
+                # the in-flight reply and open a fresh turn. Stopping instead
+                # would fire on_stopped's end cue (goodbye sound on every
+                # re-wake) and lose the start of the command to the reconnect.
+                - voice_assistant_websocket.interrupt: vaws
+                - if:
+                    condition:
+                      switch.is_on: wake_sound
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: "wake_word_triggered_sound"
+              else:
+                - if:
+                    condition:
+                      switch.is_on: wake_sound
+                    then:
+                      - script.execute:
+                          id: play_sound
+                          priority: true
+                          sound_file: "wake_word_triggered_sound"
+                      - delay: 300ms
+                - voice_assistant_websocket.start: vaws
 
 select:
   - platform: template

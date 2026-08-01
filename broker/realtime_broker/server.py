@@ -155,6 +155,15 @@ class _BotPlaybackGate(FrameProcessor):
             self._max_backlog = 0.0
         await self._set_threshold(self._config.vad_threshold)
 
+    def on_device_wake(self) -> None:
+        """Mid-session wake: the device already cut its speaker and flushed
+        its queue, so there is no echo tail to ride out. Rewind the playback
+        clock past the release margin so the mic gate opens for the command
+        immediately instead of vad_release_delay_ms later (which would feed
+        OpenAI silence for the first second of the command)."""
+        release = self._config.vad_release_delay_ms / 1000
+        self._playback_end = asyncio.get_running_loop().time() - release
+
     async def _maybe_flush_device(self) -> None:
         now = asyncio.get_running_loop().time()
         if now >= self._playback_end:
@@ -575,11 +584,12 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     """Run one OpenAI session until it dies or reaches max age, then tear down."""
     service = await build_agent(config, mcp)
 
+    serializer = RawPCMSerializer()
     transport = WebsocketServerTransport(
         host=config.ws_host,
         port=config.ws_port,
         params=WebsocketServerParams(
-            serializer=RawPCMSerializer(),
+            serializer=serializer,
             audio_in_enabled=True,
             audio_out_enabled=True,
         ),
@@ -647,6 +657,30 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
             transport.output(),
         ]
     )
+
+    async def _on_device_control(msg: dict) -> None:
+        # Device->broker control frames. "interrupt" = a mid-session wake word:
+        # the firmware cut its own playback and kept the socket instead of
+        # reconnecting. Mirror what a fresh connect does, in place: cancel the
+        # in-flight reply, flush the pipeline (which drops the reply audio the
+        # output transport still has queued — up to ~2s of send-ahead), reopen
+        # the mic, clear stale VAD state, and grant a fresh hygiene window.
+        if msg.get("type") != "interrupt":
+            logger.warning("Unknown device control frame: %r", msg)
+            return
+        logger.info("device wake: in-session interrupt")
+        if service._current_assistant_response is not None:
+            # server_vad only auto-cancels on heard speech, and the mic was
+            # gated during playback — cancel explicitly so a bare wake with no
+            # follow-up command still shuts the reply up. The benign race with
+            # response.done is swallowed in VoicePERealtimeService.
+            await service.send_client_event(oai_events.ResponseCancelEvent())
+        await service.push_interruption_task_frame_and_wait()
+        gate.on_device_wake()
+        asyncio.create_task(gate.reset_vad(drain=0.0))
+        hygiene.on_device_connect()
+
+    serializer.on_control = _on_device_control
 
     loop = asyncio.get_running_loop()
     device_connected = False
