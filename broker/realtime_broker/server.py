@@ -39,14 +39,13 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMContextAggregatorPair,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.llm_service import FunctionCallResultProperties
+from pipecat.services.openai.realtime import events as oai_events
 from pipecat.transports.websocket.server import (
     WebsocketServerParams,
     WebsocketServerTransport,
 )
 from websockets.protocol import State
-
-from pipecat.services.llm_service import FunctionCallResultProperties
-from pipecat.services.openai.realtime import events as oai_events
 
 from . import mcp_client
 from .agent import build_agent, build_audio_input
@@ -105,7 +104,7 @@ class _BotPlaybackGate(FrameProcessor):
     goes quiet.
     """
 
-    def __init__(self, service, config: Config, get_ws) -> None:  # noqa: ANN001
+    def __init__(self, service, config: Config, get_ws) -> None:
         super().__init__()
         self._service = service
         self._config = config
@@ -173,7 +172,7 @@ class _BotPlaybackGate(FrameProcessor):
             return
         try:
             await ws.send('{"type":"interrupt"}')
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("barge-in: failed to signal device")
             return
         self._playback_end = now  # device drops its queue on the flush
@@ -238,7 +237,7 @@ class _BotPlaybackGate(FrameProcessor):
                 await asyncio.sleep(drain)
             await self._service.send_client_event(oai_events.InputAudioBufferClearEvent())
             await self._send_vad(self._threshold)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("VAD reset failed")
         finally:
             if self._reset_task is task:
@@ -259,7 +258,7 @@ class _MicInputGate(FrameProcessor):
     real barge-in needs echo cancellation, not just an open mic.
     """
 
-    def __init__(self, gate: "_BotPlaybackGate", config: Config) -> None:
+    def __init__(self, gate: _BotPlaybackGate, config: Config) -> None:
         super().__init__()
         self._gate = gate
         self._config = config
@@ -316,7 +315,7 @@ class _TurnHygiene(FrameProcessor):
     it a response end is invisible.
     """
 
-    def __init__(self, gate: "_BotPlaybackGate", config: Config, get_ws) -> None:  # noqa: ANN001
+    def __init__(self, gate: _BotPlaybackGate, config: Config, get_ws) -> None:
         super().__init__()
         self._gate = gate  # single source of truth for the playback clock
         self._config = config
@@ -364,10 +363,9 @@ class _TurnHygiene(FrameProcessor):
                 self._awaiting_since = asyncio.get_running_loop().time()
             else:
                 self._awaiting_response = False
-        elif isinstance(frame, (CancelFrame, EndFrame)):
-            if self._watch_task is not None:
-                task, self._watch_task = self._watch_task, None
-                await self.cancel_task(task)
+        elif isinstance(frame, (CancelFrame, EndFrame)) and self._watch_task is not None:
+            task, self._watch_task = self._watch_task, None
+            await self.cancel_task(task)
         await self.push_frame(frame, direction)
 
     def on_device_connect(self) -> None:
@@ -462,7 +460,7 @@ class _TurnHygiene(FrameProcessor):
                 continue  # socket swapped mid-tick (re-wake); fresh state incoming
             try:
                 await ws.send('{"type":"disconnect"}')
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("turn hygiene: failed to signal device")
             else:
                 logger.info("turn hygiene: %s; disconnecting device", reason)
@@ -485,7 +483,7 @@ async def run(config: Config) -> None:
     while True:
         try:
             await _serve_session(config, mcp)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("Session crashed; rebuilding")
         await asyncio.sleep(0.5)  # let the socket fully release before rebind
 
@@ -580,7 +578,7 @@ def _start_music(config: Config, query: str, speaker: str | None) -> str:
         return "Sorry, I couldn't start the music."
 
 
-async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
+async def _serve_session(config: Config, mcp) -> None:
     """Run one OpenAI session until it dies or reaches max age, then tear down."""
     service = await build_agent(config, mcp)
 
@@ -595,28 +593,28 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         ),
     )
 
-    async def _get_weather(params):  # noqa: ANN001
+    async def _get_weather(params):
         # Run the blocking HA fetch off the event loop so it can't stall audio.
         weather = await asyncio.to_thread(_fetch_weather, config)
         await params.result_callback(weather)
 
-    async def _end_conversation(params):  # noqa: ANN001
+    async def _end_conversation(params):
         await params.result_callback("Okay, goodbye!")
         ws = getattr(transport.input(), "_websocket", None)
         if ws is not None:
             try:
                 await ws.send('{"type":"disconnect"}')
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.exception("end_conversation: failed to signal device")
 
-    async def _play_music(params):  # noqa: ANN001
+    async def _play_music(params):
         args = params.arguments or {}
         msg = await asyncio.to_thread(
             _start_music, config, args.get("query", ""), args.get("speaker")
         )
         await params.result_callback(msg)
 
-    async def _wait_for_user(params):  # noqa: ANN001
+    async def _wait_for_user(params):
         # Non-addressed speech (TV, side conversation, background). Acknowledge
         # the call but suppress the follow-up response (run_llm=False) so the bot
         # stays silent and keeps listening instead of replying to the room.
@@ -687,7 +685,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
     idle_since = loop.time()
 
     @transport.event_handler("on_client_connected")
-    async def _on_connect(_transport, client):  # noqa: ANN001
+    async def _on_connect(_transport, client):
         nonlocal device_connected
         device_connected = True
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
@@ -703,7 +701,7 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         hygiene.on_device_connect()
 
     @transport.event_handler("on_client_disconnected")
-    async def _on_disconnect(_transport, client, *args):  # noqa: ANN001
+    async def _on_disconnect(_transport, client, *args):
         nonlocal device_connected, idle_since
         # When a new connection kicks a lingering old one (re-wake after a
         # WiFi blip: the dead socket never closed), Pipecat swaps the
@@ -804,5 +802,5 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
                 pass
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("Runner teardown error")

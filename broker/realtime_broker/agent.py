@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
@@ -21,7 +22,6 @@ from pipecat.services.openai.realtime.events import (
     TurnDetection,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-from pipecat.processors.aggregators.llm_context import LLMContext
 
 from .config import Config
 
@@ -47,7 +47,7 @@ class VoicePERealtimeService(OpenAIRealtimeLLMService):
         self._llm_needs_conversation_setup = False
         await self._process_completed_function_calls(send_new_results=True)
 
-    async def _handle_evt_error(self, evt) -> None:  # noqa: ANN001
+    async def _handle_evt_error(self, evt) -> None:
         # A device-wake response.cancel can race response.done; OpenAI then
         # answers with response_cancel_not_active. Upstream treats every error
         # event as fatal (ErrorFrame -> session rebuild), which would turn a
