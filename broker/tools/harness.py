@@ -260,7 +260,7 @@ async def s_background_rejection(url):
 
 
 async def s_challenge_follow_up(url):
-    # Both real turns the TV test swallowed (2026-07-01) were follow-ups to
+    # Both real turns swallowed under background TV noise were follow-ups to
     # the bot's own answer. A bare challenge ("are you sure?") has no topic
     # words at all: the hardest addressed-speech case for the background
     # gate. The bot must answer, not wait_for_user it away.
@@ -276,8 +276,8 @@ async def s_challenge_follow_up(url):
 async def s_tv_line_after_answer(url):
     # Counter-metric to the follow-up bias in BACKGROUND_GUIDANCE: a
     # conversational TV line in a different voice right after the bot
-    # answers: the exact false-accept from the TV test ("It's good, huh?",
-    # 2026-07-01 20:49:56). Want silence. Pre-declared tradeoff: swallowing
+    # answers: the exact false-accept class this gate must reject ("It's
+    # good, huh?"). Want silence. Pre-declared tradeoff: swallowing
     # a real follow-up is worse than answering a TV line, so under --soak
     # this scenario is allowed to be the flakier of the pair: but it must
     # not fail while challenge_follow_up also fails.
