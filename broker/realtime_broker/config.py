@@ -72,7 +72,7 @@ class Config:
         return bool(self.ha_mcp_url and self.ha_token)
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required")
