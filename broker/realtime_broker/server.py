@@ -722,8 +722,8 @@ async def _serve_session(config: Config, mcp) -> None:
         # through the pipeline). A buffer clear alone can't kill it: see
         # _BotPlaybackGate.reset_vad, which disables and re-enables turn
         # detection to drop the segment before it becomes a ghost turn
-        # (stray 'Bye.' in the TV test 2026-07-01; 'I'm here when you're
-        # ready' in the soak 2026-07-02).
+        # (observed on the next wake as a stray 'Bye.' or an unprompted
+        # 'I'm here when you're ready').
         asyncio.create_task(gate.reset_vad())
         # Cancel the hygiene watcher for a REAL disconnect only: the stale
         # guard above already returned for a kicked old socket, so it can't
