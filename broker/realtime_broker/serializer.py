@@ -33,7 +33,7 @@ class RawPCMSerializer(FrameSerializer):
     def type(self) -> FrameSerializerType:
         return FrameSerializerType.BINARY
 
-    async def deserialize(self, message: bytes) -> InputAudioRawFrame | None:
+    async def deserialize(self, message: bytes | str) -> InputAudioRawFrame | None:
         if not isinstance(message, bytes):
             if isinstance(message, str) and self.on_control is not None:
                 try:
@@ -41,7 +41,15 @@ class RawPCMSerializer(FrameSerializer):
                 except ValueError:
                     logger.warning("Dropping malformed control frame: %r", message[:200])
                     return None
-                await self.on_control(data)
+                if not isinstance(data, dict):
+                    logger.warning("Dropping non-object control frame: %r", message[:200])
+                    return None
+                # An exception here would kill the transport receive loop and
+                # with it the session's audio input; log and carry on instead.
+                try:
+                    await self.on_control(data)
+                except Exception:
+                    logger.exception("Control frame handler failed")
             return None
         if len(message) % 2 != 0:
             logger.warning("Dropping odd-length audio frame (%d bytes)", len(message))
