@@ -16,10 +16,10 @@ PORT="${1:-/dev/ttyACM0}"
 RUN=(docker run --rm --device="$PORT" -v "$PWD":/config --entrypoint python "$IMG" -m esptool --port "$PORT")
 
 [ -e "$PORT" ] || { echo "No device at $PORT (try: lsusb; ls /dev/ttyACM* /dev/ttyUSB*)"; exit 1; }
-[ -f "$BIN" ]  || { echo "Missing $BIN — compile first."; exit 1; }
+[ -f "$BIN" ]  || { echo "Missing $BIN, compile first."; exit 1; }
 
 echo ">> Verifying it's an ESP32-S3 (not some other serial device)..."
-"${RUN[@]}" flash_id | grep -q "ESP32-S3" || { echo "Not an ESP32-S3 on $PORT — aborting."; exit 1; }
+"${RUN[@]}" flash_id | grep -q "ESP32-S3" || { echo "Not an ESP32-S3 on $PORT, aborting."; exit 1; }
 
 echo ">> [1/2] Backing up stock firmware (16 MB) -> stock-voice-pe-backup.bin"
 "${RUN[@]}" --baud 460800 read_flash 0 0x1000000 /config/stock-voice-pe-backup.bin

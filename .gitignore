@@ -15,5 +15,6 @@ stock-voice-pe-backup.bin
 *.wav
 *.pcm
 
-# internal ops runbook (not for public repo)
+# personal notes and agent context, kept local
+CLAUDE.md
 SUNDAY_RUNBOOK.md

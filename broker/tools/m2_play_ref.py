@@ -3,7 +3,7 @@
 Generates a known TTS clip (once, cached next to the captures), serves it
 over HTTP from this machine, and asks Home Assistant to play it on the
 puck's media_player entity. This drives the speaker through the normal HA
-media path — the broker never sends a binary frame, so the firmware mic
+media path, the broker never sends a binary frame, so the firmware mic
 gate stays open and m2_capture.py records the XMOS post-AEC residual of
 exactly this clip.
 

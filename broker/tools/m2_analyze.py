@@ -16,7 +16,7 @@ Method: coarse global alignment via envelope cross-correlation (the capture
 starts at an arbitrary time before playback), then per-window (320ms, hop
 160ms) normalized cross-correlation at the global lag +/- 150ms search
 range, scored only over windows where the reference is active. Baseline is
-the same statistic over reference-silent windows — it shows what NCC noise
+the same statistic over reference-silent windows, it shows what NCC noise
 looks like for this capture.
 """
 
@@ -60,7 +60,7 @@ def max_ncc(r: np.ndarray, m: np.ndarray) -> float:
     """Max |NCC| of window r against every sample offset of segment m.
 
     Sample-accurate: NCC collapses within a few samples of the true lag, so
-    any strided search misses the peak. Vectorized — numerator via one
+    any strided search misses the peak. Vectorized, numerator via one
     cross-correlation, per-offset mean/energy via cumulative sums.
     """
     r0 = r - r.mean()
@@ -88,7 +88,7 @@ def main() -> None:
         # shorter one, which would produce a garbage global lag and a false
         # "residual uncorrelated" verdict. The capture must cover the clip.
         raise SystemExit(
-            "capture shorter than the reference — bad take, retake it "
+            "capture shorter than the reference. Bad take, retake it "
             f"(capture {len(mic)/RATE:.1f}s < ref {len(ref)/RATE:.1f}s)"
         )
 
@@ -109,7 +109,7 @@ def main() -> None:
         (active if np.abs(r).mean() > ref_gate else silent).append((best, rms))
 
     if not active:
-        raise SystemExit("no reference-active windows found — alignment failed?")
+        raise SystemExit("no reference-active windows found, alignment failed?")
 
     a_ncc = np.array([x[0] for x in active])
     a_rms = np.array([x[1] for x in active])
@@ -125,14 +125,14 @@ def main() -> None:
 
     p50 = float(np.median(a_ncc))
     if p50 >= 0.6:
-        print("\nVERDICT: NCC gate viable — echo residual clearly correlated. Build M1.")
+        print("\nVERDICT: NCC gate viable, echo residual clearly correlated. Build M1.")
     elif p50 >= 0.3:
-        print("\nVERDICT: gray zone (0.3-0.6) — per the plan, STOP and redesign "
+        print("\nVERDICT: gray zone (0.3-0.6): per the plan, STOP and redesign "
               "(volume cap -> aec_corr_factor DFU -> software AEC).")
     else:
         print("\nVERDICT: residual uncorrelated. If mic RMS during playback is "
               "near the silent baseline, XMOS AEC already buries the echo at "
-              "this volume — measure at max volume before concluding.")
+              "this volume, measure at max volume before concluding.")
 
 
 if __name__ == "__main__":
