@@ -273,6 +273,22 @@ async def s_challenge_follow_up(url):
         return r2.got_audio, f"challenge reply={t!r}", r2.first_audio_ms
 
 
+async def s_first_turn_addressed(url):
+    # Turn-1 twin of tv_line_after_answer, deliberately the SAME line: a wake
+    # word opened this connection, so whatever follows it is addressed to us
+    # even when it sounds exactly like the room. The model used to
+    # wait_for_user the first utterance away and strand the session silent
+    # (live logs); this line reproduced that 0/3 before the turn-1 override.
+    # The pair encodes the tradeoff — same words, answer on turn 1, ignore on
+    # turn 2.
+    async with session(url) as c:
+        tv = ("Oh man, it's good, huh? I told you this show gets better. "
+              "Hang on, I'm gonna grab another drink before it starts.")
+        r = await c.ask(tv, voice="echo")
+        t = r.transcript().lower() if r.got_audio else ""
+        return r.got_audio, f"first-turn reply={t!r}", r.first_audio_ms
+
+
 async def s_tv_line_after_answer(url):
     # Counter-metric to the follow-up bias in BACKGROUND_GUIDANCE: a
     # conversational TV line in a different voice right after the bot
@@ -323,6 +339,7 @@ SCENARIOS = {
     "reconnect": s_reconnect,
     "background_rejection": s_background_rejection,
     "challenge_follow_up": s_challenge_follow_up,
+    "first_turn_addressed": s_first_turn_addressed,
     "tv_line_after_answer": s_tv_line_after_answer,
     "mid_speech_disconnect": s_mid_speech_disconnect,
 }

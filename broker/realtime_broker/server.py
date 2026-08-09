@@ -361,6 +361,16 @@ class _TurnHygiene(FrameProcessor):
                 await self.cancel_task(task)
         await self.push_frame(frame, direction)
 
+    def is_first_turn(self) -> bool:
+        """True while this connection's FIRST committed user turn is in flight.
+
+        A wake word opened the connection, so that first utterance is addressed
+        to us by construction — the wait_for_user handler uses this to refuse
+        suppressing it. Independent of the hygiene knobs: `_turns` is counted
+        (and reset per connect) even when both bounds are disabled.
+        """
+        return self._turns <= 1
+
     def on_device_connect(self) -> None:
         # Fresh wake = fresh budget and window. The connect handler runs for
         # the NEW client before a kicked stale socket's disconnect fires (and
@@ -610,6 +620,17 @@ async def _serve_session(config: Config, mcp) -> None:  # noqa: ANN001
         # Non-addressed speech (TV, side conversation, background). Acknowledge
         # the call but suppress the follow-up response (run_llm=False) so the bot
         # stays silent and keeps listening instead of replying to the room.
+        if hygiene.is_first_turn():
+            # Belt-and-suspenders for the instruction above: the wake word that
+            # opened this connection is proof the first utterance was meant for
+            # us, but the model still wait_for_user's it sometimes and strands
+            # the session silent. Let the response run so it answers.
+            logger.warning("wait_for_user on turn 1 overridden; answering instead")
+            await params.result_callback(
+                "That speech was addressed to you: the user just said the wake "
+                "word. Answer it now."
+            )
+            return
         await params.result_callback(
             "", properties=FunctionCallResultProperties(run_llm=False)
         )
