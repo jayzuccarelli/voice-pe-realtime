@@ -2,7 +2,7 @@
 
 Configures voice, system prompt, server-side VAD, and the available tools:
 the Home Assistant MCP tools (if HA control is enabled) plus two custom broker
-tools — `get_weather` (live HA weather, which HA's MCP doesn't surface) and
+tools, `get_weather` (live HA weather, which HA's MCP doesn't surface) and
 `end_conversation` (clean "ok, bye" stop). Handlers for the custom tools are
 registered by the server (they need HA access / the device connection).
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
@@ -21,7 +22,6 @@ from pipecat.services.openai.realtime.events import (
     TurnDetection,
 )
 from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
-from pipecat.processors.aggregators.llm_context import LLMContext
 
 from .config import Config
 
@@ -34,7 +34,7 @@ class VoicePERealtimeService(OpenAIRealtimeLLMService):
     Upstream's _handle_context treats the FIRST context frame as conversation
     setup: it replays the context as conversation items and issues a bare
     response.create. With server_vad the audio commit already created the user
-    item and auto-created the response, so that double-fires — OpenAI rejects
+    item and auto-created the response, so that double-fires, OpenAI rejects
     it (conversation_already_has_active_response) and Pipecat treats any error
     event as fatal, killing the session's receive loop. Conversation state
     lives server-side here; the only thing context frames must deliver is new
@@ -46,6 +46,16 @@ class VoicePERealtimeService(OpenAIRealtimeLLMService):
         self._context = context
         self._llm_needs_conversation_setup = False
         await self._process_completed_function_calls(send_new_results=True)
+
+    async def _handle_evt_error(self, evt) -> None:
+        # A device-wake response.cancel can race response.done; OpenAI then
+        # answers with response_cancel_not_active. Upstream treats every error
+        # event as fatal (ErrorFrame -> session rebuild), which would turn a
+        # harmless race into a dropped conversation. Swallow just that code.
+        if getattr(getattr(evt, "error", None), "code", None) == "response_cancel_not_active":
+            logger.debug("Ignoring benign response.cancel race (no active response)")
+            return
+        await super()._handle_evt_error(evt)
 
 # Custom broker tools, registered with handlers by the server.
 CUSTOM_TOOLS = [
@@ -99,7 +109,7 @@ CUSTOM_TOOLS = [
             "to you: TV or other media dialogue, or a conversation between other "
             "people. If you just answered and the next utterance could be a "
             "follow-up, reaction, or challenge to your answer ('are you sure?', "
-            "'okay, and what about...'), it IS addressed to you — answer it "
+            "'okay, and what about...'), it IS addressed to you. Answer it "
             "instead of calling this. Calling it means stay silent and keep "
             "listening. Produce no spoken reply when you call it."
         ),
@@ -109,7 +119,7 @@ CUSTOM_TOOLS = [
 
 # Appended to the configured persona instructions. This device is far-field and
 # its mic hears the whole room (TV, other people), so the model must gate on
-# whether speech is actually addressed to it — the OpenAI-recommended pattern
+# whether speech is actually addressed to it: the OpenAI-recommended pattern
 # for rejecting non-addressed speech (there is no speaker separation at the API
 # layer).
 BACKGROUND_GUIDANCE = (
@@ -121,7 +131,7 @@ BACKGROUND_GUIDANCE = (
     "right after you answer, the next utterance is usually the same user "
     "following up. A follow-up question, reaction, or challenge to what you just "
     "said ('are you sure?', 'okay, and...', 'what about tomorrow?') is addressed "
-    "to you even when it does not name you — answer it. A second exception, "
+    "to you even when it does not name you. Answer it. A second exception, "
     "absolute: the FIRST speech you hear after a session starts is always "
     "addressed to you, because the user just said the wake word to open the "
     "session. Never call wait_for_user on that first utterance; answer it even "
@@ -140,7 +150,7 @@ def build_audio_input(config: Config, threshold: float | None) -> AudioInput:
     transcription.
 
     threshold=None disables turn detection entirely (serialized as
-    turn_detection: null), which also discards the server's VAD state —
+    turn_detection: null), which also discards the server's VAD state,
     used to drop a speech-in-progress segment after a device disconnect.
     """
     return AudioInput(
@@ -162,7 +172,7 @@ def build_audio_input(config: Config, threshold: float | None) -> AudioInput:
         # off lets the quiet-but-clean tap reach the VAD intact.
         noise_reduction=None,
         # Optionally transcribe each user turn so broker logs show what OpenAI
-        # heard (self-trigger / "janky" diagnosis). Off by default — it bills a
+        # heard (self-trigger / "janky" diagnosis). Off by default: it bills a
         # Whisper pass per turn. whisper-1 because gpt-4o-transcribe yielded
         # zero transcription events on gpt-realtime.
         transcription=(

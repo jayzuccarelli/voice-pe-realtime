@@ -1,21 +1,21 @@
 """End-to-end reliability harness for the voice-pe realtime broker.
 
-Drives the broker exactly like the Voice PE firmware does — streams PCM16 /
-24 kHz / mono speech up the WebSocket in 20 ms frames with trailing silence —
+Drives the broker exactly like the Voice PE firmware does, streams PCM16 /
+24 kHz / mono speech up the WebSocket in 20 ms frames with trailing silence,
 then collects the spoken reply, transcribes it, and asserts on content,
 turn-taking, and latency. No hardware needed; test speech is synthesized with
 OpenAI TTS and replies are transcribed with Whisper.
 
 Targets a RUNNING broker. Defaults to ws://127.0.0.1:8766 on purpose so it does
-NOT fight the live puck on :8765 (the broker is single-client — connecting
+NOT fight the live puck on :8765 (the broker is single-client, connecting
 kicks whoever is already on). Spin an isolated broker on 8766 to run this.
 
     OPENAI_API_KEY=... python -m broker.tools.harness [ws://host:port] [--soak N]
 
-The legacy SCENARIOS assume the internal ref turn hygiene is DISABLED (start the
+The legacy SCENARIOS assume the turn-hygiene behavior is DISABLED (start the
 broker with FOLLOWUP_WINDOW_SECONDS=0): synth/whisper turnaround between
 turns can approach the 6s follow-up window and would race the close. The
-hygiene feature has its own set — `--hygiene` runs HYGIENE_SCENARIOS only,
+hygiene feature has its own set, `--hygiene` runs HYGIENE_SCENARIOS only,
 against an isolated broker at 8766 started with
 FOLLOWUP_WINDOW_SECONDS=6 MAX_TURNS_PER_WAKE=2.
 
@@ -45,10 +45,10 @@ SILENCE_1S = b"\x00\x00" * RATE
 
 
 # ----------------------------------------------------------------------------
-# OpenAI TTS / STT helpers (plain HTTP, no extra deps — matches existing tools)
+# OpenAI TTS / STT helpers (plain HTTP, no extra deps: matches existing tools)
 # ----------------------------------------------------------------------------
 def _send(req: urllib.request.Request, attempts: int = 4) -> bytes:
-    """POST with retry — OpenAI's audio endpoints occasionally blip (429/5xx,
+    """POST with retry, OpenAI's audio endpoints occasionally blip (429/5xx,
     even a transient 404). A flaky API call must not fail a scenario."""
     delay = 1.0
     for n in range(attempts):
@@ -162,7 +162,7 @@ class Client:
         return await self._collect()
 
     async def ask_pcm(self, pcm: bytes) -> Reply:
-        """ask() with pre-synthesized PCM — hygiene scenarios must start their
+        """ask() with pre-synthesized PCM, hygiene scenarios must start their
         next turn inside the follow-up window, and a synth() round trip alone
         can eat most of it."""
         await self._stream(pcm)
@@ -186,7 +186,7 @@ async def session(url: str):
 
 
 # ----------------------------------------------------------------------------
-# Scenarios — each returns (passed: bool, detail: str, latency_ms: float | None)
+# Scenarios: each returns (passed: bool, detail: str, latency_ms: float | None)
 # ----------------------------------------------------------------------------
 async def s_capital(url):
     async with session(url) as c:
@@ -235,7 +235,7 @@ async def s_reconnect(url):
         r1 = await c.ask("What is the capital of France?")
     if not r1.got_audio:
         return False, "first session got no audio", r1.first_audio_ms
-    async with session(url) as c:  # fresh connection — the fjfricke #9 bug
+    async with session(url) as c:  # fresh connection, the fjfricke #9 bug
         r2 = await c.ask("In one short sentence, what is two plus two?")
     t = r2.transcript().lower()
     ok = r2.got_audio and any(w in t for w in ("four", "4"))
@@ -260,9 +260,9 @@ async def s_background_rejection(url):
 
 
 async def s_challenge_follow_up(url):
-    # Both real turns the TV test swallowed (2026-07-01) were follow-ups to
+    # Both real turns swallowed under background TV noise were follow-ups to
     # the bot's own answer. A bare challenge ("are you sure?") has no topic
-    # words at all — the hardest addressed-speech case for the background
+    # words at all: the hardest addressed-speech case for the background
     # gate. The bot must answer, not wait_for_user it away.
     async with session(url) as c:
         r1 = await c.ask("In one short sentence, what is the capital of France?")
@@ -292,10 +292,10 @@ async def s_first_turn_addressed(url):
 async def s_tv_line_after_answer(url):
     # Counter-metric to the follow-up bias in BACKGROUND_GUIDANCE: a
     # conversational TV line in a different voice right after the bot
-    # answers — the exact false-accept from the TV test ("It's good, huh?",
-    # 2026-07-01 20:49:56). Want silence. Pre-declared tradeoff: swallowing
+    # answers: the exact false-accept class this gate must reject ("It's
+    # good, huh?"). Want silence. Pre-declared tradeoff: swallowing
     # a real follow-up is worse than answering a TV line, so under --soak
-    # this scenario is allowed to be the flakier of the pair — but it must
+    # this scenario is allowed to be the flakier of the pair: but it must
     # not fail while challenge_follow_up also fails.
     async with session(url) as c:
         r1 = await c.ask("In one short sentence, what is the capital of France?")
@@ -346,14 +346,14 @@ SCENARIOS = {
 
 
 # ----------------------------------------------------------------------------
-# Turn-hygiene scenarios (internal ref) — run with --hygiene against an ISOLATED
+# Turn-hygiene scenarios: run with --hygiene against an ISOLATED
 # broker on 8766 started with FOLLOWUP_WINDOW_SECONDS=6 MAX_TURNS_PER_WAKE=2.
 # Kept out of SCENARIOS: the legacy set assumes the feature is off (W=0),
 # because synth/whisper turnaround between turns can approach the 6s window.
 # ----------------------------------------------------------------------------
 async def _watch_disconnect(c: Client, timeout: float) -> float | None:
     """Stream silence (the device's mic never closes) and wait for the
-    broker's {"type":"disconnect"} text frame — or a server-side close, which
+    broker's {"type":"disconnect"} text frame, or a server-side close, which
     counts too. Mirrors test_bargein.py's interrupt-frame capture. Returns
     the monotonic arrival time, or None on timeout."""
     pump = asyncio.create_task(c._stream(b"\x00\x00" * int(RATE * timeout)))
@@ -408,7 +408,7 @@ async def h_followup_window_allows(url):
 
 async def h_turn_budget_cap(url):
     # With MAX_TURNS_PER_WAKE=2: two Q/A turns succeed, then the broker
-    # disconnects once the 2nd reply finishes playing — no 3rd turn granted.
+    # disconnects once the 2nd reply finishes playing: no 3rd turn granted.
     # The budget close (playback end + release) usually beats r2's 2.5s
     # collect idle, so the disconnect frame tends to land inside r2.texts.
     q2 = synth("In one short sentence, what is two plus two?")
@@ -442,13 +442,113 @@ HYGIENE_SCENARIOS = {
 }
 
 
-async def run(url: str, soak: int = 1, only: str | None = None, hygiene: bool = False) -> int:
+# ----------------------------------------------------------------------------
+# Wake-interrupt scenarios — run with --wake. Exercise the firmware's
+# mid-session wake path: a {"type":"interrupt"} TEXT frame on the open socket
+# (what voice_assistant_websocket.interrupt sends) instead of a reconnect.
+# Fine against prod hygiene values (W=6/MAX=8): the wake resets the window and
+# re-arms the 10s initial grace, so synth turnaround can't race the close.
+# ----------------------------------------------------------------------------
+async def w_wake_cuts_reply(url):
+    # Interrupt as soon as reply audio starts flowing; the tail already in
+    # flight must stay short (broker flushes its send-ahead), and the same
+    # socket must answer a fresh question afterwards.
+    follow = synth("In one short sentence, what is two plus two?")
+    async with session(url) as c:
+        await c._stream(synth("Slowly and in detail, tell me a short story about a lighthouse."))
+        await c._stream(SILENCE_1S)
+        c._send_done = time.monotonic()
+        # wait for first reply audio
+        first = None
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                msg = await asyncio.wait_for(c.ws.recv(), timeout=deadline - time.monotonic())
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                first = time.monotonic()
+                break
+        if first is None:
+            return False, "no reply audio to interrupt", None
+        await c.ws.send('{"type":"interrupt"}')
+        tail = bytearray()
+        while True:  # collect the in-flight tail; 1.2s idle = tail over
+            try:
+                msg = await asyncio.wait_for(c.ws.recv(), timeout=1.2)
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                tail.extend(msg)
+        tail_s = len(tail) / 2 / RATE
+        if tail_s > 3.0:
+            return False, f"reply kept flowing {tail_s:.1f}s after interrupt (want <3s)", None
+        r = await c.ask_pcm(follow)
+        t = r.transcript().lower() if r.got_audio else ""
+        ok = r.got_audio and any(w in t for w in ("four", "4"))
+        return ok, f"tail={tail_s:.1f}s post-wake reply={t!r}", r.first_audio_ms
+
+
+async def w_wake_while_idle(url):
+    # Wake with nothing in flight (bot idle, listening). Must not error the
+    # session (response.cancel is guarded/swallowed) and must answer next turn.
+    follow = synth("In one short sentence, what is the capital of France?")
+    async with session(url) as c:
+        r1 = await c.ask("In one short sentence, what is two plus two?")
+        if not r1.got_audio:
+            return False, "setup turn got no audio", r1.first_audio_ms
+        await c.ws.send('{"type":"interrupt"}')
+        r = await c.ask_pcm(follow)
+        t = r.transcript().lower() if r.got_audio else ""
+        ok = r.got_audio and "paris" in t
+        return ok, f"post-idle-wake reply={t!r}", r.first_audio_ms
+
+
+async def w_wake_bare_no_followup(url):
+    # The complaint scenario: bot mid-reply, user says the wake word and then
+    # NOTHING. The reply must stop and stay stopped (explicit response.cancel:
+    # server_vad never heard the user, so it would not cancel on its own).
+    async with session(url) as c:
+        await c._stream(synth("Slowly and in detail, tell me a short story about a lighthouse."))
+        await c._stream(SILENCE_1S)
+        first = None
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            try:
+                msg = await asyncio.wait_for(c.ws.recv(), timeout=deadline - time.monotonic())
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                break
+            if isinstance(msg, (bytes, bytearray)):
+                first = time.monotonic()
+                break
+        if first is None:
+            return False, "no reply audio to interrupt", None
+        await c.ws.send('{"type":"interrupt"}')
+        await asyncio.sleep(3.0)  # let any in-flight tail land
+        quiet = await c.listen(3.5)  # silence, like a user who said nothing
+        ok = not quiet.got_audio
+        return ok, f"audio_after_bare_wake={quiet.seconds:.1f}s (want 0)", None
+
+
+WAKE_SCENARIOS = {
+    "wake_cuts_reply": w_wake_cuts_reply,
+    "wake_while_idle": w_wake_while_idle,
+    "wake_bare_no_followup": w_wake_bare_no_followup,
+}
+
+
+async def run(
+    url: str, soak: int = 1, only: str | None = None,
+    hygiene: bool = False, wake: bool = False,
+) -> int:
     print(f"== voice-pe broker reliability harness -> {url} ==")
     if hygiene:
         print("   hygiene mode: broker must run FOLLOWUP_WINDOW_SECONDS=6 MAX_TURNS_PER_WAKE=2")
+    if wake:
+        print("   wake mode: mid-session {\"type\":\"interrupt\"} control frames")
     if soak > 1:
         print(f"   soak mode: {soak} rounds")
-    scenario_set = HYGIENE_SCENARIOS if hygiene else SCENARIOS
+    scenario_set = WAKE_SCENARIOS if wake else HYGIENE_SCENARIOS if hygiene else SCENARIOS
     scenarios = {only: scenario_set[only]} if only else scenario_set
     results: list[tuple[str, bool, str, float | None]] = []
     latencies: list[float] = []
@@ -458,12 +558,12 @@ async def run(url: str, soak: int = 1, only: str | None = None, hygiene: bool = 
             t0 = time.monotonic()
             try:
                 ok, detail, lat = await fn(url)
-            except Exception as e:  # noqa: BLE001 — a crash IS a failed scenario
+            except Exception as e:  # noqa: BLE001  (a crash IS a failed scenario)
                 ok, detail, lat = False, f"EXCEPTION {type(e).__name__}: {e}", None
             dt = time.monotonic() - t0
             if lat is not None:
                 latencies.append(lat)
-            latstr = f"{lat:.0f}ms 1st-audio" if lat is not None else "—"
+            latstr = f"{lat:.0f}ms 1st-audio" if lat is not None else "n/a"
             print(f"[{'PASS' if ok else 'FAIL'}] {label:<26} {latstr:<16} {dt:4.1f}s  {detail}")
             results.append((label, ok, detail, lat))
 
@@ -487,16 +587,17 @@ def main() -> None:
     ]
     url = args[0] if args else "ws://127.0.0.1:8766"
     hygiene = "--hygiene" in sys.argv
+    wake = "--wake" in sys.argv
     soak = 1
     if "--soak" in sys.argv:
         soak = int(sys.argv[sys.argv.index("--soak") + 1])
     only = None
     if "--only" in sys.argv:
         only = sys.argv[sys.argv.index("--only") + 1]
-        valid = HYGIENE_SCENARIOS if hygiene else SCENARIOS
+        valid = WAKE_SCENARIOS if wake else HYGIENE_SCENARIOS if hygiene else SCENARIOS
         if only not in valid:
             raise SystemExit(f"unknown scenario {only!r}; one of: {', '.join(valid)}")
-    raise SystemExit(asyncio.run(run(url, soak, only, hygiene)))
+    raise SystemExit(asyncio.run(run(url, soak, only, hygiene, wake)))
 
 
 if __name__ == "__main__":
