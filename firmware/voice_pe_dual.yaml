@@ -1742,7 +1742,9 @@ external_components:
   - source:
       type: git
       url: https://github.com/esphome/home-assistant-voice-pe
-      ref: dev
+      # Pinned to the SHA the puck was last flashed with; upstream dev is a
+      # moving branch and an unpinned ref ships unreviewed changes on rebuild.
+      ref: 5a4e7eec11cc6df75386de10b8f961a00dd8a82e
     components:
       - voice_kit
     refresh: 365d
@@ -1792,6 +1794,28 @@ voice_assistant_websocket:
               id: play_sound
               priority: true
               sound_file: "mute_switch_off_sound"
+
+# Self-heal for the deaf-puck failure mode: micro_wake_word.start's only other
+# call site is voice_assistant.on_client_connected, so if HA restarts and the
+# assist_satellite subscription never re-establishes, the wake engine stays
+# stopped forever while the LED looks normal (dead windows 2026-08-14 47h and
+# 2026-08-28 16h). The wake path itself (mww -> voice_assistant_websocket ->
+# broker) does not need HA, so an always-running wake engine is safe: mww
+# already runs continuously mid-session (stop_after_detection: false powers
+# barge-in). Worst case after this fix is ~2 min deaf instead of forever.
+interval:
+  - interval: 60s
+    startup_delay: 60s
+    then:
+      - if:
+          condition:
+            lambda: return !id(mww).is_running();
+          then:
+            - logger.log:
+                format: "mww self-heal: wake engine stopped, restarting"
+                level: WARN
+            - micro_wake_word.start:
+            - micro_wake_word.enable_model: hey_mycroft
 
 micro_wake_word:
   id: mww
