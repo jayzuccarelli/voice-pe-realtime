@@ -8,7 +8,6 @@ import logging
 from dotenv import load_dotenv
 
 from .config import Config
-from .server import run
 
 
 def main() -> None:
@@ -19,8 +18,16 @@ def main() -> None:
     logging.getLogger("websockets").setLevel(logging.WARNING)
     # Load a local .env if present (no-op in Docker, which uses --env-file).
     load_dotenv()
+    config = Config.from_env()
+    if config.engine == "live":
+        from .live_server import run_live as serve
+    elif config.engine == "realtime":
+        from .server import run as serve
+    else:
+        raise RuntimeError(f"ENGINE must be 'realtime' or 'live', got {config.engine!r}")
+    logging.getLogger(__name__).info("Starting %s engine", config.engine)
     try:
-        asyncio.run(run(Config.from_env()))
+        asyncio.run(serve(config))
     except KeyboardInterrupt:
         pass
 

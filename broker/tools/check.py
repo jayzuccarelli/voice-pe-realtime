@@ -47,6 +47,14 @@ def load_key() -> str:
 
 
 KEY = load_key()
+
+# How long a reply may go quiet before we call it finished. The Live engine
+# can speak a short holding phrase, fall silent while the delegated backend
+# works, then come back with the answer: a 3s idle window cut those replies
+# off mid-thought and the check read the filler as the answer. Bounded by
+# REPLY_MAX_WAIT so a genuinely dead broker still fails fast enough.
+REPLY_IDLE = float(os.environ.get("REPLY_IDLE_SECS", "8.0"))
+REPLY_MAX_WAIT = float(os.environ.get("REPLY_MAX_WAIT_SECS", "45.0"))
 WS_URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:8765"
 
 
@@ -102,13 +110,16 @@ async def ask(question: str) -> bytes:
             await ws.send(b"\x00\x00" * (chunk // 2))
             await asyncio.sleep(0.02)
         out = bytearray()
+        deadline = asyncio.get_running_loop().time() + REPLY_MAX_WAIT
         while True:
             try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
-            except asyncio.TimeoutError:
+                msg = await asyncio.wait_for(ws.recv(), timeout=REPLY_IDLE)
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
                 break
             if isinstance(msg, bytes):
                 out.extend(msg)
+            if asyncio.get_running_loop().time() > deadline:
+                break
     return bytes(out)
 
 
