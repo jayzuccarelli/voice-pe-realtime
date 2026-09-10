@@ -27,10 +27,20 @@ RATE = 24000
 # probes must be robust to prior history: each is framed "ignore prior
 # context" and asserts on a token that appears in the answer regardless of
 # phrasing. Deterministic + HA-independent so the check is signal, not flake.
+# Each case asks for a FULL SENTENCE on purpose. The Live engine answers a
+# bare factual question with a single word, which is about 300 ms of audio,
+# and transcribing 300 ms is a coin flip: real replies of "Earth." came back
+# as 'art' and 'ers.', and "Paris." as 'parrot'. Measured with
+# tools/probe-style energy analysis, the audio was not clipped (there was
+# ~4 s of leading silence and a clean 300 ms of speech), so the flake was in
+# the transcription, not the broker. Asking for a sentence removes the
+# artifact and is closer to how the puck is actually used.
 CASES = [
-    ("New question, ignore anything before: what is the capital of France?",
+    ("New question, ignore anything before: in one full sentence, "
+     "what is the capital of France?",
      ["paris"]),
-    ("New question, ignore anything before: what planet do humans live on?",
+    ("New question, ignore anything before: in one full sentence, "
+     "what planet do humans live on?",
      ["earth"]),
 ]
 
