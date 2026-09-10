@@ -54,6 +54,13 @@ from .server import _fetch_weather, _start_music
 
 logger = logging.getLogger(__name__)
 
+# How long the watcher will hold off on the follow-up window and the turn
+# budget waiting for a reply that has been asked for but has not started.
+# Generous on purpose: the frontend can hand off to the backend and think for
+# seconds before speaking, and cutting a user off mid-thought is the worse
+# failure. The hard cap still bounds the session underneath this.
+_REPLY_OVERDUE_SECONDS = 45.0
+
 
 class _LiveHygiene(FrameProcessor):
     """Own the billing meter for one wake.
@@ -84,6 +91,8 @@ class _LiveHygiene(FrameProcessor):
         self._quiet_since = 0.0  # when the bot last stopped speaking
         self._bot_speaking = False
         self._user_speaking = False
+        self._reply_pending = False  # question committed, reply not started
+        self._reply_pending_since = 0.0
         self._turns = 0
         self._close_requested = False  # end_conversation fired
         self._watch: asyncio.Task | None = None
@@ -96,6 +105,7 @@ class _LiveHygiene(FrameProcessor):
             self._bot_speaking = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
+            self._reply_pending = False
             self._quiet_since = asyncio.get_running_loop().time()
             if self._close_requested:
                 # The goodbye has now actually been spoken.
@@ -105,6 +115,14 @@ class _LiveHygiene(FrameProcessor):
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
             self._turns += 1
+            # A reply is owed but has not started. Nobody is speaking during
+            # this gap, and it is long: the model may hand off to the backend
+            # and think for seconds before its first word. Without this flag
+            # the watcher would judge the gap against a _quiet_since from
+            # before the question and hang up on the user mid-thought, or
+            # close on the turn budget the instant the last question landed.
+            self._reply_pending = True
+            self._reply_pending_since = asyncio.get_running_loop().time()
         elif isinstance(frame, (CancelFrame, EndFrame)) and self._watch is not None:
             task, self._watch = self._watch, None
             await self.cancel_task(task)
@@ -121,6 +139,7 @@ class _LiveHygiene(FrameProcessor):
         self._quiet_since = loop.time()
         self._bot_speaking = False
         self._user_speaking = False
+        self._reply_pending = False
         self._turns = 0
         self._close_requested = False
         self._gen += 1
@@ -152,6 +171,19 @@ class _LiveHygiene(FrameProcessor):
                 return
             if self._bot_speaking or self._user_speaking:
                 continue
+            if self._reply_pending:
+                # Fail-open: a reply that never arrives (a hung tool, a
+                # response the API dropped without telling us) must not hold
+                # the meter open until the hard cap. Well above any real
+                # delegation round trip, which measured a few seconds.
+                if now - self._reply_pending_since <= _REPLY_OVERDUE_SECONDS:
+                    continue
+                logger.warning(
+                    "live hygiene: reply overdue >%.0fs; releasing the pending hold",
+                    _REPLY_OVERDUE_SECONDS,
+                )
+                self._reply_pending = False
+                self._quiet_since = now
             if budget > 0 and self._turns >= budget:
                 await self._close(f"turn budget reached ({self._turns}/{budget})")
                 return

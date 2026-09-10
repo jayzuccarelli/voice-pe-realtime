@@ -120,16 +120,20 @@ async def ask(question: str) -> bytes:
             await ws.send(b"\x00\x00" * (chunk // 2))
             await asyncio.sleep(0.02)
         out = bytearray()
-        deadline = asyncio.get_running_loop().time() + REPLY_MAX_WAIT
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REPLY_MAX_WAIT
         while True:
+            # Cap each wait by whatever is left of the total, so a silent
+            # broker cannot overrun REPLY_MAX_WAIT by a whole idle window.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
             try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=REPLY_IDLE)
+                msg = await asyncio.wait_for(ws.recv(), timeout=min(REPLY_IDLE, remaining))
             except (asyncio.TimeoutError, websockets.ConnectionClosed):
                 break
             if isinstance(msg, bytes):
                 out.extend(msg)
-            if asyncio.get_running_loop().time() > deadline:
-                break
     return bytes(out)
 
 

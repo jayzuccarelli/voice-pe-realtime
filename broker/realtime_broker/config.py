@@ -6,6 +6,20 @@ import os
 from dataclasses import dataclass
 
 
+def _non_negative(name: str, default: int) -> int:
+    """Read an int env var that must not be negative.
+
+    Guards the Live cost fuse in particular: `_LiveHygiene` treats any cap
+    that is not greater than zero as "no cap", so a stray minus sign would
+    quietly disable the one thing bounding a per-minute meter, while the
+    documentation promises that only 0 does that. Refuse to start instead.
+    """
+    value = int(os.environ.get(name, str(default)))
+    if value < 0:
+        raise RuntimeError(f"{name} must be >= 0 (0 disables the bound), got {value}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     """All broker settings. Construct with `Config.from_env()`."""
@@ -116,7 +130,7 @@ class Config:
             max_turns_per_wake=int(os.environ.get("MAX_TURNS_PER_WAKE", "8")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
             idle_refresh_seconds=int(os.environ.get("IDLE_REFRESH_SECONDS", "600")),
-            max_live_session_seconds=int(
-                os.environ.get("MAX_LIVE_SESSION_SECONDS", str(cls.max_live_session_seconds))
+            max_live_session_seconds=_non_negative(
+                "MAX_LIVE_SESSION_SECONDS", cls.max_live_session_seconds
             ),
         )

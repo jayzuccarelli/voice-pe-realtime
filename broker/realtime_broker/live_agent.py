@@ -56,11 +56,26 @@ class VoicePELiveService(OpenAILiveLLMService):
             await self._send_session_config()
 
     async def end_live_session(self) -> None:
-        """Close the billed session when the device goes away."""
-        await self._close_open_turns()
-        await self._close_session()
-        await self._disconnect()
-        self._needs_session_config = True
+        """Close the billed session when the device goes away.
+
+        Every step is attempted even if an earlier one raises. The steps are
+        ordered nice-to-have first and load-bearing last: failing to close
+        out turns costs a transcript, failing to disconnect leaves a billed
+        session open, so an exception in the first must not skip the last.
+        Nothing upstream guards this: the framework's own cleanup only runs
+        when the whole worker shuts down, and by then the meter has been
+        running for however long the puck has been idle.
+        """
+        try:
+            try:
+                await self._close_open_turns()
+            finally:
+                await self._close_session()
+        finally:
+            try:
+                await self._disconnect()
+            finally:
+                self._needs_session_config = True
 
 
 # Appended to the configured persona instructions. The device is far-field
@@ -175,11 +190,28 @@ def _scrub_floats(node, path: str) -> None:
             else:
                 _scrub_floats(value, f"{path}.{key}")
     elif isinstance(node, list):
+        # Rebuilt rather than edited in place: a fractional float inside a
+        # list (an `enum` of allowed values, say) has to come out too, and
+        # deleting while enumerating skips elements. Losing one enum value
+        # narrows what the model may pass; leaving it in means no session at
+        # all, so out it goes.
+        kept = []
         for i, value in enumerate(node):
-            if isinstance(value, float) and not isinstance(value, bool) and value.is_integer():
-                node[i] = int(value)
-            else:
-                _scrub_floats(value, f"{path}[{i}]")
+            if isinstance(value, float) and not isinstance(value, bool):
+                if value.is_integer():
+                    kept.append(int(value))
+                else:
+                    logger.warning(
+                        "Dropping fractional list value %s at %s[%d] (Live API "
+                        "rejects float literals in tool schemas)",
+                        value,
+                        path,
+                        i,
+                    )
+                continue
+            _scrub_floats(value, f"{path}[{i}]")
+            kept.append(value)
+        node[:] = kept
 
 
 async def build_live_tools(mcp: MCPClient | None) -> ToolsSchema:
