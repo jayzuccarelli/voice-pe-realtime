@@ -32,7 +32,9 @@ from pipecat.frames.frames import (
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker, ProcessorUnusablePolicy
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.transports.websocket.server import (
     WebsocketServerParams,
@@ -199,7 +201,9 @@ async def _serve_live(config: Config, mcp) -> None:
             audio_out_enabled=True,
         ),
     )
-    get_ws = lambda: getattr(transport.input(), "_websocket", None)  # noqa: E731
+    def get_ws():
+        return getattr(transport.input(), "_websocket", None)
+
     hygiene = _LiveHygiene(config, get_ws)
 
     async def _get_weather(params):
