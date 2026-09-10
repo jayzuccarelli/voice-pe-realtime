@@ -41,12 +41,45 @@ class VoicePELiveService(OpenAILiveLLMService):
     a time, because the live model bills per minute of session, not per
     minute of speech. So the transport is left connected (free) while the
     *session* is started and closed around each wake.
+
+    It also counts the delegated backend responses currently in flight, so
+    the broker can tell "the model has finished answering" from "the model
+    paused mid-answer while the backend thinks". Nothing else can: the live
+    model streams continuous audio and speaks in bursts, so a gap in speech
+    looks identical either way.
     """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._live_delegations_in_flight = 0
+
+    @property
+    def delegation_in_flight(self) -> bool:
+        """Whether a delegated backend response is still being worked on."""
+        return self._live_delegations_in_flight > 0
+
+    async def _handle_evt_response(self, evt) -> None:
+        """Count delegated responses as they open and close.
+
+        Tracked here rather than read off upstream's `_pending_responses`,
+        which only drops an entry for a response that made function calls: a
+        delegated response that just answers is never removed, so its length
+        reads as "forever in flight" after the first delegation.
+        """
+        inner = getattr(evt, "inner_type", None)
+        if inner == "response.created":
+            self._live_delegations_in_flight += 1
+        elif inner in ("response.completed", "response.incomplete", "response.failed"):
+            # Floor at zero: a reconnect can deliver a completion whose
+            # matching creation belonged to a session that is already gone.
+            self._live_delegations_in_flight = max(0, self._live_delegations_in_flight - 1)
+        await super()._handle_evt_response(evt)
 
     async def begin_live_session(self) -> None:
         """Open a billed session for a freshly connected device."""
         if self._session_started:
             return
+        self._live_delegations_in_flight = 0
         # _connect() early-returns on a non-None socket even when it is dead,
         # so always tear the old one down first.
         await self._disconnect()
@@ -76,6 +109,7 @@ class VoicePELiveService(OpenAILiveLLMService):
                 await self._disconnect()
             finally:
                 self._needs_session_config = True
+                self._live_delegations_in_flight = 0
 
 
 # Appended to the configured persona instructions. The device is far-field

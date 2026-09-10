@@ -56,10 +56,13 @@ logger = logging.getLogger(__name__)
 
 # How long the watcher will hold off on the follow-up window and the turn
 # budget waiting for a reply that has been asked for but has not started.
-# Generous on purpose: the frontend can hand off to the backend and think for
-# seconds before speaking, and cutting a user off mid-thought is the worse
-# failure. The hard cap still bounds the session underneath this.
-_REPLY_OVERDUE_SECONDS = 45.0
+# This only has to bridge the gap from a committed question to either the
+# first word or the first sign of a delegation, measured at a few seconds:
+# long thinking is covered by the delegation hold instead, so this does not
+# need to be generous. Keeping it short matters because a false wake (a TV
+# line the model correctly ignores) commits a turn and never produces speech,
+# and every second of that hold is billed.
+_REPLY_OVERDUE_SECONDS = 12.0
 
 
 class _LiveHygiene(FrameProcessor):
@@ -82,10 +85,12 @@ class _LiveHygiene(FrameProcessor):
     saying goodbye (the tool result comes back long before the words do).
     """
 
-    def __init__(self, config: Config, get_ws) -> None:
+    def __init__(self, config: Config, get_ws, is_delegating=None) -> None:
         super().__init__()
         self._config = config
         self._get_ws = get_ws
+        # Returns True while a delegated backend response is in flight.
+        self._is_delegating = is_delegating or (lambda: False)
         self._connected = False
         self._connect_time = 0.0
         self._quiet_since = 0.0  # when the bot last stopped speaking
@@ -171,6 +176,15 @@ class _LiveHygiene(FrameProcessor):
                 return
             if self._bot_speaking or self._user_speaking:
                 continue
+            if self._is_delegating():
+                # The model paused mid-answer to let the backend work, and it
+                # will speak again when the result lands. Treating that pause
+                # as the end of the reply is what truncated answers
+                # ("humans live on" instead of "humans live on Earth"), so
+                # hold the window open and restart it from the moment the
+                # backend finishes.
+                self._quiet_since = now
+                continue
             if self._reply_pending:
                 # Fail-open: a reply that never arrives (a hung tool, a
                 # response the API dropped without telling us) must not hold
@@ -240,7 +254,7 @@ async def _serve_live(config: Config, mcp) -> None:
     def get_ws():
         return getattr(transport.input(), "_websocket", None)
 
-    hygiene = _LiveHygiene(config, get_ws)
+    hygiene = _LiveHygiene(config, get_ws, lambda: service.delegation_in_flight)
 
     async def _get_weather(params):
         await params.result_callback(await asyncio.to_thread(_fetch_weather, config))
