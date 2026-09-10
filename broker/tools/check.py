@@ -27,10 +27,20 @@ RATE = 24000
 # probes must be robust to prior history: each is framed "ignore prior
 # context" and asserts on a token that appears in the answer regardless of
 # phrasing. Deterministic + HA-independent so the check is signal, not flake.
+# Each case asks for a FULL SENTENCE on purpose. The Live engine answers a
+# bare factual question with a single word, which is about 300 ms of audio,
+# and transcribing 300 ms is a coin flip: real replies of "Earth." came back
+# as 'art' and 'ers.', and "Paris." as 'parrot'. Measured with
+# tools/probe-style energy analysis, the audio was not clipped (there was
+# ~4 s of leading silence and a clean 300 ms of speech), so the flake was in
+# the transcription, not the broker. Asking for a sentence removes the
+# artifact and is closer to how the puck is actually used.
 CASES = [
-    ("New question, ignore anything before: what is the capital of France?",
+    ("New question, ignore anything before: in one full sentence, "
+     "what is the capital of France?",
      ["paris"]),
-    ("New question, ignore anything before: what planet do humans live on?",
+    ("New question, ignore anything before: in one full sentence, "
+     "what planet do humans live on?",
      ["earth"]),
 ]
 
@@ -47,6 +57,14 @@ def load_key() -> str:
 
 
 KEY = load_key()
+
+# How long a reply may go quiet before we call it finished. The Live engine
+# can speak a short holding phrase, fall silent while the delegated backend
+# works, then come back with the answer: a 3s idle window cut those replies
+# off mid-thought and the check read the filler as the answer. Bounded by
+# REPLY_MAX_WAIT so a genuinely dead broker still fails fast enough.
+REPLY_IDLE = float(os.environ.get("REPLY_IDLE_SECS", "8.0"))
+REPLY_MAX_WAIT = float(os.environ.get("REPLY_MAX_WAIT_SECS", "45.0"))
 WS_URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:8765"
 
 
@@ -102,10 +120,17 @@ async def ask(question: str) -> bytes:
             await ws.send(b"\x00\x00" * (chunk // 2))
             await asyncio.sleep(0.02)
         out = bytearray()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + REPLY_MAX_WAIT
         while True:
+            # Cap each wait by whatever is left of the total, so a silent
+            # broker cannot overrun REPLY_MAX_WAIT by a whole idle window.
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
             try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=3.0)
-            except asyncio.TimeoutError:
+                msg = await asyncio.wait_for(ws.recv(), timeout=min(REPLY_IDLE, remaining))
+            except (asyncio.TimeoutError, websockets.ConnectionClosed):
                 break
             if isinstance(msg, bytes):
                 out.extend(msg)

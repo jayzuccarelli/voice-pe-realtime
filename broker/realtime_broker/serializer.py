@@ -12,7 +12,12 @@ import json
 import logging
 
 from pipecat.frames.frames import Frame, InputAudioRawFrame, OutputAudioRawFrame
-from pipecat.serializers.base_serializer import FrameSerializer, FrameSerializerType
+from pipecat.serializers.base_serializer import FrameSerializer
+
+try:  # pipecat <= 1.x required a declared serializer type; main dropped it.
+    from pipecat.serializers.base_serializer import FrameSerializerType
+except ImportError:  # pragma: no cover - depends on the installed pipecat
+    FrameSerializerType = None
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +34,11 @@ class RawPCMSerializer(FrameSerializer):
 
     on_control = None  # async callable(dict) | None
 
-    @property
-    def type(self) -> FrameSerializerType:
-        return FrameSerializerType.BINARY
+    if FrameSerializerType is not None:
+
+        @property
+        def type(self):
+            return FrameSerializerType.BINARY
 
     async def deserialize(self, message: bytes | str) -> InputAudioRawFrame | None:
         if not isinstance(message, bytes):

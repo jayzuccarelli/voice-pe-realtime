@@ -6,12 +6,34 @@ import os
 from dataclasses import dataclass
 
 
+def _non_negative(name: str, default: int) -> int:
+    """Read an int env var that must not be negative.
+
+    Guards the Live cost fuse in particular: `_LiveHygiene` treats any cap
+    that is not greater than zero as "no cap", so a stray minus sign would
+    quietly disable the one thing bounding a per-minute meter, while the
+    documentation promises that only 0 does that. Refuse to start instead.
+    """
+    value = int(os.environ.get(name, str(default)))
+    if value < 0:
+        raise RuntimeError(f"{name} must be >= 0 (0 disables the bound), got {value}")
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     """All broker settings. Construct with `Config.from_env()`."""
 
     openai_api_key: str
     model: str = "gpt-realtime"
+    # Which brain serves the device: "realtime" (gpt-realtime, turn-based with
+    # a stack of VAD/echo workarounds) or "live" (gpt-live-1, full duplex).
+    # The engines share the device protocol, so this is the rollback lever:
+    # flip it back and restart, no reflash.
+    engine: str = "realtime"
+    live_model: str = "gpt-live-1"
+    # The model the live frontend delegates tool use and reasoning to.
+    live_backend_model: str = "gpt-5.4-mini"
     voice: str = "marin"
     instructions: str = "You are a helpful voice assistant."
 
@@ -61,6 +83,13 @@ class Config:
     # so a rotation between turns is invisible.
     max_session_seconds: int = 3000  # 50 min
 
+    # Live engine only. Billing is per minute of open session and nothing on
+    # the device can end one (the firmware auto-stop keys on speaker audio,
+    # which a continuous stream keeps alive), so this cap is a cost fuse, not
+    # a UX bound: it fires even mid-sentence. 0 disables it, which means a
+    # stuck session bills until someone notices.
+    max_live_session_seconds: int = 180  # 3 min
+
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
     # stayed OPEN (2026-06-10). Refresh the session whenever no device has been
@@ -79,6 +108,9 @@ class Config:
         return cls(
             openai_api_key=api_key,
             model=os.environ.get("MODEL", "gpt-realtime"),
+            engine=os.environ.get("ENGINE", cls.engine).lower(),
+            live_model=os.environ.get("LIVE_MODEL", cls.live_model),
+            live_backend_model=os.environ.get("LIVE_BACKEND_MODEL", cls.live_backend_model),
             voice=os.environ.get("VOICE", "marin"),
             instructions=os.environ.get("INSTRUCTIONS", cls.instructions),
             ws_host=os.environ.get("WS_HOST", "0.0.0.0"),
@@ -98,4 +130,7 @@ class Config:
             max_turns_per_wake=int(os.environ.get("MAX_TURNS_PER_WAKE", "8")),
             max_session_seconds=int(os.environ.get("MAX_SESSION_SECONDS", "3000")),
             idle_refresh_seconds=int(os.environ.get("IDLE_REFRESH_SECONDS", "600")),
+            max_live_session_seconds=_non_negative(
+                "MAX_LIVE_SESSION_SECONDS", cls.max_live_session_seconds
+            ),
         )

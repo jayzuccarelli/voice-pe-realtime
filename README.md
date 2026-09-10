@@ -27,6 +27,48 @@ The canonical pattern: **the agent runs server-side; the device is a thin full-d
 
 The stock Voice PE pipeline runs STT → LLM → TTS sequentially, a latency floor that feels clunky next to ChatGPT Voice. Routing audio through a persistent Realtime session collapses that to a single round trip with a natural voice, while MCP gives the model first-class control of the home.
 
+## Two engines
+
+The broker can drive the puck with either OpenAI voice model. `ENGINE` picks
+one; both speak the same device protocol, so switching is a restart, never a
+reflash, and switching back is the rollback.
+
+| | `ENGINE=realtime` (default) | `ENGINE=live` |
+|---|---|---|
+| Model | `gpt-realtime` | `gpt-live-1` |
+| Turn taking | server VAD, one turn at a time | full duplex: the model hears you while it speaks |
+| Barge-in | needs a raised voice; the mic is fed silence during playback so the bot cannot answer its own echo | the model stops on its own |
+| Tools | called directly by the voice model | delegated to a backend model (`LIVE_BACKEND_MODEL`) that runs the same Home Assistant tools |
+| Billing | per token | per minute of open session |
+
+The Live engine is why the broker owns session lifetime. `gpt-live-1` bills
+per minute of session and streams audio continuously, which keeps the
+firmware's 10-second auto-stop from ever firing, so a session is opened when
+the device connects and closed when it disconnects, with a follow-up window,
+a turn budget and `MAX_LIVE_SESSION_SECONDS` as a hard cost fuse.
+
+It needs pipecat's main branch (see `broker/requirements-live.txt`) and
+Python 3.11+, so it does not run in the container built from
+`requirements.lock`. Run it against the isolated dev port:
+
+```bash
+cd broker
+uv venv --python 3.12 .venv-live
+uv pip install --python .venv-live/bin/python -r requirements-live.txt
+ENGINE=live WS_PORT=8766 .venv-live/bin/python -m realtime_broker
+make check WS=ws://127.0.0.1:8766      # from the repo root
+```
+
+### Known API bug: no floats in delegated tool schemas
+
+`session.start` fails with `Invalid AVAS session_data: Type is not JSON
+serializable: decimal.Decimal` if any delegated tool schema contains a float
+literal. One tool with `{"type": "number", "minimum": 0.5}` is enough; the
+same tool with `minimum: 1` starts fine. Home Assistant's MCP server reports
+numeric bounds as floats, so a single script with a numeric range takes the
+whole session down. The broker works around it by rewriting whole floats as
+integers and dropping fractional bounds (`live_agent._scrub_floats`).
+
 ## Reliability
 
 Speech-to-speech on a $59 puck is easy to demo and hard to keep up. This repo treats robustness as the feature:
@@ -67,6 +109,7 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 | Env | Default | Purpose |
 |---|---|---|
 | `OPENAI_API_KEY` | none | required |
+| `ENGINE` | `realtime` | `realtime` or `live` (see [Two engines](#two-engines)) |
 | `MODEL` | `gpt-realtime` | Realtime model |
 | `VOICE` | `marin` | Realtime voice |
 | `INSTRUCTIONS` | generic | system prompt / persona |
@@ -78,6 +121,9 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 | `MAX_TURNS_PER_WAKE` | `8` | user turns allowed per wake, so TV speech can't spiral a session |
 | `MAX_SESSION_SECONDS` | `3000` | rotate before the 60-min cap |
 | `IDLE_REFRESH_SECONDS` | `600` | refresh a stale idle session |
+| `LIVE_MODEL` | `gpt-live-1` | Live engine: the full-duplex frontend model |
+| `LIVE_BACKEND_MODEL` | `gpt-5.4-mini` | Live engine: the model the frontend delegates tools and reasoning to |
+| `MAX_LIVE_SESSION_SECONDS` | `180` | Live engine cost fuse: hard cap on one wake, honoured mid-sentence. `0` disables it, and a stuck session then bills until someone notices |
 
 Turn hygiene (`FOLLOWUP_WINDOW_SECONDS` / `MAX_TURNS_PER_WAKE`): set either to `0` to disable that bound. Setting both to `0` restores the old unbounded behavior, which is the no-redeploy rollback lever.
 

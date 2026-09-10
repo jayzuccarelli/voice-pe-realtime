@@ -1,0 +1,13 @@
+# Dependency set for the LIVE engine (ENGINE=live, model gpt-live-1).
+#
+# gpt-live-1 support (OpenAILiveLLMService) landed on pipecat's main branch
+# after 1.8.1, so there is no release to pin to yet and this pins the commit
+# instead. Replace it with a version specifier once pipecat ships a release
+# containing pipecat.services.openai.live, and fold this file into
+# requirements.txt when the Live engine becomes the default.
+#
+# Needs Python >= 3.11: pipecat main dropped 3.10, which the host still runs.
+# The container is already 3.12. requirements.lock remains the pinned set for
+# the REALTIME engine, which is what production runs today.
+pipecat-ai[mcp,openai,websocket] @ git+https://github.com/pipecat-ai/pipecat.git@555e34a2c2722e301b08246a68cd3039e8357c74
+python-dotenv==1.2.1
