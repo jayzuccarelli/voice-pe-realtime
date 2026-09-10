@@ -49,37 +49,74 @@ class VoicePELiveService(OpenAILiveLLMService):
     looks identical either way.
     """
 
+    #: Terminal states for a delegated backend response.
+    _RESPONSE_DONE = ("response.completed", "response.incomplete", "response.failed")
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._live_delegations_in_flight = 0
+        # Ids of delegated responses still open, for the CURRENT session only.
+        self._live_open_responses: set[str] = set()
 
     @property
     def delegation_in_flight(self) -> bool:
         """Whether a delegated backend response is still being worked on."""
-        return self._live_delegations_in_flight > 0
+        return bool(self._live_open_responses)
+
+    @staticmethod
+    def _response_key(evt) -> str | None:
+        """Identify the delegated response an envelope belongs to."""
+        event = getattr(evt, "event", None) or {}
+        response = event.get("response") or {}
+        key = response.get("id")
+        if key:
+            return str(key)
+        # Fall back to the delegation the envelope was wrapped in, which the
+        # API carries even when the response snapshot is empty.
+        for attr in ("delegation_id", "item_id", "event_id"):
+            value = getattr(evt, attr, None)
+            if value:
+                return str(value)
+        return None
 
     async def _handle_evt_response(self, evt) -> None:
-        """Count delegated responses as they open and close.
+        """Track which delegated responses are open, by id.
 
         Tracked here rather than read off upstream's `_pending_responses`,
         which only drops an entry for a response that made function calls: a
         delegated response that just answers is never removed, so its length
         reads as "forever in flight" after the first delegation.
+
+        Ids rather than a counter, and cleared per session, because a plain
+        count is not safe across a session boundary. A completion from the
+        previous session can arrive after the next one has already opened a
+        delegation, and decrementing a shared counter would release the new
+        session's hold and let the watcher hang up mid-answer. An id that was
+        never opened in this session is simply not in the set, so a late
+        arrival from a dead session is ignored instead of stealing a
+        decrement.
         """
         inner = getattr(evt, "inner_type", None)
+        key = self._response_key(evt)
         if inner == "response.created":
-            self._live_delegations_in_flight += 1
-        elif inner in ("response.completed", "response.incomplete", "response.failed"):
-            # Floor at zero: a reconnect can deliver a completion whose
-            # matching creation belonged to a session that is already gone.
-            self._live_delegations_in_flight = max(0, self._live_delegations_in_flight - 1)
+            if key is not None:
+                self._live_open_responses.add(key)
+        elif inner in self._RESPONSE_DONE:
+            if key is not None:
+                self._live_open_responses.discard(key)
+            elif self._live_open_responses:
+                # No id to match on. Release one hold rather than hold
+                # forever; the pending-reply grace and the hard cap still
+                # bound the session either way.
+                self._live_open_responses.pop()
         await super()._handle_evt_response(evt)
 
     async def begin_live_session(self) -> None:
         """Open a billed session for a freshly connected device."""
         if self._session_started:
             return
-        self._live_delegations_in_flight = 0
+        # A fresh session owns no delegations. Clearing here is what makes a
+        # late completion from the previous session harmless.
+        self._live_open_responses.clear()
         # _connect() early-returns on a non-None socket even when it is dead,
         # so always tear the old one down first.
         await self._disconnect()
@@ -109,7 +146,7 @@ class VoicePELiveService(OpenAILiveLLMService):
                 await self._disconnect()
             finally:
                 self._needs_session_config = True
-                self._live_delegations_in_flight = 0
+                self._live_open_responses.clear()
 
 
 # Appended to the configured persona instructions. The device is far-field

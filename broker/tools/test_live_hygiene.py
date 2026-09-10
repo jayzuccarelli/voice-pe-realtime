@@ -17,7 +17,86 @@ import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from realtime_broker.live_server import _LiveHygiene  # noqa: E402
+from realtime_broker.live_agent import VoicePELiveService
+from realtime_broker.live_server import _LiveHygiene
+
+
+def _response_evt(inner: str, response_id: str | None):
+    """A minimal stand-in for a wrapped Responses lifecycle envelope."""
+    event = {"response": {"id": response_id}} if response_id else {}
+    return types.SimpleNamespace(
+        inner_type=inner,
+        type="response.event",
+        event=event,
+        delegation_id=None,
+        item_id=None,
+        event_id=None,
+    )
+
+
+class _TrackerOnly(VoicePELiveService):
+    """The delegation tracker without any of the websocket machinery."""
+
+    def __init__(self):
+        self._live_open_responses = set()
+
+    async def _handle_evt_response(self, evt):
+        # Skip the parent chain, which would need a live session.
+        inner = getattr(evt, "inner_type", None)
+        key = self._response_key(evt)
+        if inner == "response.created":
+            if key is not None:
+                self._live_open_responses.add(key)
+        elif inner in self._RESPONSE_DONE:
+            if key is not None:
+                self._live_open_responses.discard(key)
+            elif self._live_open_responses:
+                self._live_open_responses.pop()
+
+
+async def test_delegation_tracker_opens_and_closes():
+    svc = _TrackerOnly()
+    assert not svc.delegation_in_flight
+    await svc._handle_evt_response(_response_evt("response.created", "resp_a"))
+    assert svc.delegation_in_flight
+    await svc._handle_evt_response(_response_evt("response.created", "resp_b"))
+    await svc._handle_evt_response(_response_evt("response.completed", "resp_a"))
+    assert svc.delegation_in_flight, "one of two closed should still hold"
+    await svc._handle_evt_response(_response_evt("response.failed", "resp_b"))
+    assert not svc.delegation_in_flight, "all closed should release"
+    print("PASS: delegation tracker opens and closes by response id")
+
+
+async def test_stale_completion_cannot_release_a_new_session():
+    """The bug a plain counter would have: a late completion stealing a hold.
+
+    Session A opens a delegation and goes away. Session B opens its own. A's
+    completion then arrives late. With a counter that decrement would release
+    B's hold and let the watcher hang up mid-answer; keyed by id and cleared
+    per session, it is ignored.
+    """
+    svc = _TrackerOnly()
+    await svc._handle_evt_response(_response_evt("response.created", "resp_old"))
+    svc._live_open_responses.clear()  # what begin_live_session() does
+    await svc._handle_evt_response(_response_evt("response.created", "resp_new"))
+    assert svc.delegation_in_flight
+    await svc._handle_evt_response(_response_evt("response.completed", "resp_old"))
+    assert svc.delegation_in_flight, "a stale completion released the new session's hold"
+    await svc._handle_evt_response(_response_evt("response.completed", "resp_new"))
+    assert not svc.delegation_in_flight
+    print("PASS: a stale completion cannot release the new session's hold")
+
+
+async def test_unidentifiable_completion_does_not_hold_forever():
+    """An envelope with no id must not wedge the hold open."""
+    svc = _TrackerOnly()
+    await svc._handle_evt_response(_response_evt("response.created", "resp_a"))
+    await svc._handle_evt_response(_response_evt("response.completed", None))
+    assert not svc.delegation_in_flight, "an id-less completion left the hold stuck"
+    # And one with nothing open is harmless.
+    await svc._handle_evt_response(_response_evt("response.completed", None))
+    assert not svc.delegation_in_flight
+    print("PASS: an id-less completion releases a hold instead of wedging it")
 
 
 def _hygiene(*, window=1.0, budget=0, cap=0, delegating=lambda: False):
@@ -137,6 +216,9 @@ async def test_turn_budget_waits_for_the_reply():
 
 
 async def main():
+    await test_delegation_tracker_opens_and_closes()
+    await test_stale_completion_cannot_release_a_new_session()
+    await test_unidentifiable_completion_does_not_hold_forever()
     await test_delegation_holds_the_window()
     await test_window_closes_when_idle()
     await test_pending_reply_defers_then_fails_open()
