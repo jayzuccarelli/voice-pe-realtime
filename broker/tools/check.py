@@ -36,12 +36,20 @@ RATE = 24000
 # the transcription, not the broker. Asking for a sentence removes the
 # artifact and is closer to how the puck is actually used.
 CASES = [
-    ("New question, ignore anything before: in one full sentence, "
-     "what is the capital of France?",
-     ["paris"]),
-    ("New question, ignore anything before: in one full sentence, "
-     "what planet do humans live on?",
-     ["earth"]),
+    (
+        (
+            "New question, ignore anything before: in one full sentence, "
+            "what is the capital of France?"
+        ),
+        ["paris"],
+    ),
+    (
+        (
+            "New question, ignore anything before: in one full sentence, "
+            "what planet do humans live on?"
+        ),
+        ["earth"],
+    ),
 ]
 
 
@@ -137,8 +145,38 @@ async def ask(question: str) -> bytes:
     return bytes(out)
 
 
+def _listening(url: str, timeout: float = 2.0) -> bool:
+    """Whether anything is accepting connections at this ws:// URL.
+
+    `make check` is wired into a hook, so it runs whenever a shell lands in
+    this repo, including when no broker is up. Without this probe that case
+    surfaced as a 20-line ConnectionRefusedError traceback out of
+    websockets, which reads like the code is broken rather than "nothing is
+    running" — four times in one session before anyone fixed it.
+    """
+    import socket  # local: only needed for this preflight
+
+    rest = url.split("://", 1)[-1].split("/", 1)[0]
+    host, _, port = rest.rpartition(":")
+    try:
+        target = (host or "127.0.0.1", int(port))
+    except ValueError:
+        return True  # unparseable: let the real connection report it
+    try:
+        with socket.create_connection(target, timeout):
+            return True
+    except OSError:
+        return False
+
+
 async def main() -> int:
     print(f"check: broker={WS_URL}  cases={len(CASES)}")
+    if not _listening(WS_URL):
+        print(f"  no broker is listening on {WS_URL}, so there is nothing to check.")
+        print("  Start one, or point this at one that is already up:")
+        print("    live puck's broker:   make check WS=ws://127.0.0.1:8765")
+        print("    isolated dev broker:  see 'Two engines' in README.md")
+        return 1
     failures = 0
     for question, accept in CASES:
         audio = await ask(question)
