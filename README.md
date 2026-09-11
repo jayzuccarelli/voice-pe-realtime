@@ -37,7 +37,7 @@ reflash, and switching back is the rollback.
 |---|---|---|
 | Model | `gpt-realtime` | `gpt-live-1` |
 | Turn taking | server VAD, one turn at a time | full duplex: the model hears you while it speaks |
-| Barge-in | needs a raised voice; the mic is fed silence during playback so the bot cannot answer its own echo | the model stops on its own |
+| Barge-in | needs a raised voice; the mic is fed silence during playback so the bot cannot answer its own echo | the model yields on its own, ~2.7x faster than Realtime, though not instantly ([measured](#barge-in-measured)) |
 | Tools | called directly by the voice model | delegated to a backend model (`LIVE_BACKEND_MODEL`) that runs the same Home Assistant tools |
 | Billing | per token | per minute of open session |
 
@@ -68,6 +68,42 @@ same tool with `minimum: 1` starts fine. Home Assistant's MCP server reports
 numeric bounds as floats, so a single script with a numeric range takes the
 whole session down. The broker works around it by rewriting whole floats as
 integers and dropping fractional bounds (`live_agent._scrub_floats`).
+
+## Barge-in, measured
+
+Full duplex is the reason to switch engines, so it is measured rather than
+asserted. `broker/tools/bench_bargein.py` asks a long question, cuts in
+1.5 s into the answer, and times how long the bot keeps talking. It runs
+**headless against a broker, no Voice PE required**, because the model-side
+half of barge-in is fully observable from the audio stream.
+
+5 trials per engine, `STOP_WINDOW_S=1.0`:
+
+| engine | yields <1 s | time to last word (p50) | audio after cut (p50) | reply onset (p50) |
+|---|---|---|---|---|
+| `gpt-live-1` | 1/4 | **1.48 s** | 0.56 s | 0.25 s |
+| `gpt-realtime` | 0/3 | **3.99 s** | 3.24 s | 0.48 s |
+
+**Live yields the floor about 2.7x faster.** That is the real difference, and
+it is large enough to feel.
+
+What this does **not** show: neither engine reliably goes quiet within a
+second. If you want "stops the instant you speak", neither qualifies yet on
+this test. Reply onset also goes *negative* on some Live trials, meaning it
+begins answering while you are still speaking, which Realtime cannot do by
+construction since server VAD must detect end-of-speech first.
+
+```bash
+python3 broker/tools/bench_bargein.py ws://127.0.0.1:8766 --trials 5 --label gpt-live-1
+python3 broker/tools/bench_bargein.py ws://127.0.0.1:8765 --trials 5 --label gpt-realtime
+```
+
+Caveats worth stating plainly: small n (4 and 3 scored runs after excluding
+dropped connections and replies that ended before the cut), synthesized TTS
+interruptions rather than a human voice in a room, and **acoustic echo
+residual is unmeasured** — whether the device's own speaker bleeding into its
+mic false-triggers an interruption needs the real puck in a real room, and it
+is the one number a browser-tab demo cannot produce.
 
 ## Reliability
 
