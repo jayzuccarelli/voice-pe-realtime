@@ -73,6 +73,10 @@ SILENCE_RMS = 180
 # one trailing word at conversational pace.
 STOP_WINDOW_S = float(os.environ.get("STOP_WINDOW_S", "1.0"))
 
+# The bot counts as "actively talking right now" if it produced speech within
+# this long. Used to make sure we interrupt a live reply rather than silence.
+ACTIVE_SPEECH_GAP_S = float(os.environ.get("ACTIVE_SPEECH_GAP_S", "0.5"))
+
 
 def load_key() -> str:
     key = os.environ.get("OPENAI_API_KEY")
@@ -130,6 +134,9 @@ class Trial:
     stop_latency_s: float | None = None
     first_audio_s: float | None = None
     bot_speech_after_cut_s: float = 0.0
+    # Inconclusive: the socket died, so we cannot say whether it yielded.
+    # Excluded from the success ratio entirely rather than counted either way.
+    dropped: bool = False
     note: str = ""
 
 
@@ -161,15 +168,25 @@ async def run_trial(url: str, question_pcm: bytes, interrupt_pcm: bytes, cut_aft
         sent_interrupt = False
         deadline = loop.time() + 75.0
 
+        dropped = False
+
         async def read_loop():
-            nonlocal first_speech_at, speech_started_at, last_speech_at, speech_after_cut
+            nonlocal first_speech_at, speech_started_at, last_speech_at
+            nonlocal speech_after_cut, dropped
             while loop.time() < deadline:
                 try:
                     msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
-                except (asyncio.TimeoutError, websockets.ConnectionClosed):
+                except asyncio.TimeoutError:
                     if interrupted_at is not None:
-                        return  # quiet after the cut: it stopped
+                        return  # genuinely quiet after the cut: it stopped
                     continue
+                except websockets.ConnectionClosed:
+                    # NOT the same as silence. A socket that dies after the
+                    # cut leaves speech_after_cut at 0, which used to score
+                    # as a perfect yield. The trial is inconclusive and is
+                    # excluded from the ratio entirely.
+                    dropped = True
+                    return
                 if not isinstance(msg, (bytes, bytearray)):
                     continue
                 if _rms(bytes(msg)) <= SILENCE_RMS:
@@ -177,8 +194,9 @@ async def run_trial(url: str, question_pcm: bytes, interrupt_pcm: bytes, cut_aft
                 now = loop.time()
                 if first_speech_at is None:
                     first_speech_at = now
-                    speech_started_at = now
                 last_speech_at = now
+                if speech_started_at is None:
+                    speech_started_at = now
                 if interrupted_at is not None and now > interrupted_at:
                     speech_after_cut += len(msg) / (2 * RATE)
 
@@ -192,14 +210,31 @@ async def run_trial(url: str, question_pcm: bytes, interrupt_pcm: bytes, cut_aft
         await _stream(ws, b"\x00" * CHUNK * 50)  # 1s trailing silence
         asked_at = loop.time()
 
-        # Wait until the bot has genuinely been talking for cut_after seconds.
-        while loop.time() < deadline:
+        # Cut in only while the bot is ACTIVELY talking. Gating on
+        # "speech started cut_after ago" was wrong: if the reply had already
+        # finished, we interrupted silence, no audio followed, and the trial
+        # scored as a flawless yield. Require recent speech too.
+        while loop.time() < deadline and not dropped:
             await asyncio.sleep(0.05)
-            if speech_started_at and loop.time() - speech_started_at >= cut_after:
-                break
-        if speech_started_at is None:
+            now = loop.time()
+            if speech_started_at is None or last_speech_at is None:
+                continue
+            if now - speech_started_at < cut_after:
+                continue
+            if now - last_speech_at <= ACTIVE_SPEECH_GAP_S:
+                break  # still talking right now: cut in
+            # It went quiet before we could cut in. Wait for it to resume;
+            # if it never does, the deadline ends the trial as inconclusive.
+            speech_started_at = None
+
+        if dropped:
             reader.cancel()
-            t.note = "bot never spoke"
+            t.dropped = True
+            t.note = "connection closed before the cut"
+            return t
+        if speech_started_at is None or last_speech_at is None:
+            reader.cancel()
+            t.note = "bot never spoke long enough to interrupt"
             return t
 
         sent_interrupt = True
@@ -212,16 +247,19 @@ async def run_trial(url: str, question_pcm: bytes, interrupt_pcm: bytes, cut_aft
 
     if first_speech_at is not None:
         t.first_audio_s = first_speech_at - asked_at
+    if dropped:
+        t.dropped = True
+        t.note = t.note or "connection closed after the cut"
+        return t
     if sent_interrupt and last_speech_at is not None and interrupted_at is not None:
         t.stop_latency_s = last_speech_at - interrupted_at
         t.bot_speech_after_cut_s = speech_after_cut
-        # "Stopped" means it yielded the floor, not that it cut off mid-
-        # syllable. A human who is interrupted also finishes the word they
-        # are on. The first run used 0.4s and scored 0/5 on a model that was
-        # plainly yielding in 0.56-0.88s, which measured politeness rather
-        # than failure. STOP_WINDOW_S is what a listener would still call
-        # "it stopped when I spoke"; anything beyond it is talking over you.
-        t.stopped = speech_after_cut < STOP_WINDOW_S
+        # Score on WHEN it last spoke, not on how much it said. Summing
+        # duration let a single 20ms packet arriving 3s after the cut still
+        # pass, because the total stayed small. What matters is whether it
+        # had yielded the floor by STOP_WINDOW_S, so a late resumption
+        # counts as talking over us even if it was brief.
+        t.stopped = t.stop_latency_s < STOP_WINDOW_S
     return t
 
 
@@ -267,18 +305,32 @@ async def main() -> int:
         print(f"  trial {i}: {mark} stop={lat} talked_over={over} first_audio={first} {t.note}")
         await asyncio.sleep(3)  # let the broker's hygiene close the session
 
-    ok = [t for t in bench.trials if t.stopped]
-    overs = [t.bot_speech_after_cut_s for t in bench.trials if t.stop_latency_s is not None]
+    # Scored trials only. A dropped connection is inconclusive, so it is
+    # excluded from BOTH sides of the ratio rather than silently counted as
+    # a pass, which is what an earlier version did.
+    scored = [t for t in bench.trials if not t.dropped and t.stop_latency_s is not None]
+    dropped = [t for t in bench.trials if t.dropped]
+    nospeech = [t for t in bench.trials if not t.dropped and t.stop_latency_s is None]
+    ok = [t for t in scored if t.stopped]
+    stops = [t.stop_latency_s for t in scored]
+    overs = [t.bot_speech_after_cut_s for t in scored]
     firsts = [t.first_audio_s for t in bench.trials if t.first_audio_s is not None]
 
     print(f"\n== {label} ==")
-    print(f"barge-in success: {len(ok)}/{len(bench.trials)}")
-    if overs:
-        print(f"talked over us:   p50 {pct(overs, 0.5):.2f}s   p95 {pct(overs, 0.95):.2f}s")
+    if scored:
+        print(f"yielded within {STOP_WINDOW_S:.1f}s: {len(ok)}/{len(scored)}")
+        print(f"time to last word: p50 {pct(stops, 0.5):.2f}s   p95 {pct(stops, 0.95):.2f}s")
+        print(f"audio after cut:   p50 {pct(overs, 0.5):.2f}s   p95 {pct(overs, 0.95):.2f}s")
+    else:
+        print("no scorable trials")
+    if dropped:
+        print(f"inconclusive (connection dropped): {len(dropped)}, excluded from the ratio")
+    if nospeech:
+        print(f"unusable (bot never spoke long enough): {len(nospeech)}")
     if firsts:
-        print(f"first audio:      p50 {pct(firsts, 0.5):.2f}s   p95 {pct(firsts, 0.95):.2f}s")
+        print(f"reply onset:       p50 {pct(firsts, 0.5):.2f}s   p95 {pct(firsts, 0.95):.2f}s")
     if len(firsts) > 1:
-        print(f"first audio sd:   {statistics.stdev(firsts):.2f}s")
+        print(f"reply onset sd:    {statistics.stdev(firsts):.2f}s")
 
     if args.json_out:
         with open(args.json_out, "w") as f:
@@ -287,10 +339,15 @@ async def main() -> int:
                     "label": label,
                     "url": args.url,
                     "cut_after": args.cut_after,
-                    "success": len(ok),
+                    "stop_window_s": STOP_WINDOW_S,
+                    "yielded": len(ok),
+                    "scored": len(scored),
                     "trials": len(bench.trials),
-                    "talked_over_s": overs,
-                    "first_audio_s": firsts,
+                    "dropped": len(dropped),
+                    "unusable": len(nospeech),
+                    "stop_latency_s": stops,
+                    "audio_after_cut_s": overs,
+                    "reply_onset_s": firsts,
                 },
                 f,
                 indent=2,
