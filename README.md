@@ -2,7 +2,14 @@
 
 Self-hosted, real-time speech-to-speech for the [Home Assistant Voice PE](https://www.home-assistant.io/voice-pe/): talk to your home with ChatGPT-Voice-style latency, and have it actually *do* things.
 
-Instead of the turn-based `wake → STT → LLM → TTS` Assist pipeline, the Voice PE streams audio straight to a small server-side **broker** that holds an **OpenAI Realtime** session and controls Home Assistant over **MCP**. One round trip, natural voice, real actions.
+Instead of the turn-based `wake → STT → LLM → TTS` Assist pipeline, the Voice PE streams audio straight to a small server-side **broker** that holds an OpenAI speech-to-speech session and controls Home Assistant over **MCP**. One round trip, natural voice, real actions.
+
+Two brains are supported, switched with one environment variable and no
+reflash: **`gpt-realtime`** (turn-based, the default) and **`gpt-live-1`**,
+OpenAI's [full-duplex model](https://openai.com/index/introducing-gpt-live-1-in-the-api/)
+that listens while it speaks. On this hardware Live **yields the floor about
+2.7x faster when you talk over it** (1.48 s vs 3.99 s to its last word), which
+is measured here rather than asserted: see [Barge-in, measured](#barge-in-measured).
 
 Say **"Hey Mycroft"**, then talk.
 
