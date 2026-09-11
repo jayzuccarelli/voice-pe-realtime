@@ -18,3 +18,14 @@ stock-voice-pe-backup.bin
 # personal notes and agent context, kept local
 CLAUDE.md
 SUNDAY_RUNBOOK.md
+
+# Dated .env backups. `*.env` above does not catch these (they end in the
+# suffix, not in ".env"), so they sat untracked for months and kept
+# `git status --porcelain` non-empty, which is the condition the Stop hook
+# uses to decide whether to run `make check`. Result: the check ran on every
+# turn in this repo.
+.env.bak-*
+.env.known-good-*
+
+# Agent worktrees live inside the repo and are never part of it.
+.claude/worktrees/

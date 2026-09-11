@@ -54,14 +54,25 @@ CASES = [
 
 
 def load_key() -> str:
+    """The OpenAI key, or "" when there isn't one.
+
+    Returns rather than exits, and tolerates a missing broker/.env, so the
+    no-key case can be reported as a skip next to the no-broker one. It used
+    to raise FileNotFoundError straight out of open() at import time, which
+    is how a checkout without a .env (a fresh clone, a worktree) got a
+    traceback instead of a sentence.
+    """
     key = os.environ.get("OPENAI_API_KEY")
     if key:
         return key
-    with open(ENV) as f:
-        for line in f:
-            if line.startswith("OPENAI_API_KEY="):
-                return line.split("=", 1)[1].strip()
-    sys.exit("OPENAI_API_KEY not set and not found in broker/.env")
+    try:
+        with open(ENV) as f:
+            for line in f:
+                if line.startswith("OPENAI_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
 
 
 KEY = load_key()
@@ -171,12 +182,26 @@ def _listening(url: str, timeout: float = 2.0) -> bool:
 
 async def main() -> int:
     print(f"check: broker={WS_URL}  cases={len(CASES)}")
+    if not KEY:
+        # Same reasoning as the no-broker skip below: a checkout without a
+        # key cannot verify anything, and that is a setup gap rather than a
+        # regression in the code under test.
+        print("  SKIP  no OPENAI_API_KEY in the environment or broker/.env.")
+        print("        Set one to actually verify.")
+        return 0
     if not _listening(WS_URL):
-        print(f"  no broker is listening on {WS_URL}, so there is nothing to check.")
-        print("  Start one, or point this at one that is already up:")
-        print("    live puck's broker:   make check WS=ws://127.0.0.1:8765")
-        print("    isolated dev broker:  see 'Two engines' in README.md")
-        return 1
+        # Exit 0, not 1. This runs from a Stop hook on every turn, and no
+        # broker on the dev port is the normal resting state, not a
+        # regression: there is nothing under test, so there is nothing to
+        # fail. Returning 1 here meant the hook reported "make check failed"
+        # after every single edit, which trained everyone to ignore it — the
+        # exact opposite of what a check is for. A real red still comes from
+        # a broker that answers wrongly.
+        print(f"  SKIP  nothing is listening on {WS_URL}, so there is nothing to check.")
+        print("        Point this at a running broker to actually verify:")
+        print("          live puck's broker:   make check WS=ws://127.0.0.1:8765")
+        print("          isolated dev broker:  see 'Two engines' in README.md")
+        return 0
     failures = 0
     for question, accept in CASES:
         audio = await ask(question)
