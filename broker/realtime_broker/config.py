@@ -32,6 +32,10 @@ class Config:
     # flip it back and restart, no reflash.
     engine: str = "realtime"
     live_model: str = "gpt-live-1"
+    # Live engine voice. Separate from `voice` so the two engines can differ:
+    # they do not offer the same set, and switching engines should not silently
+    # change how the assistant sounds. Falls back to `voice` when unset.
+    live_voice: str | None = None
     # The model the live frontend delegates tool use and reasoning to.
     live_backend_model: str = "gpt-5.4-mini"
     voice: str = "marin"
@@ -110,6 +114,7 @@ class Config:
             model=os.environ.get("MODEL", "gpt-realtime"),
             engine=os.environ.get("ENGINE", cls.engine).lower(),
             live_model=os.environ.get("LIVE_MODEL", cls.live_model),
+            live_voice=os.environ.get("LIVE_VOICE") or None,
             live_backend_model=os.environ.get("LIVE_BACKEND_MODEL", cls.live_backend_model),
             voice=os.environ.get("VOICE", "marin"),
             instructions=os.environ.get("INSTRUCTIONS", cls.instructions),
