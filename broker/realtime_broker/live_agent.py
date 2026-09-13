@@ -312,7 +312,7 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         api_key=config.openai_api_key,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
-            voice=config.voice,
+            voice=config.live_voice or config.voice,
             system_instruction=config.instructions + BACKGROUND_GUIDANCE + DELEGATION_GUIDANCE,
         ),
         delegation=VoicePELiveService.ResponsesDelegation(

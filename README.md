@@ -165,6 +165,7 @@ The broker fetches HA's tools at startup and registers them on the Realtime sess
 | `MAX_SESSION_SECONDS` | `3000` | rotate before the 60-min cap |
 | `IDLE_REFRESH_SECONDS` | `600` | refresh a stale idle session |
 | `LIVE_MODEL` | `gpt-live-1` | Live engine: the full-duplex frontend model |
+| `LIVE_VOICE` | falls back to `VOICE` | Live engine voice (`cedar`, `marin`, ...). Separate from `VOICE` because the engines do not offer the same set, so switching engines should not silently change how the assistant sounds |
 | `LIVE_BACKEND_MODEL` | `gpt-5.4-mini` | Live engine: the model the frontend delegates tools and reasoning to |
 | `MAX_LIVE_SESSION_SECONDS` | `180` | Live engine cost fuse: hard cap on one wake, honoured mid-sentence. `0` disables it, and a stuck session then bills until someone notices |
 
