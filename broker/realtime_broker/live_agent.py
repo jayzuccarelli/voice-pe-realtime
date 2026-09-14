@@ -20,9 +20,11 @@ Two behaviours the Realtime engine needed and this one does not:
 from __future__ import annotations
 
 import logging
+from collections import deque
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.frames.frames import InputAudioRawFrame
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.live.llm import OpenAILiveLLMService
 from pipecat.services.openai.responses.llm import OpenAIResponsesLLMSettings
@@ -52,10 +54,20 @@ class VoicePELiveService(OpenAILiveLLMService):
     #: Terminal states for a delegated backend response.
     _RESPONSE_DONE = ("response.completed", "response.incomplete", "response.failed")
 
+    #: How much speech to hold while the billed session is opening. Opening
+    #: costs ~3s (our websocket handshake, then the API's own session.start),
+    #: and a puck connects *because* the user just said the wake word, so the
+    #: question is spoken entirely inside that window. Bounded so an unusually
+    #: slow open replays recent speech rather than a stale backlog.
+    _MAX_PRESTART_AUDIO_SECONDS = 8.0
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         # Ids of delegated responses still open, for the CURRENT session only.
         self._live_open_responses: set[str] = set()
+        # Mic audio captured while the session was still opening, oldest first.
+        self._prestart_audio: deque[InputAudioRawFrame] = deque()
+        self._prestart_seconds = 0.0
 
     @property
     def delegation_in_flight(self) -> bool:
@@ -110,6 +122,91 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._live_open_responses.pop()
         await super()._handle_evt_response(evt)
 
+    @staticmethod
+    def _frame_seconds(frame: InputAudioRawFrame) -> float:
+        """Wall-clock duration of one PCM16 frame."""
+        rate = getattr(frame, "sample_rate", 0) or 0
+        channels = getattr(frame, "num_channels", 1) or 1
+        if not rate:
+            return 0.0
+        return len(frame.audio) / float(rate * channels * 2)
+
+    def _clear_prestart_audio(self) -> None:
+        self._prestart_audio.clear()
+        self._prestart_seconds = 0.0
+
+    async def _send_user_audio(self, frame: InputAudioRawFrame) -> None:
+        """Hold mic audio that arrives before the session is live.
+
+        Upstream drops it ("dropping input audio until the session has
+        started"). On a call that is harmless, because the human is still
+        saying hello into an already-open session. On a wake-word puck it is
+        the entire request: the device connects *because* the user just
+        spoke, so the question lands inside the ~3s the session takes to
+        open. Dropping it makes a wake sound like the chime followed by
+        nothing, the model having come alive to silence and hung up with
+        zero turns.
+        """
+        if not self._session_started:
+            self._prestart_audio.append(frame)
+            self._prestart_seconds += self._frame_seconds(frame)
+            while self._prestart_audio and self._prestart_seconds > self._MAX_PRESTART_AUDIO_SECONDS:
+                self._prestart_seconds -= self._frame_seconds(self._prestart_audio.popleft())
+            return
+        await super()._send_user_audio(frame)
+
+    async def _handle_evt_session_started(self, evt) -> None:
+        """Start the session, then replay what the user said while it opened."""
+        await super()._handle_evt_session_started(evt)
+        if not self._prestart_audio:
+            return
+        held = list(self._prestart_audio)
+        seconds = self._prestart_seconds
+        self._clear_prestart_audio()
+        self._describe_prestart_audio(held, seconds)
+        for frame in held:
+            await super()._send_user_audio(frame)
+
+    def _describe_prestart_audio(self, held, seconds: float) -> None:
+        """Log what was actually captured, and keep a copy to listen to.
+
+        A flush that reports the right duration still tells us nothing about
+        whether the user's voice is in it. Peak amplitude separates "we held
+        3s of the user asking a question" from "we held 3s of near-silence",
+        which are the same line in the log otherwise.
+        """
+        import array
+        import wave
+
+        samples = array.array("h")
+        for frame in held:
+            try:
+                samples.frombytes(frame.audio)
+            except ValueError:
+                pass
+        peak = max((abs(s) for s in samples), default=0)
+        rates = sorted({getattr(f, "sample_rate", 0) for f in held})
+        logger.info(
+            "Flushing %.1fs of speech captured while the session opened "
+            "(%d frames, rate(s)=%s, peak=%d/32767)",
+            seconds,
+            len(held),
+            rates,
+            peak,
+        )
+        if not samples:
+            return
+        try:
+            path = f"/tmp/claude/prestart-{int(seconds * 1000)}ms.wav"
+            with wave.open(path, "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(rates[-1] if rates else 16000)
+                out.writeframes(samples.tobytes())
+            logger.info("Wrote captured audio to %s", path)
+        except OSError as exc:  # debug aid only; never break a session for it
+            logger.warning("Could not write captured audio: %s", exc)
+
     async def begin_live_session(self) -> None:
         """Open a billed session for a freshly connected device."""
         if self._session_started:
@@ -117,6 +214,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         # A fresh session owns no delegations. Clearing here is what makes a
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
+        self._clear_prestart_audio()
         # _connect() early-returns on a non-None socket even when it is dead,
         # so always tear the old one down first.
         await self._disconnect()
@@ -147,6 +245,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             finally:
                 self._needs_session_config = True
                 self._live_open_responses.clear()
+                self._clear_prestart_audio()
 
 
 # Appended to the configured persona instructions. The device is far-field
