@@ -120,6 +120,11 @@ class Config:
     # floor left in = silent; both = answered. The on-device wake word already
     # gates who the model listens to.
     live_far_field_guidance: bool = False
+    # Tell the Live model the wake word was just said and the speaker is
+    # distant, so it treats imperfect far-field audio as a request to it.
+    # Off: measured no effect (0/6 cold replays of the device's capture with
+    # it on, 1/6 without, 2026-09-14). Kept as a switch for the next capture.
+    live_wake_guidance: bool = False
 
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
@@ -175,5 +180,7 @@ class Config:
             in ("1", "true", "yes"),
             live_flush_pace=float(os.environ.get("LIVE_FLUSH_PACE", str(cls.live_flush_pace))),
             live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
+            in ("1", "true", "yes"),
+            live_wake_guidance=os.environ.get("LIVE_WAKE_GUIDANCE", "").lower()
             in ("1", "true", "yes"),
         )

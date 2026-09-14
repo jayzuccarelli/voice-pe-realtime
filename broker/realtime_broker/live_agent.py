@@ -471,6 +471,20 @@ BACKGROUND_GUIDANCE = (
     "TV line."
 )
 
+# The opposite bias from BACKGROUND_GUIDANCE, for a wake-word device. The
+# wake word is consumed on the device, so the model never hears itself
+# addressed; without this it has only distant, noisy audio and no reason to
+# believe anyone is talking to it. The Live API has no input-side knob for
+# this (no turn-detection or noise-reduction setting exists in session.start),
+# so the prompt is the only lever.
+WAKE_GUIDANCE = (
+    " The user has just said your wake word, so they are speaking to you. They "
+    "are across the room, through a far-field microphone, so their voice may "
+    "sound quiet, distant or noisy. Treat what you hear right after the session "
+    "starts as a request addressed to you and answer it promptly. Do not wait to "
+    "hear your name, and do not stay silent because the audio is imperfect."
+)
+
 # Told to the frontend model only. Task knowledge lives in the backend
 # prompt; this is about conversation and when to hand off.
 DELEGATION_GUIDANCE = (
@@ -612,7 +626,11 @@ async def build_live_tools(mcp: MCPClient | None) -> ToolsSchema:
 
 def build_live_agent(config: Config) -> VoicePELiveService:
     """Create the Live service with an OpenAI-hosted backend model."""
-    guidance = (BACKGROUND_GUIDANCE if config.live_far_field_guidance else "") + DELEGATION_GUIDANCE
+    guidance = (
+        (BACKGROUND_GUIDANCE if config.live_far_field_guidance else "")
+        + (WAKE_GUIDANCE if config.live_wake_guidance else "")
+        + DELEGATION_GUIDANCE
+    )
     return VoicePELiveService(
         api_key=config.openai_api_key,
         input_gate_rms=config.live_input_gate_rms,
