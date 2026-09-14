@@ -23,6 +23,8 @@ import array
 import asyncio
 import logging
 import math
+import os
+import time
 from collections import deque
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -97,6 +99,9 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._flush_queue: deque[InputAudioRawFrame] = deque()
         self._flush_task = None
         self._draining = False
+        # Debug aid: everything sent to the model this session, written to a
+        # WAV at session end so a silent wake can be transcribed and heard.
+        self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
         # Ids of delegated responses still open, for the CURRENT session only.
         self._live_open_responses: set[str] = set()
         # Mic audio captured while the session was still opening, oldest first.
@@ -306,7 +311,31 @@ class VoicePELiveService(OpenAILiveLLMService):
                 # the question with live silence spliced between its frames.
                 self._flush_queue.append(ready)
                 continue
-            await super()._send_user_audio(ready)
+            await self._send_to_model(ready)
+
+    async def _send_to_model(self, frame: InputAudioRawFrame) -> None:
+        if self._session_tape is not None:
+            self._session_tape += frame.audio
+        await super()._send_user_audio(frame)
+
+    def _write_session_tape(self) -> None:
+        if not self._session_tape:
+            return
+        import wave
+
+        path = f"/tmp/claude/session-{int(time.time())}.wav"
+        try:
+            with wave.open(path, "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(24000)
+                out.writeframes(bytes(self._session_tape))
+            logger.info(
+                "Session tape: %.1fs written to %s", len(self._session_tape) / 48000.0, path
+            )
+        except OSError as exc:
+            logger.warning("Could not write session tape: %s", exc)
+        self._session_tape.clear()
 
     async def _handle_evt_session_started(self, evt) -> None:
         """Start the session, then replay what the user said while it opened."""
@@ -329,7 +358,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         try:
             while self._flush_queue:
                 frame = self._flush_queue.popleft()
-                await super()._send_user_audio(frame)
+                await self._send_to_model(frame)
                 if self._flush_pace > 0:
                     await asyncio.sleep(self._frame_seconds(frame) / self._flush_pace)
         finally:
@@ -337,7 +366,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             # Anything that slipped in between the last pop and the flag
             # clearing goes out now, still in order.
             while self._flush_queue:
-                await super()._send_user_audio(self._flush_queue.popleft())
+                await self._send_to_model(self._flush_queue.popleft())
 
     async def _stop_flush(self) -> None:
         task, self._flush_task = self._flush_task, None
@@ -423,6 +452,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         running for however long the puck has been idle.
         """
         await self._stop_flush()
+        if self._session_tape is not None:
+            self._write_session_tape()
         try:
             try:
                 await self._close_open_turns()
