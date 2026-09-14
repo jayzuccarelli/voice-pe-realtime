@@ -90,6 +90,13 @@ class VoicePELiveService(OpenAILiveLLMService):
     ) -> None:
         super().__init__(**kwargs)
         self._flush_pace = float(flush_pace)
+        # Audio waiting to go to the model at real-time pace once the session
+        # is live: what was captured while it opened, then anything that
+        # arrives while that is still draining, so order is preserved and
+        # live frames are never interleaved with the replay.
+        self._flush_queue: deque[InputAudioRawFrame] = deque()
+        self._flush_task = None
+        self._draining = False
         # Ids of delegated responses still open, for the CURRENT session only.
         self._live_open_responses: set[str] = set()
         # Mic audio captured while the session was still opening, oldest first.
@@ -293,6 +300,12 @@ class VoicePELiveService(OpenAILiveLLMService):
                 ):
                     self._prestart_seconds -= self._frame_seconds(self._prestart_audio.popleft())
                 continue
+            if self._draining:
+                # The replay of the opening seconds is still going out; queue
+                # behind it rather than jumping the line, or the model hears
+                # the question with live silence spliced between its frames.
+                self._flush_queue.append(ready)
+                continue
             await super()._send_user_audio(ready)
 
     async def _handle_evt_session_started(self, evt) -> None:
@@ -306,10 +319,32 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._describe_prestart_audio(held, seconds)
         # Paced, not dumped: the model's turn detector runs on a real-time
         # stream, and a question that arrives in one instant is not a turn.
-        for frame in held:
-            await super()._send_user_audio(frame)
-            if self._flush_pace > 0:
-                await asyncio.sleep(self._frame_seconds(frame) / self._flush_pace)
+        # Drained by its own task so this handler, which runs on the receive
+        # loop, returns at once and server events keep flowing meanwhile.
+        self._flush_queue.extend(held)
+        self._draining = True
+        self._flush_task = self.create_task(self._drain_flush_queue())
+
+    async def _drain_flush_queue(self) -> None:
+        try:
+            while self._flush_queue:
+                frame = self._flush_queue.popleft()
+                await super()._send_user_audio(frame)
+                if self._flush_pace > 0:
+                    await asyncio.sleep(self._frame_seconds(frame) / self._flush_pace)
+        finally:
+            self._draining = False
+            # Anything that slipped in between the last pop and the flag
+            # clearing goes out now, still in order.
+            while self._flush_queue:
+                await super()._send_user_audio(self._flush_queue.popleft())
+
+    async def _stop_flush(self) -> None:
+        task, self._flush_task = self._flush_task, None
+        self._draining = False
+        self._flush_queue.clear()
+        if task is not None and not task.done():
+            await self.cancel_task(task, timeout=1.0)
 
     def _describe_prestart_audio(self, held, seconds: float) -> None:
         """Log what was actually captured, and keep a copy to listen to.
@@ -359,10 +394,19 @@ class VoicePELiveService(OpenAILiveLLMService):
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
         self._clear_prestart_audio()
-        # _connect() early-returns on a non-None socket even when it is dead,
-        # so always tear the old one down first.
-        await self._disconnect()
-        await self._connect()
+        await self._stop_flush()
+        # Reuse the socket when it is alive: the handshake is the bulk of the
+        # ~3s a cold open costs, and everything the user says during that
+        # wait has to be replayed later. The socket is free to hold open; only
+        # the session bills. _connect() early-returns on a non-None socket
+        # even when it is dead, so a dead one is torn down first.
+        socket_dead = self._websocket is not None and (
+            self._receive_task is None or self._receive_task.done()
+        )
+        if socket_dead:
+            await self._disconnect()
+        if self._websocket is None:
+            await self._connect()
         self._needs_session_config = True
         if self._context is not None:
             await self._send_session_config()
@@ -378,6 +422,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         when the whole worker shuts down, and by then the meter has been
         running for however long the puck has been idle.
         """
+        await self._stop_flush()
         try:
             try:
                 await self._close_open_turns()
@@ -386,6 +431,9 @@ class VoicePELiveService(OpenAILiveLLMService):
         finally:
             try:
                 await self._disconnect()
+                # Reconnect now, while nobody is waiting, so the next wake
+                # pays only session.start (~0.7s) and not the handshake.
+                await self._connect()
             finally:
                 self._needs_session_config = True
                 self._live_open_responses.clear()
