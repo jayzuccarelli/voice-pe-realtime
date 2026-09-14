@@ -105,6 +105,12 @@ class Config:
     # How long the gate stays open after the last loud frame, in audio time,
     # so word tails and mid-sentence pauses are not chopped.
     live_input_gate_hold_ms: float = 250.0
+    # Decide speech with Silero VAD (True) or by level alone (False).
+    live_input_gate_vad: bool = True
+    # How fast to replay audio captured while the session was opening, as a
+    # multiple of real time. 1.0 feeds it at the pace it was spoken, which is
+    # what a streaming turn detector expects; 0 dumps it all at once.
+    live_flush_pace: float = 1.0
     # Whether to append the "stay silent for TV, media and background chatter"
     # instruction to the Live persona. Off: with gpt-live-1 the wake word is
     # consumed on the device, so the model never hears itself addressed, and
@@ -165,6 +171,9 @@ class Config:
             live_input_gate_hold_ms=float(
                 os.environ.get("LIVE_INPUT_GATE_HOLD_MS", str(cls.live_input_gate_hold_ms))
             ),
+            live_input_gate_vad=os.environ.get("LIVE_INPUT_GATE_VAD", "1").lower()
+            in ("1", "true", "yes"),
+            live_flush_pace=float(os.environ.get("LIVE_FLUSH_PACE", str(cls.live_flush_pace))),
             live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
             in ("1", "true", "yes"),
         )
