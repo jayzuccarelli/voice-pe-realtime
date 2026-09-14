@@ -94,6 +94,27 @@ class Config:
     # stuck session bills until someone notices.
     max_live_session_seconds: int = 180  # 3 min
 
+    # Live engine only. Frames whose RMS sits under this are treated as the
+    # room's noise floor and attenuated 40 dB before they reach the model.
+    # gpt-live-1 never opens a turn on the Voice PE's audio otherwise: the mic
+    # path carries a constant ~-40 dBFS floor (mains hum plus a device tone)
+    # and the model reads that as nobody talking, however loud the words on
+    # top. 400 is about -38 dBFS; the device's floor measures 250-300 and its
+    # speech 1000+. 0 disables the gate.
+    live_input_gate_rms: float = 400.0
+    # How long the gate stays open after the last loud frame, in audio time,
+    # so word tails and mid-sentence pauses are not chopped.
+    live_input_gate_hold_ms: float = 250.0
+    # Whether to append the "stay silent for TV, media and background chatter"
+    # instruction to the Live persona. Off: with gpt-live-1 the wake word is
+    # consumed on the device, so the model never hears itself addressed, and
+    # that instruction makes it treat real far-field questions as background
+    # and never open a turn. Replaying the device's own captures on
+    # 2026-09-14: floor removed + instruction on = silent; instruction off +
+    # floor left in = silent; both = answered. The on-device wake word already
+    # gates who the model listens to.
+    live_far_field_guidance: bool = False
+
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
     # stayed OPEN (2026-06-10). Refresh the session whenever no device has been
@@ -138,4 +159,12 @@ class Config:
             max_live_session_seconds=_non_negative(
                 "MAX_LIVE_SESSION_SECONDS", cls.max_live_session_seconds
             ),
+            live_input_gate_rms=float(
+                os.environ.get("LIVE_INPUT_GATE_RMS", str(cls.live_input_gate_rms))
+            ),
+            live_input_gate_hold_ms=float(
+                os.environ.get("LIVE_INPUT_GATE_HOLD_MS", str(cls.live_input_gate_hold_ms))
+            ),
+            live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
+            in ("1", "true", "yes"),
         )

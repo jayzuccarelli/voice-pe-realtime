@@ -19,7 +19,9 @@ Two behaviours the Realtime engine needed and this one does not:
 
 from __future__ import annotations
 
+import array
 import logging
+import math
 from collections import deque
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -61,13 +63,93 @@ class VoicePELiveService(OpenAILiveLLMService):
     #: slow open replays recent speech rather than a stale backlog.
     _MAX_PRESTART_AUDIO_SECONDS = 8.0
 
-    def __init__(self, **kwargs) -> None:
+    #: Length of the rolling window the gate measures level over.
+    _GATE_WINDOW_SECONDS = 0.1
+    #: What gated frames are scaled by: 40 dB down, not digital zero. This is
+    #: the figure the replay experiments validated against the real device.
+    _GATE_ATTENUATION = 0.01
+
+    def __init__(
+        self, *, input_gate_rms: float = 0.0, input_gate_hold_ms: float = 250.0, **kwargs
+    ) -> None:
         super().__init__(**kwargs)
         # Ids of delegated responses still open, for the CURRENT session only.
         self._live_open_responses: set[str] = set()
         # Mic audio captured while the session was still opening, oldest first.
         self._prestart_audio: deque[InputAudioRawFrame] = deque()
         self._prestart_seconds = 0.0
+        # Input noise gate. 0 disables it. The decision is made on a rolling
+        # 100 ms window, not the 20 ms frame: frame-level RMS dips under the
+        # threshold on every consonant and micro-pause and the gate then
+        # chops words into fragments. 100 ms is what the replay experiments
+        # validated.
+        self._input_gate_rms = float(input_gate_rms)
+        self._gate_hold_seconds = float(input_gate_hold_ms) / 1000.0
+        self._gate_quiet_seconds = 0.0
+        self._gate_window: deque[tuple[float, int, float]] = deque()  # (sum sq, n, secs)
+        self._gate_window_seconds = 0.0
+        self._gate_passed = 0
+        self._gate_attenuated = 0
+        logger.info(
+            "Live input gate: rms<%.0f attenuated after %.0f ms quiet (0 = off)",
+            self._input_gate_rms,
+            self._gate_hold_seconds * 1000,
+        )
+
+    def _gate_input(self, frame: InputAudioRawFrame) -> InputAudioRawFrame:
+        """Attenuate frames that carry only the room's noise floor.
+
+        gpt-live-1 does its own turn detection, and on this device it never
+        opens a turn: the puck's mic path carries a constant floor of about
+        -40 dBFS (mains hum and a device tone) under and around the speech,
+        and the model treats that as "no one is talking" no matter how loud
+        the words on top of it are. The same recording with its between-word
+        floor pulled down 40 dB gets answered; clean synthetic speech, which
+        falls to digital zero between words, always did. Level, bandwidth,
+        leading silence and the persona's far-field instruction were each
+        ruled out by replaying the device's own capture with one change at a
+        time (2026-09-14).
+
+        So the floor is removed here, before the audio reaches the model,
+        with a hold so word tails and mid-sentence pauses are not chopped.
+        """
+        if self._input_gate_rms <= 0:
+            return frame
+        samples = array.array("h")
+        samples.frombytes(frame.audio[: len(frame.audio) // 2 * 2])
+        if not samples:
+            return frame
+        secs = self._frame_seconds(frame)
+        frame_sq = float(sum(s * s for s in samples))
+        self._gate_window.append((frame_sq, len(samples), secs))
+        self._gate_window_seconds += secs
+        while self._gate_window_seconds > self._GATE_WINDOW_SECONDS and len(self._gate_window) > 1:
+            _, _, old = self._gate_window.popleft()
+            self._gate_window_seconds -= old
+        total_sq = sum(w[0] for w in self._gate_window)
+        total_n = sum(w[1] for w in self._gate_window) or 1
+        # Fast attack, slow release: the frame alone opens the gate, so a
+        # word's first milliseconds are never clipped while the window still
+        # holds the quiet before it; the window keeps it open across the
+        # dips inside a word.
+        frame_rms = math.sqrt(frame_sq / len(samples))
+        window_rms = math.sqrt(total_sq / total_n)
+        rms = max(frame_rms, window_rms)
+        if rms >= self._input_gate_rms:
+            self._gate_quiet_seconds = 0.0
+            self._gate_passed += 1
+            return frame
+        self._gate_quiet_seconds += self._frame_seconds(frame)
+        if self._gate_quiet_seconds <= self._gate_hold_seconds:
+            self._gate_passed += 1
+            return frame
+        self._gate_attenuated += 1
+        quiet = array.array("h", (int(s * self._GATE_ATTENUATION) for s in samples))
+        return InputAudioRawFrame(
+            audio=quiet.tobytes(),
+            sample_rate=frame.sample_rate,
+            num_channels=frame.num_channels,
+        )
 
     @property
     def delegation_in_flight(self) -> bool:
@@ -147,6 +229,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         nothing, the model having come alive to silence and hung up with
         zero turns.
         """
+        frame = self._gate_input(frame)
         if not self._session_started:
             self._prestart_audio.append(frame)
             self._prestart_seconds += self._frame_seconds(frame)
@@ -246,6 +329,16 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._needs_session_config = True
                 self._live_open_responses.clear()
                 self._clear_prestart_audio()
+                if self._input_gate_rms > 0:
+                    logger.info(
+                        "Live input gate this session: %d frames passed, %d attenuated",
+                        self._gate_passed,
+                        self._gate_attenuated,
+                    )
+                self._gate_passed = self._gate_attenuated = 0
+                self._gate_quiet_seconds = 0.0
+                self._gate_window.clear()
+                self._gate_window_seconds = 0.0
 
 
 # Appended to the configured persona instructions. The device is far-field
@@ -407,12 +500,15 @@ async def build_live_tools(mcp: MCPClient | None) -> ToolsSchema:
 
 def build_live_agent(config: Config) -> VoicePELiveService:
     """Create the Live service with an OpenAI-hosted backend model."""
+    guidance = (BACKGROUND_GUIDANCE if config.live_far_field_guidance else "") + DELEGATION_GUIDANCE
     return VoicePELiveService(
         api_key=config.openai_api_key,
+        input_gate_rms=config.live_input_gate_rms,
+        input_gate_hold_ms=config.live_input_gate_hold_ms,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
-            system_instruction=config.instructions + BACKGROUND_GUIDANCE + DELEGATION_GUIDANCE,
+            system_instruction=config.instructions + guidance,
         ),
         delegation=VoicePELiveService.ResponsesDelegation(
             settings=OpenAIResponsesLLMSettings(
