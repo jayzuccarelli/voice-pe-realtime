@@ -200,6 +200,12 @@ class _LiveHygiene(FrameProcessor):
         """end_conversation: hang up once the bot stops speaking."""
         self._close_requested = True
 
+    def on_prestart_replayed(self) -> None:
+        """The pre-start replay has reached the model: the first-reply clock
+        starts now. The hard cap still runs from the connect."""
+        if self._reply_pending and not self._bot_spoke:
+            self._reply_pending_since = asyncio.get_running_loop().time()
+
     def on_device_connect(self) -> None:
         loop = asyncio.get_running_loop()
         self._connected = True
@@ -334,6 +340,7 @@ async def _serve_live(config: Config, mcp) -> None:
         return getattr(transport.input(), "_websocket", None)
 
     hygiene = _LiveHygiene(config, get_ws, lambda: service.delegation_in_flight)
+    service.on_prestart_replayed = hygiene.on_prestart_replayed
 
     async def _get_weather(params):
         await params.result_callback(await asyncio.to_thread(_fetch_weather, config))

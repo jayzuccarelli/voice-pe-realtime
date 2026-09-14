@@ -99,6 +99,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._flush_queue: deque[InputAudioRawFrame] = deque()
         self._flush_task = None
         self._draining = False
+        # Called once the pre-start replay has fully reached the model.
+        self.on_prestart_replayed = None
         # Debug aid: everything sent to the model this session, written to a
         # WAV at session end so a silent wake can be transcribed and heard.
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
@@ -367,6 +369,11 @@ class VoicePELiveService(OpenAILiveLLMService):
             # clearing goes out now, still in order.
             while self._flush_queue:
                 await self._send_to_model(self._flush_queue.popleft())
+            # The model has now heard everything said before the session
+            # opened; the wait for its first reply starts here, not at the
+            # wake, or a long replay would eat the reply's time.
+            if self.on_prestart_replayed is not None:
+                self.on_prestart_replayed()
 
     async def _stop_flush(self) -> None:
         task, self._flush_task = self._flush_task, None
@@ -402,7 +409,9 @@ class VoicePELiveService(OpenAILiveLLMService):
             rates,
             peak,
         )
-        if not samples:
+        if not samples or self._session_tape is None:
+            # Microphone audio is only ever written to disk when the
+            # operator opted in with LIVE_SESSION_TAPE.
             return
         try:
             path = f"/tmp/claude/prestart-{int(seconds * 1000)}ms.wav"

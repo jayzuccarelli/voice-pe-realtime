@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
+
+
+def _non_negative_float(name: str, default: float) -> float:
+    """Read a float env var that must be finite and >= 0.
+
+    A negative gate threshold silently disables the gate and a negative
+    replay pace silently dumps the replay; refuse to start instead.
+    """
+    value = float(os.environ.get(name, str(default)))
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError(f"{name} must be a finite value >= 0, got {value}")
+    return value
 
 
 def _non_negative(name: str, default: int) -> int:
@@ -170,15 +183,13 @@ class Config:
             max_live_session_seconds=_non_negative(
                 "MAX_LIVE_SESSION_SECONDS", cls.max_live_session_seconds
             ),
-            live_input_gate_rms=float(
-                os.environ.get("LIVE_INPUT_GATE_RMS", str(cls.live_input_gate_rms))
-            ),
-            live_input_gate_hold_ms=float(
-                os.environ.get("LIVE_INPUT_GATE_HOLD_MS", str(cls.live_input_gate_hold_ms))
+            live_input_gate_rms=_non_negative_float("LIVE_INPUT_GATE_RMS", cls.live_input_gate_rms),
+            live_input_gate_hold_ms=_non_negative_float(
+                "LIVE_INPUT_GATE_HOLD_MS", cls.live_input_gate_hold_ms
             ),
             live_input_gate_vad=os.environ.get("LIVE_INPUT_GATE_VAD", "1").lower()
             in ("1", "true", "yes"),
-            live_flush_pace=float(os.environ.get("LIVE_FLUSH_PACE", str(cls.live_flush_pace))),
+            live_flush_pace=_non_negative_float("LIVE_FLUSH_PACE", cls.live_flush_pace),
             live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
             in ("1", "true", "yes"),
             live_wake_guidance=os.environ.get("LIVE_WAKE_GUIDANCE", "").lower()
