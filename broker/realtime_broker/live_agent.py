@@ -19,10 +19,17 @@ Two behaviours the Realtime engine needed and this one does not:
 
 from __future__ import annotations
 
+import array
+import asyncio
 import logging
+import math
+import os
+import time
+from collections import deque
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.frames.frames import InputAudioRawFrame
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.live.llm import OpenAILiveLLMService
 from pipecat.services.openai.responses.llm import OpenAIResponsesLLMSettings
@@ -52,10 +59,165 @@ class VoicePELiveService(OpenAILiveLLMService):
     #: Terminal states for a delegated backend response.
     _RESPONSE_DONE = ("response.completed", "response.incomplete", "response.failed")
 
-    def __init__(self, **kwargs) -> None:
+    #: How much speech to hold while the billed session is opening. Opening
+    #: costs ~3s (our websocket handshake, then the API's own session.start),
+    #: and a puck connects *because* the user just said the wake word, so the
+    #: question is spoken entirely inside that window. Bounded so an unusually
+    #: slow open replays recent speech rather than a stale backlog.
+    _MAX_PRESTART_AUDIO_SECONDS = 8.0
+
+    #: What gated frames are scaled by: 40 dB down, not digital zero. This is
+    #: the figure the replay experiments validated against the real device.
+    _GATE_ATTENUATION = 0.01
+    #: Silero runs at 16 kHz on 512-sample chunks; anything at or above this
+    #: confidence counts as speech.
+    _GATE_VAD_RATE = 16000
+    _GATE_VAD_CONFIDENCE = 0.5
+    #: Frames held back so the decision for a frame can use audio slightly
+    #: after it. Silero needs ~32 ms of audio before it reports an onset; two
+    #: 20 ms frames of look-ahead mean a word's first syllable is never the
+    #: casualty of that delay. 40 ms of added mic latency is inaudible.
+    _GATE_LOOKAHEAD_FRAMES = 2
+    #: Fallback when Silero is unavailable: level over a rolling window.
+    _GATE_WINDOW_SECONDS = 0.1
+
+    def __init__(
+        self,
+        *,
+        input_gate_rms: float = 0.0,
+        input_gate_hold_ms: float = 250.0,
+        input_gate_vad: bool = True,
+        flush_pace: float = 1.0,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
+        self._flush_pace = float(flush_pace)
+        # Audio waiting to go to the model at real-time pace once the session
+        # is live: what was captured while it opened, then anything that
+        # arrives while that is still draining, so order is preserved and
+        # live frames are never interleaved with the replay.
+        self._flush_queue: deque[InputAudioRawFrame] = deque()
+        self._flush_task = None
+        self._draining = False
+        # Called once the pre-start replay has fully reached the model.
+        self.on_prestart_replayed = None
+        # Debug aid: everything sent to the model this session, written to a
+        # WAV at session end so a silent wake can be transcribed and heard.
+        self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
         # Ids of delegated responses still open, for the CURRENT session only.
         self._live_open_responses: set[str] = set()
+        # Mic audio captured while the session was still opening, oldest first.
+        self._prestart_audio: deque[InputAudioRawFrame] = deque()
+        self._prestart_seconds = 0.0
+        # Input noise gate. 0 disables it. Speech is decided by Silero VAD,
+        # which is trained on exactly this kind of noisy far-field audio; a
+        # level threshold is the fallback, and it is a poor one here because
+        # the device's floor and its quieter speech overlap in level.
+        self._input_gate_rms = float(input_gate_rms)
+        self._gate_hold_seconds = float(input_gate_hold_ms) / 1000.0
+        self._gate_quiet_seconds = 0.0
+        self._gate_pending: deque[InputAudioRawFrame] = deque()
+        self._gate_vad = None
+        self._gate_resampler = None
+        self._gate_vad_buf = bytearray()
+        self._gate_vad_conf = 0.0
+        self._gate_window: deque[tuple[float, int, float]] = deque()  # (sum sq, n, secs)
+        self._gate_window_seconds = 0.0
+        self._gate_passed = 0
+        self._gate_attenuated = 0
+        if self._input_gate_rms > 0 and input_gate_vad:
+            try:
+                from pipecat.audio.utils import create_stream_resampler
+                from pipecat.audio.vad.silero import SileroVADAnalyzer
+
+                self._gate_vad = SileroVADAnalyzer(sample_rate=self._GATE_VAD_RATE)
+                # The constructor stores the rate; the model only sees it
+                # once this is called (the transport normally does it).
+                self._gate_vad.set_sample_rate(self._GATE_VAD_RATE)
+                self._gate_resampler = create_stream_resampler()
+            except (ImportError, OSError, RuntimeError) as exc:
+                logger.warning("Silero VAD unavailable (%s); input gate falls back to level", exc)
+        logger.info(
+            "Live input gate: %s, floor attenuated 40 dB after %.0f ms quiet (0 = off)",
+            "Silero VAD" if self._gate_vad is not None else f"level rms<{self._input_gate_rms:.0f}",
+            self._gate_hold_seconds * 1000,
+        )
+
+    async def _gate_is_speech(self, frame: InputAudioRawFrame) -> bool:
+        """Whether the newest audio is speech, by Silero or, failing that, level."""
+        if self._gate_vad is not None:
+            pcm = await self._gate_resampler.resample(
+                frame.audio, frame.sample_rate, self._GATE_VAD_RATE
+            )
+            self._gate_vad_buf += pcm
+            need = self._gate_vad.num_frames_required() * 2
+            while len(self._gate_vad_buf) >= need:
+                chunk = bytes(self._gate_vad_buf[:need])
+                del self._gate_vad_buf[:need]
+                # Silero hands back a 1-element array, not a scalar.
+                conf = self._gate_vad.voice_confidence(chunk)
+                self._gate_vad_conf = float(getattr(conf, "flat", [conf])[0])
+            return self._gate_vad_conf >= self._GATE_VAD_CONFIDENCE
+        samples = array.array("h")
+        samples.frombytes(frame.audio[: len(frame.audio) // 2 * 2])
+        if not samples:
+            return False
+        secs = self._frame_seconds(frame)
+        frame_sq = float(sum(s * s for s in samples))
+        self._gate_window.append((frame_sq, len(samples), secs))
+        self._gate_window_seconds += secs
+        while self._gate_window_seconds > self._GATE_WINDOW_SECONDS and len(self._gate_window) > 1:
+            _, _, old = self._gate_window.popleft()
+            self._gate_window_seconds -= old
+        total_sq = sum(w[0] for w in self._gate_window)
+        total_n = sum(w[1] for w in self._gate_window) or 1
+        # Fast attack on the frame, slow release on the window.
+        rms = max(math.sqrt(frame_sq / len(samples)), math.sqrt(total_sq / total_n))
+        return rms >= self._input_gate_rms
+
+    async def _gate_input(self, frame: InputAudioRawFrame) -> list[InputAudioRawFrame]:
+        """Attenuate frames that carry only the room's noise floor.
+
+        gpt-live-1 does its own turn detection, and on this device it never
+        opens a turn: the puck's mic path carries a constant floor of about
+        -40 dBFS (mains hum and a device tone) under and around the speech,
+        and the model treats that as "no one is talking" no matter how loud
+        the words on top of it are. The same recording with its between-word
+        floor pulled down 40 dB gets answered; clean synthetic speech, which
+        falls to digital zero between words, always did. Level, bandwidth,
+        leading silence and reverb were each ruled out by replaying the
+        device's own capture with one change at a time (2026-09-14).
+
+        So the floor is removed here, before the audio reaches the model.
+        Returns the frames now ready to send: none while the look-ahead
+        fills, then one per call.
+        """
+        if self._input_gate_rms <= 0:
+            return [frame]
+        speech = await self._gate_is_speech(frame)
+        self._gate_pending.append(frame)
+        if len(self._gate_pending) <= self._GATE_LOOKAHEAD_FRAMES:
+            return []
+        out = self._gate_pending.popleft()
+        if speech:
+            self._gate_quiet_seconds = 0.0
+            self._gate_passed += 1
+            return [out]
+        self._gate_quiet_seconds += self._frame_seconds(out)
+        if self._gate_quiet_seconds <= self._gate_hold_seconds:
+            self._gate_passed += 1
+            return [out]
+        self._gate_attenuated += 1
+        samples = array.array("h")
+        samples.frombytes(out.audio[: len(out.audio) // 2 * 2])
+        quiet = array.array("h", (int(s * self._GATE_ATTENUATION) for s in samples))
+        return [
+            InputAudioRawFrame(
+                audio=quiet.tobytes(),
+                sample_rate=out.sample_rate,
+                num_channels=out.num_channels,
+            )
+        ]
 
     @property
     def delegation_in_flight(self) -> bool:
@@ -110,6 +272,158 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._live_open_responses.pop()
         await super()._handle_evt_response(evt)
 
+    @staticmethod
+    def _frame_seconds(frame: InputAudioRawFrame) -> float:
+        """Wall-clock duration of one PCM16 frame."""
+        rate = getattr(frame, "sample_rate", 0) or 0
+        channels = getattr(frame, "num_channels", 1) or 1
+        if not rate:
+            return 0.0
+        return len(frame.audio) / float(rate * channels * 2)
+
+    def _clear_prestart_audio(self) -> None:
+        self._prestart_audio.clear()
+        self._prestart_seconds = 0.0
+
+    async def _send_user_audio(self, frame: InputAudioRawFrame) -> None:
+        """Hold mic audio that arrives before the session is live.
+
+        Upstream drops it ("dropping input audio until the session has
+        started"). On a call that is harmless, because the human is still
+        saying hello into an already-open session. On a wake-word puck it is
+        the entire request: the device connects *because* the user just
+        spoke, so the question lands inside the ~3s the session takes to
+        open. Dropping it makes a wake sound like the chime followed by
+        nothing, the model having come alive to silence and hung up with
+        zero turns.
+        """
+        for ready in await self._gate_input(frame):
+            if not self._session_started:
+                self._prestart_audio.append(ready)
+                self._prestart_seconds += self._frame_seconds(ready)
+                while (
+                    self._prestart_audio
+                    and self._prestart_seconds > self._MAX_PRESTART_AUDIO_SECONDS
+                ):
+                    self._prestart_seconds -= self._frame_seconds(self._prestart_audio.popleft())
+                continue
+            if self._draining:
+                # The replay of the opening seconds is still going out; queue
+                # behind it rather than jumping the line, or the model hears
+                # the question with live silence spliced between its frames.
+                self._flush_queue.append(ready)
+                continue
+            await self._send_to_model(ready)
+
+    async def _send_to_model(self, frame: InputAudioRawFrame) -> None:
+        if self._session_tape is not None:
+            self._session_tape += frame.audio
+        await super()._send_user_audio(frame)
+
+    def _write_session_tape(self) -> None:
+        if not self._session_tape:
+            return
+        import wave
+
+        path = f"/tmp/claude/session-{int(time.time())}.wav"
+        try:
+            with wave.open(path, "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(24000)
+                out.writeframes(bytes(self._session_tape))
+            logger.info(
+                "Session tape: %.1fs written to %s", len(self._session_tape) / 48000.0, path
+            )
+        except OSError as exc:
+            logger.warning("Could not write session tape: %s", exc)
+        self._session_tape.clear()
+
+    async def _handle_evt_session_started(self, evt) -> None:
+        """Start the session, then replay what the user said while it opened."""
+        await super()._handle_evt_session_started(evt)
+        if not self._prestart_audio:
+            return
+        held = list(self._prestart_audio)
+        seconds = self._prestart_seconds
+        self._clear_prestart_audio()
+        self._describe_prestart_audio(held, seconds)
+        # Paced, not dumped: the model's turn detector runs on a real-time
+        # stream, and a question that arrives in one instant is not a turn.
+        # Drained by its own task so this handler, which runs on the receive
+        # loop, returns at once and server events keep flowing meanwhile.
+        self._flush_queue.extend(held)
+        self._draining = True
+        self._flush_task = self.create_task(self._drain_flush_queue())
+
+    async def _drain_flush_queue(self) -> None:
+        try:
+            while self._flush_queue:
+                frame = self._flush_queue.popleft()
+                await self._send_to_model(frame)
+                if self._flush_pace > 0:
+                    await asyncio.sleep(self._frame_seconds(frame) / self._flush_pace)
+        finally:
+            self._draining = False
+            # Anything that slipped in between the last pop and the flag
+            # clearing goes out now, still in order.
+            while self._flush_queue:
+                await self._send_to_model(self._flush_queue.popleft())
+            # The model has now heard everything said before the session
+            # opened; the wait for its first reply starts here, not at the
+            # wake, or a long replay would eat the reply's time.
+            if self.on_prestart_replayed is not None:
+                self.on_prestart_replayed()
+
+    async def _stop_flush(self) -> None:
+        task, self._flush_task = self._flush_task, None
+        self._draining = False
+        self._flush_queue.clear()
+        if task is not None and not task.done():
+            await self.cancel_task(task, timeout=1.0)
+
+    def _describe_prestart_audio(self, held, seconds: float) -> None:
+        """Log what was actually captured, and keep a copy to listen to.
+
+        A flush that reports the right duration still tells us nothing about
+        whether the user's voice is in it. Peak amplitude separates "we held
+        3s of the user asking a question" from "we held 3s of near-silence",
+        which are the same line in the log otherwise.
+        """
+        import array
+        import wave
+
+        samples = array.array("h")
+        for frame in held:
+            try:
+                samples.frombytes(frame.audio)
+            except ValueError:
+                pass
+        peak = max((abs(s) for s in samples), default=0)
+        rates = sorted({getattr(f, "sample_rate", 0) for f in held})
+        logger.info(
+            "Flushing %.1fs of speech captured while the session opened "
+            "(%d frames, rate(s)=%s, peak=%d/32767)",
+            seconds,
+            len(held),
+            rates,
+            peak,
+        )
+        if not samples or self._session_tape is None:
+            # Microphone audio is only ever written to disk when the
+            # operator opted in with LIVE_SESSION_TAPE.
+            return
+        try:
+            path = f"/tmp/claude/prestart-{int(seconds * 1000)}ms.wav"
+            with wave.open(path, "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(rates[-1] if rates else 16000)
+                out.writeframes(samples.tobytes())
+            logger.info("Wrote captured audio to %s", path)
+        except OSError as exc:  # debug aid only; never break a session for it
+            logger.warning("Could not write captured audio: %s", exc)
+
     async def begin_live_session(self) -> None:
         """Open a billed session for a freshly connected device."""
         if self._session_started:
@@ -117,10 +431,20 @@ class VoicePELiveService(OpenAILiveLLMService):
         # A fresh session owns no delegations. Clearing here is what makes a
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
-        # _connect() early-returns on a non-None socket even when it is dead,
-        # so always tear the old one down first.
-        await self._disconnect()
-        await self._connect()
+        self._clear_prestart_audio()
+        await self._stop_flush()
+        # Reuse the socket when it is alive: the handshake is the bulk of the
+        # ~3s a cold open costs, and everything the user says during that
+        # wait has to be replayed later. The socket is free to hold open; only
+        # the session bills. _connect() early-returns on a non-None socket
+        # even when it is dead, so a dead one is torn down first.
+        socket_dead = self._websocket is not None and (
+            self._receive_task is None or self._receive_task.done()
+        )
+        if socket_dead:
+            await self._disconnect()
+        if self._websocket is None:
+            await self._connect()
         self._needs_session_config = True
         if self._context is not None:
             await self._send_session_config()
@@ -136,6 +460,9 @@ class VoicePELiveService(OpenAILiveLLMService):
         when the whole worker shuts down, and by then the meter has been
         running for however long the puck has been idle.
         """
+        await self._stop_flush()
+        if self._session_tape is not None:
+            self._write_session_tape()
         try:
             try:
                 await self._close_open_turns()
@@ -144,9 +471,26 @@ class VoicePELiveService(OpenAILiveLLMService):
         finally:
             try:
                 await self._disconnect()
+                # Reconnect now, while nobody is waiting, so the next wake
+                # pays only session.start (~0.7s) and not the handshake.
+                await self._connect()
             finally:
                 self._needs_session_config = True
                 self._live_open_responses.clear()
+                self._clear_prestart_audio()
+                if self._input_gate_rms > 0:
+                    logger.info(
+                        "Live input gate this session: %d frames passed, %d attenuated",
+                        self._gate_passed,
+                        self._gate_attenuated,
+                    )
+                self._gate_passed = self._gate_attenuated = 0
+                self._gate_quiet_seconds = 0.0
+                self._gate_window.clear()
+                self._gate_window_seconds = 0.0
+                self._gate_pending.clear()
+                self._gate_vad_buf.clear()
+                self._gate_vad_conf = 0.0
 
 
 # Appended to the configured persona instructions. The device is far-field
@@ -165,6 +509,20 @@ BACKGROUND_GUIDANCE = (
     "between answering a plausible follow-up and staying silent, answer: a wrongly "
     "ignored user must repeat themselves, which is worse than a wrongly answered "
     "TV line."
+)
+
+# The opposite bias from BACKGROUND_GUIDANCE, for a wake-word device. The
+# wake word is consumed on the device, so the model never hears itself
+# addressed; without this it has only distant, noisy audio and no reason to
+# believe anyone is talking to it. The Live API has no input-side knob for
+# this (no turn-detection or noise-reduction setting exists in session.start),
+# so the prompt is the only lever.
+WAKE_GUIDANCE = (
+    " The user has just said your wake word, so they are speaking to you. They "
+    "are across the room, through a far-field microphone, so their voice may "
+    "sound quiet, distant or noisy. Treat what you hear right after the session "
+    "starts as a request addressed to you and answer it promptly. Do not wait to "
+    "hear your name, and do not stay silent because the audio is imperfect."
 )
 
 # Told to the frontend model only. Task knowledge lives in the backend
@@ -308,12 +666,21 @@ async def build_live_tools(mcp: MCPClient | None) -> ToolsSchema:
 
 def build_live_agent(config: Config) -> VoicePELiveService:
     """Create the Live service with an OpenAI-hosted backend model."""
+    guidance = (
+        (BACKGROUND_GUIDANCE if config.live_far_field_guidance else "")
+        + (WAKE_GUIDANCE if config.live_wake_guidance else "")
+        + DELEGATION_GUIDANCE
+    )
     return VoicePELiveService(
         api_key=config.openai_api_key,
+        input_gate_rms=config.live_input_gate_rms,
+        input_gate_hold_ms=config.live_input_gate_hold_ms,
+        input_gate_vad=config.live_input_gate_vad,
+        flush_pace=config.live_flush_pace,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
-            system_instruction=config.instructions + BACKGROUND_GUIDANCE + DELEGATION_GUIDANCE,
+            system_instruction=config.instructions + guidance,
         ),
         delegation=VoicePELiveService.ResponsesDelegation(
             settings=OpenAIResponsesLLMSettings(

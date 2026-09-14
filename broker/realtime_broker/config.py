@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
+
+
+def _non_negative_float(name: str, default: float) -> float:
+    """Read a float env var that must be finite and >= 0.
+
+    A negative gate threshold silently disables the gate and a negative
+    replay pace silently dumps the replay; refuse to start instead.
+    """
+    value = float(os.environ.get(name, str(default)))
+    if not math.isfinite(value) or value < 0:
+        raise RuntimeError(f"{name} must be a finite value >= 0, got {value}")
+    return value
 
 
 def _non_negative(name: str, default: int) -> int:
@@ -94,6 +107,38 @@ class Config:
     # stuck session bills until someone notices.
     max_live_session_seconds: int = 180  # 3 min
 
+    # Live engine only. Frames whose RMS sits under this are treated as the
+    # room's noise floor and attenuated 40 dB before they reach the model.
+    # gpt-live-1 never opens a turn on the Voice PE's audio otherwise: the mic
+    # path carries a constant ~-40 dBFS floor (mains hum plus a device tone)
+    # and the model reads that as nobody talking, however loud the words on
+    # top. 400 is about -38 dBFS; the device's floor measures 250-300 and its
+    # speech 1000+. 0 disables the gate.
+    live_input_gate_rms: float = 400.0
+    # How long the gate stays open after the last loud frame, in audio time,
+    # so word tails and mid-sentence pauses are not chopped.
+    live_input_gate_hold_ms: float = 250.0
+    # Decide speech with Silero VAD (True) or by level alone (False).
+    live_input_gate_vad: bool = True
+    # How fast to replay audio captured while the session was opening, as a
+    # multiple of real time. 1.0 feeds it at the pace it was spoken, which is
+    # what a streaming turn detector expects; 0 dumps it all at once.
+    live_flush_pace: float = 1.0
+    # Whether to append the "stay silent for TV, media and background chatter"
+    # instruction to the Live persona. Off: with gpt-live-1 the wake word is
+    # consumed on the device, so the model never hears itself addressed, and
+    # that instruction makes it treat real far-field questions as background
+    # and never open a turn. Replaying the device's own captures on
+    # 2026-09-14: floor removed + instruction on = silent; instruction off +
+    # floor left in = silent; both = answered. The on-device wake word already
+    # gates who the model listens to.
+    live_far_field_guidance: bool = False
+    # Tell the Live model the wake word was just said and the speaker is
+    # distant, so it treats imperfect far-field audio as a request to it.
+    # Off: measured no effect (0/6 cold replays of the device's capture with
+    # it on, 1/6 without, 2026-09-14). Kept as a switch for the next capture.
+    live_wake_guidance: bool = False
+
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
     # stayed OPEN (2026-06-10). Refresh the session whenever no device has been
@@ -138,4 +183,15 @@ class Config:
             max_live_session_seconds=_non_negative(
                 "MAX_LIVE_SESSION_SECONDS", cls.max_live_session_seconds
             ),
+            live_input_gate_rms=_non_negative_float("LIVE_INPUT_GATE_RMS", cls.live_input_gate_rms),
+            live_input_gate_hold_ms=_non_negative_float(
+                "LIVE_INPUT_GATE_HOLD_MS", cls.live_input_gate_hold_ms
+            ),
+            live_input_gate_vad=os.environ.get("LIVE_INPUT_GATE_VAD", "1").lower()
+            in ("1", "true", "yes"),
+            live_flush_pace=_non_negative_float("LIVE_FLUSH_PACE", cls.live_flush_pace),
+            live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
+            in ("1", "true", "yes"),
+            live_wake_guidance=os.environ.get("LIVE_WAKE_GUIDANCE", "").lower()
+            in ("1", "true", "yes"),
         )

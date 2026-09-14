@@ -121,6 +121,7 @@ def _hygiene(*, window=1.0, budget=0, cap=0, delegating=lambda: False):
     h._user_speaking = False
     h._reply_pending = False
     h._reply_pending_since = 0.0
+    h._bot_spoke = True
     h._turns = 1
     h._close_requested = False
     h._watch = None
@@ -185,6 +186,29 @@ async def test_pending_reply_defers_then_fails_open():
     print("PASS: pending reply defers the window, then fails open")
 
 
+async def test_fresh_wake_waits_for_the_first_reply():
+    """A new session starts with a reply owed, and closes if none ever comes.
+
+    The device connects because the wake word fired, so the question is
+    still being spoken when the old follow-up clock (started at the chime)
+    ran out at 6s with "0 turns"; every wake on the device died that way.
+    The user-turn frames the turn counter relies on never fire for the
+    device's audio, so zero turns is the normal count and cannot be used.
+    """
+    h = _hygiene(window=0.5)
+    h._reply_pending = True
+    h._reply_pending_since = asyncio.get_event_loop().time()
+    h._bot_spoke = False
+    task = asyncio.create_task(_LiveHygiene._watch_loop(h))
+    await asyncio.sleep(1.5)  # well past the 0.5s window
+    assert not h.closed, f"hung up before the first reply could come: {h.closed}"
+    h._reply_pending_since -= 100.0  # overdue, and nothing was ever answered
+    await asyncio.sleep(1.5)
+    assert h.closed and "no reply" in h.closed[0], h.closed
+    task.cancel()
+    print("PASS: a fresh wake waits for the first reply, then closes if none comes")
+
+
 async def test_hard_cap_fires_regardless():
     """The cost fuse ignores speech and delegation state."""
     h = _hygiene(window=0, cap=1, delegating=lambda: True)
@@ -221,6 +245,7 @@ async def main():
     await test_unidentifiable_completion_does_not_hold_forever()
     await test_delegation_holds_the_window()
     await test_window_closes_when_idle()
+    await test_fresh_wake_waits_for_the_first_reply()
     await test_pending_reply_defers_then_fails_open()
     await test_hard_cap_fires_regardless()
     await test_turn_budget_waits_for_the_reply()

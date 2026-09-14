@@ -26,6 +26,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     LLMRunFrame,
+    OutputAudioRawFrame,
     UserStartedSpeakingFrame,
     UserStoppedSpeakingFrame,
 )
@@ -64,6 +65,66 @@ logger = logging.getLogger(__name__)
 # and every second of that hold is billed.
 _REPLY_OVERDUE_SECONDS = 12.0
 
+# Output frames quieter than this (RMS, 16-bit) are the model's idle stream,
+# not speech, and are not sent to the device.
+_OUTPUT_SILENCE_RMS = 50.0
+
+
+class _OutputSilenceFilter(FrameProcessor):
+    """Send the device only the audio the model actually speaks.
+
+    gpt-live-1 streams output continuously, silence included. The firmware
+    treats any speaker audio in the last 500 ms as "the bot is speaking" and
+    drops mic data for as long as that holds (voice_assistant_websocket.cpp,
+    on_microphone_data_ / is_bot_speaking), a guard written for a turn-based
+    model that only ever sent audio while talking. Forward the idle stream
+    and the puck goes deaf the moment the session opens: the model then only
+    ever hears what was captured before session start, which is the wake
+    chime. That was the whole on-device failure (2026-09-14).
+
+    Dropping silent frames is safe on the device side: the firmware keeps its
+    own audio chain warm with silence between replies.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._dropped = 0
+        self._sent = 0
+        self._last_sent_at = 0.0
+        self._burst_frames = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, OutputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
+            rms = _rms16(frame.audio)
+            if rms < _OUTPUT_SILENCE_RMS:
+                self._dropped += 1
+                return
+            now = asyncio.get_running_loop().time()
+            if now - self._last_sent_at > 1.0:
+                # Start of a burst of audio to the device. Anything here that
+                # is not the model talking is what mutes the puck's mic.
+                if self._burst_frames:
+                    logger.info("output: previous burst was %d frames", self._burst_frames)
+                logger.info("output: burst starts, rms %.0f (%d dropped as silence since last)", rms, self._dropped)
+                self._burst_frames = 0
+                self._dropped = 0
+            self._burst_frames += 1
+            self._last_sent_at = now
+            self._sent += 1
+        await self.push_frame(frame, direction)
+
+
+def _rms16(pcm: bytes) -> float:
+    import array
+    import math
+
+    samples = array.array("h")
+    samples.frombytes(pcm[: len(pcm) // 2 * 2])
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(s * s for s in samples) / len(samples))
+
 
 class _LiveHygiene(FrameProcessor):
     """Own the billing meter for one wake.
@@ -98,6 +159,7 @@ class _LiveHygiene(FrameProcessor):
         self._user_speaking = False
         self._reply_pending = False  # question committed, reply not started
         self._reply_pending_since = 0.0
+        self._bot_spoke = False  # any reply at all this session
         self._turns = 0
         self._close_requested = False  # end_conversation fired
         self._watch: asyncio.Task | None = None
@@ -108,6 +170,7 @@ class _LiveHygiene(FrameProcessor):
         await super().process_frame(frame, direction)
         if isinstance(frame, BotStartedSpeakingFrame):
             self._bot_speaking = True
+            self._bot_spoke = True
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_speaking = False
             self._reply_pending = False
@@ -137,6 +200,12 @@ class _LiveHygiene(FrameProcessor):
         """end_conversation: hang up once the bot stops speaking."""
         self._close_requested = True
 
+    def on_prestart_replayed(self) -> None:
+        """The pre-start replay has reached the model: the first-reply clock
+        starts now. The hard cap still runs from the connect."""
+        if self._reply_pending and not self._bot_spoke:
+            self._reply_pending_since = asyncio.get_running_loop().time()
+
     def on_device_connect(self) -> None:
         loop = asyncio.get_running_loop()
         self._connected = True
@@ -144,7 +213,17 @@ class _LiveHygiene(FrameProcessor):
         self._quiet_since = loop.time()
         self._bot_speaking = False
         self._user_speaking = False
-        self._reply_pending = False
+        self._bot_spoke = False
+        # The device connected because the wake word fired, so a question is
+        # about to be asked and a reply is owed. Start the session in that
+        # state rather than on the follow-up clock: the clock ran from the
+        # chime and expired at 6s with "0 turns", which on this device was
+        # while the question was still being spoken or the backend was still
+        # fetching the answer (every wake on 2026-09-13/14 died that way).
+        # Zero turns is the normal count here: the user-turn frames this
+        # counter relies on are not emitted for the device's audio.
+        self._reply_pending = True
+        self._reply_pending_since = loop.time()
         self._turns = 0
         self._close_requested = False
         self._gen += 1
@@ -192,6 +271,12 @@ class _LiveHygiene(FrameProcessor):
                 # delegation round trip, which measured a few seconds.
                 if now - self._reply_pending_since <= _REPLY_OVERDUE_SECONDS:
                     continue
+                if not self._bot_spoke:
+                    # Nothing was ever answered: a false wake, or a question
+                    # the model declined. Do not also run out a follow-up
+                    # window on top; every second is billed.
+                    await self._close(f"no reply within {_REPLY_OVERDUE_SECONDS:.0f}s of wake")
+                    return
                 logger.warning(
                     "live hygiene: reply overdue >%.0fs; releasing the pending hold",
                     _REPLY_OVERDUE_SECONDS,
@@ -255,6 +340,7 @@ async def _serve_live(config: Config, mcp) -> None:
         return getattr(transport.input(), "_websocket", None)
 
     hygiene = _LiveHygiene(config, get_ws, lambda: service.delegation_in_flight)
+    service.on_prestart_replayed = hygiene.on_prestart_replayed
 
     async def _get_weather(params):
         await params.result_callback(await asyncio.to_thread(_fetch_weather, config))
@@ -289,6 +375,9 @@ async def _serve_live(config: Config, mcp) -> None:
             # transport pushes BotStarted/StoppedSpeakingFrame upstream from
             # here, which is how the meter knows the speaker went quiet.
             hygiene,
+            # Last before the wire: the device must never receive the model's
+            # idle silence, or its firmware mutes the mic (see the class).
+            _OutputSilenceFilter(),
             transport.output(),
             aggregator.assistant(),
         ]
