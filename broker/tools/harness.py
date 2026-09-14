@@ -40,8 +40,29 @@ import websockets
 
 RATE = 24000
 CHUNK = int(RATE * 0.02) * 2  # 20 ms of PCM16
-KEY = os.environ["OPENAI_API_KEY"]
+KEY = os.environ.get("OPENAI_API_KEY", "")
 SILENCE_1S = b"\x00\x00" * RATE
+
+
+def _listening(url: str, timeout: float = 2.0) -> bool:
+    """Whether anything accepts connections at this ws:// URL.
+
+    Same preflight as tools/check.py: this runs from a Stop hook, and "no
+    broker on the dev port" is the normal resting state, not a failure.
+    """
+    import socket  # local: only needed for this preflight
+
+    rest = url.split("://", 1)[-1].split("/", 1)[0]
+    host, _, port = rest.rpartition(":")
+    try:
+        target = (host or "127.0.0.1", int(port))
+    except ValueError:
+        return True  # unparseable: let the real connection report it
+    try:
+        with socket.create_connection(target, timeout):
+            return True
+    except OSError:
+        return False
 
 
 # ----------------------------------------------------------------------------
@@ -569,6 +590,17 @@ def main() -> None:
         if i > 0 and i not in flag_values and not a.startswith("--")
     ]
     url = args[0] if args else "ws://127.0.0.1:8766"
+    # Exit 0, not 1, when there is nothing to verify. A hook-driven check
+    # that goes red because no broker is up or no key is in the environment
+    # reports "make check failed" after every edit and trains everyone to
+    # ignore it. A real red comes only from a broker that answers wrongly.
+    if not KEY:
+        print("  SKIP  OPENAI_API_KEY is not set, so the harness cannot synthesize or transcribe.")
+        raise SystemExit(0)
+    if not _listening(url):
+        print(f"  SKIP  nothing is listening on {url}, so there is nothing to check.")
+        print("        Start an isolated broker on 8766, or: make check WS=ws://127.0.0.1:8765")
+        raise SystemExit(0)
     hygiene = "--hygiene" in sys.argv
     wake = "--wake" in sys.argv
     soak = 1
