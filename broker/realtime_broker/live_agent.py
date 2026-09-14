@@ -33,6 +33,7 @@ from pipecat.frames.frames import InputAudioRawFrame
 from pipecat.services.mcp_service import MCPClient
 from pipecat.services.openai.live.llm import OpenAILiveLLMService
 from pipecat.services.openai.responses.llm import OpenAIResponsesLLMSettings
+from websockets.exceptions import ConnectionClosed
 
 from .config import Config
 
@@ -55,6 +56,22 @@ class VoicePELiveService(OpenAILiveLLMService):
     model streams continuous audio and speaks in bursts, so a gap in speech
     looks identical either way.
     """
+
+    async def push_error(self, error_msg: str = "", exception=None, **kwargs) -> None:
+        """An idle socket closing is not an error worth ending the pipeline for.
+
+        The OpenAI socket is held open between wakes so the next one pays
+        only session.start. OpenAI closes it after a couple of idle hours;
+        upstream treats any close outside its own teardown as permanent,
+        the pipeline ends, and the device is dead until a restart (observed
+        2026-09-14 after ~2h20 idle). With no session running there is
+        nothing to lose: drop the socket and let the next wake reconnect.
+        """
+        if isinstance(exception, ConnectionClosed) and not self._session_started:
+            logger.info("Idle OpenAI socket closed (%s); reconnecting on the next wake", exception)
+            self._websocket = None
+            return
+        await super().push_error(error_msg, exception=exception, **kwargs)
 
     #: Terminal states for a delegated backend response.
     _RESPONSE_DONE = ("response.completed", "response.incomplete", "response.failed")
