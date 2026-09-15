@@ -121,11 +121,10 @@ class Config:
     # Decide speech with Silero VAD (True) or by level alone (False).
     live_input_gate_vad: bool = True
     # Gain applied to the device's mic audio before it reaches the model, in
-    # dB. The puck's far-field capture of a person across the room sits at
-    # about a third of the level gpt-live-1's turn detector treats as
-    # speech: replaying the same real recording, 0 dB answered 0 of 4 and
-    # +8 dB answered 4 of 4 (2026-09-15). Clipped, never wrapped.
-    live_input_gain_db: float = 8.0
+    # dB. Clipped, never wrapped. Off: the +8 dB tried on 2026-09-15 drove a
+    # person speaking near the puck to full scale for every word, and the
+    # "0 dB answered 0 of 4, +8 dB 4 of 4" it rested on did not replicate.
+    live_input_gain_db: float = 0.0
     # How fast to replay audio captured while the session was opening, as a
     # multiple of real time. 1.0 feeds it at the pace it was spoken, which is
     # what a streaming turn detector expects; 0 dumps it all at once.
@@ -144,6 +143,15 @@ class Config:
     # Off: measured no effect (0/6 cold replays of the device's capture with
     # it on, 1/6 without, 2026-09-14). Kept as a switch for the next capture.
     live_wake_guidance: bool = False
+    # Live engine only. gpt-live-1 decides on its own whether someone spoke
+    # to it, and on this device's real far-field audio it often decides
+    # nobody did: a recording Whisper transcribes word-perfect gets "I
+    # didn't catch that" from the live model itself (2026-09-15). So the
+    # first thing said after a wake is also transcribed here, and if the
+    # model has not opened a turn on it by the time the speaker goes quiet,
+    # the words are handed to it as text. Once per wake.
+    live_fallback_transcription: bool = True
+    live_fallback_model: str = "gpt-4o-mini-transcribe"
 
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
@@ -203,4 +211,7 @@ class Config:
             in ("1", "true", "yes"),
             live_wake_guidance=os.environ.get("LIVE_WAKE_GUIDANCE", "").lower()
             in ("1", "true", "yes"),
+            live_fallback_transcription=os.environ.get("LIVE_FALLBACK_TRANSCRIPTION", "1").lower()
+            in ("1", "true", "yes"),
+            live_fallback_model=os.environ.get("LIVE_FALLBACK_MODEL", cls.live_fallback_model),
         )

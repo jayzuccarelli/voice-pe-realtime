@@ -17,6 +17,8 @@ import types
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
+from pipecat.frames.frames import InputAudioRawFrame
+
 from realtime_broker.live_agent import VoicePELiveService
 from realtime_broker.live_server import _LiveHygiene
 
@@ -32,6 +34,66 @@ def _response_evt(inner: str, response_id: str | None):
         item_id=None,
         event_id=None,
     )
+
+
+class _FallbackOnly(VoicePELiveService):
+    """The transcription-fallback segment tracker without the websocket machinery."""
+
+    def __init__(self):
+        self._fallback_enabled = True
+        self._reset_fallback()
+
+
+def _mic_frame(ms: int = 20) -> InputAudioRawFrame:
+    return InputAudioRawFrame(
+        audio=bytes(24000 * 2 * ms // 1000), sample_rate=24000, num_channels=1
+    )
+
+
+async def test_fallback_tracks_only_the_first_utterance():
+    """The first thing said after the wake is bounded once; the room after it is not.
+
+    A blip shorter than 100 ms does not open it, a pause shorter than 900 ms
+    does not close it, and once it has closed nothing else (a TV, a second
+    remark) is ever handed to the model as text: the wake word gated one
+    request.
+    """
+    svc = _FallbackOnly()
+
+    def feed(speech: bool, ms: int):
+        result = None
+        for _ in range(ms // 20):
+            got = svc._track_fallback_segment(_mic_frame(), speech)
+            if got is not None:
+                result = got
+        return result
+
+    assert feed(False, 500) is None  # room noise before the question
+    assert feed(True, 60) is None  # a blip shorter than the attack
+    assert feed(False, 200) is None
+    assert feed(True, 1500) is None  # the question
+    assert feed(False, 400) is None  # a mid-sentence pause
+    assert feed(True, 500) is None  # ...the question continues
+    seg = feed(False, 1000)  # quiet: the utterance is over
+    assert seg is not None, "the utterance never closed"
+    start, end = seg
+    assert abs(start - 0.76) < 0.03 and abs(end - 3.16) < 0.03, seg
+    assert len(svc._fallback_slice(end)) == int((end + 0.5) * 48000)  # from the wake, not Silero
+    assert feed(True, 1500) is None and feed(False, 1000) is None, "a second utterance was bounded"
+    print("PASS: only the first utterance after the wake is bounded for transcription")
+
+
+async def test_fallback_gives_up_on_speech_that_never_stops():
+    """A TV does not go quiet; the utterance is closed at the cap rather than never."""
+    svc = _FallbackOnly()
+    seg = None
+    for _ in range(8000 // 20):
+        got = svc._track_fallback_segment(_mic_frame(), True)
+        if got is not None:
+            seg = got
+    assert seg is not None, "an endless utterance was never closed"
+    assert abs(seg[1] - seg[0] - 6.0) < 0.03, seg
+    print("PASS: an utterance that never goes quiet is closed at the cap")
 
 
 class _TrackerOnly(VoicePELiveService):

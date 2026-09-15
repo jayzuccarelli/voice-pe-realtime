@@ -106,6 +106,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         input_gate_vad: bool = True,
         flush_pace: float = 1.0,
         input_gain_db: float = 0.0,
+        fallback_transcription: bool = True,
+        fallback_model: str = "gpt-4o-mini-transcribe",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -122,6 +124,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._draining = False
         # Called once the pre-start replay has fully reached the model.
         self.on_prestart_replayed = None
+        # Whether the model has reported hearing the user at all this session.
+        self._user_turn_seen = False
         # Debug aid: everything sent to the model this session, written to a
         # WAV at session end so a silent wake can be transcribed and heard.
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
@@ -146,39 +150,53 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._gate_window_seconds = 0.0
         self._gate_passed = 0
         self._gate_attenuated = 0
-        if self._input_gate_rms > 0 and input_gate_vad:
-            try:
-                from pipecat.audio.utils import create_stream_resampler
-                from pipecat.audio.vad.silero import SileroVADAnalyzer
+        # Silero is fed once per frame and read by both the gate and the
+        # transcription fallback, so it is built whenever it is available.
+        try:
+            from pipecat.audio.utils import create_stream_resampler
+            from pipecat.audio.vad.silero import SileroVADAnalyzer
 
-                self._gate_vad = SileroVADAnalyzer(sample_rate=self._GATE_VAD_RATE)
-                # The constructor stores the rate; the model only sees it
-                # once this is called (the transport normally does it).
-                self._gate_vad.set_sample_rate(self._GATE_VAD_RATE)
-                self._gate_resampler = create_stream_resampler()
-            except (ImportError, OSError, RuntimeError) as exc:
-                logger.warning("Silero VAD unavailable (%s); input gate falls back to level", exc)
+            self._gate_vad = SileroVADAnalyzer(sample_rate=self._GATE_VAD_RATE)
+            # The constructor stores the rate; the model only sees it
+            # once this is called (the transport normally does it).
+            self._gate_vad.set_sample_rate(self._GATE_VAD_RATE)
+            self._gate_resampler = create_stream_resampler()
+        except (ImportError, OSError, RuntimeError) as exc:
+            logger.warning(
+                "Silero VAD unavailable (%s); level gate only, no transcription fallback", exc
+            )
+        self._gate_use_vad = input_gate_vad and self._gate_vad is not None
         logger.info(
             "Live input gate: %s, floor attenuated 40 dB after %.0f ms quiet (0 = off)",
-            "Silero VAD" if self._gate_vad is not None else f"level rms<{self._input_gate_rms:.0f}",
+            "Silero VAD" if self._gate_use_vad else f"level rms<{self._input_gate_rms:.0f}",
             self._gate_hold_seconds * 1000,
         )
+        # Transcription fallback: see _track_fallback_segment.
+        self._fallback_enabled = bool(fallback_transcription) and self._gate_vad is not None
+        self._fallback_model = fallback_model
+        self._fallback_task = None
+        self._openai = None
+        self._reset_fallback()
+        logger.info(
+            "Live transcription fallback: %s",
+            f"on ({fallback_model})" if self._fallback_enabled else "off",
+        )
 
-    async def _gate_is_speech(self, frame: InputAudioRawFrame) -> bool:
-        """Whether the newest audio is speech, by Silero or, failing that, level."""
-        if self._gate_vad is not None:
-            pcm = await self._gate_resampler.resample(
-                frame.audio, frame.sample_rate, self._GATE_VAD_RATE
-            )
-            self._gate_vad_buf += pcm
-            need = self._gate_vad.num_frames_required() * 2
-            while len(self._gate_vad_buf) >= need:
-                chunk = bytes(self._gate_vad_buf[:need])
-                del self._gate_vad_buf[:need]
-                # Silero hands back a 1-element array, not a scalar.
-                conf = self._gate_vad.voice_confidence(chunk)
-                self._gate_vad_conf = float(getattr(conf, "flat", [conf])[0])
-            return self._gate_vad_conf >= self._GATE_VAD_CONFIDENCE
+    async def _vad_speech(self, frame: InputAudioRawFrame) -> bool:
+        """Whether the newest audio is speech, by Silero. Fed exactly once per frame."""
+        pcm = await self._gate_resampler.resample(frame.audio, frame.sample_rate, self._GATE_VAD_RATE)
+        self._gate_vad_buf += pcm
+        need = self._gate_vad.num_frames_required() * 2
+        while len(self._gate_vad_buf) >= need:
+            chunk = bytes(self._gate_vad_buf[:need])
+            del self._gate_vad_buf[:need]
+            # Silero hands back a 1-element array, not a scalar.
+            conf = self._gate_vad.voice_confidence(chunk)
+            self._gate_vad_conf = float(getattr(conf, "flat", [conf])[0])
+        return self._gate_vad_conf >= self._GATE_VAD_CONFIDENCE
+
+    def _level_speech(self, frame: InputAudioRawFrame) -> bool:
+        """Whether the newest audio is speech, by level alone."""
         samples = array.array("h")
         samples.frombytes(frame.audio[: len(frame.audio) // 2 * 2])
         if not samples:
@@ -196,7 +214,9 @@ class VoicePELiveService(OpenAILiveLLMService):
         rms = max(math.sqrt(frame_sq / len(samples)), math.sqrt(total_sq / total_n))
         return rms >= self._input_gate_rms
 
-    async def _gate_input(self, frame: InputAudioRawFrame) -> list[InputAudioRawFrame]:
+    async def _gate_input(
+        self, frame: InputAudioRawFrame, speech: bool
+    ) -> list[InputAudioRawFrame]:
         """Attenuate frames that carry only the room's noise floor.
 
         gpt-live-1 does its own turn detection, and on this device it never
@@ -215,7 +235,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         """
         if self._input_gate_rms <= 0:
             return [frame]
-        speech = await self._gate_is_speech(frame)
+        if not self._gate_use_vad:
+            speech = self._level_speech(frame)
         self._gate_pending.append(frame)
         if len(self._gate_pending) <= self._GATE_LOOKAHEAD_FRAMES:
             return []
@@ -239,6 +260,171 @@ class VoicePELiveService(OpenAILiveLLMService):
                 num_channels=out.num_channels,
             )
         ]
+
+    async def _open_turn(self, role: str) -> None:
+        if role == "user":
+            self._user_turn_seen = True
+        else:
+            self._model_spoke = True
+        await super()._open_turn(role)
+
+    async def _end_turn(self, role: str) -> None:
+        # What the model heard and what it said, one line each: the two
+        # halves of "did the request reach OpenAI and did an answer come back".
+        turn = self._user_turn if role == "user" else self._assistant_turn
+        if turn.open and turn.text.strip():
+            logger.info("Live %s said: %r", "user" if role == "user" else "model", turn.text.strip())
+        await super()._end_turn(role)
+
+    #
+    # Transcription fallback
+    #
+
+    _FALLBACK_BUFFER_SECONDS = 12.0
+    _FALLBACK_START_SECONDS = 0.1  # speech this long opens the utterance
+    _FALLBACK_QUIET_SECONDS = 0.9  # quiet this long closes it
+    _FALLBACK_MAX_SECONDS = 6.0  # a TV never goes quiet; a question is shorter than this
+    _FALLBACK_TAIL_SECONDS = 0.5
+    _FALLBACK_MODEL_GRACE_SECONDS = 0.6
+
+    def _reset_fallback(self) -> None:
+        self._fallback_done = False
+        self._model_spoke = False
+        self._fb_audio = bytearray()
+        self._fb_rate = 0
+        self._fb_origin = 0.0  # seconds trimmed off the front of _fb_audio
+        self._fb_seconds = 0.0  # seconds of mic audio seen this session
+        self._fb_speech_seconds = 0.0
+        self._fb_quiet_seconds = 0.0
+        self._fb_seg_start = None
+        self._sent_seconds = 0.0  # mic audio actually sent to the model this session
+
+    def _track_fallback_segment(
+        self, frame: InputAudioRawFrame, speech: bool
+    ) -> tuple[float, float] | None:
+        """Follow the first thing said after the wake; return its bounds once it ends.
+
+        gpt-live-1 decides on its own when someone has spoken to it, and on
+        this device's real far-field audio it often decides nobody has: a
+        recording Whisper transcribes word-perfect gets "I didn't catch
+        that" from the live model itself (2026-09-15), with no input
+        transcript and no turn. There is no input-side setting to change
+        that. So the first utterance after the wake is tracked here with
+        Silero, and if the model has not opened a turn on it by the time the
+        speaker goes quiet, the words go to it as text instead.
+
+        Once per wake, and only the first utterance: the wake word gated
+        exactly one request, and anything after it (a TV, the room) is not
+        one. Follow-ups after a reply stay the model's job.
+        """
+        if not self._fallback_enabled or self._fallback_done:
+            return None
+        secs = self._frame_seconds(frame)
+        if not self._fb_rate:
+            self._fb_rate = frame.sample_rate
+        self._fb_audio += frame.audio
+        self._fb_seconds += secs
+        max_bytes = int(self._FALLBACK_BUFFER_SECONDS * self._fb_rate * 2)
+        if len(self._fb_audio) > max_bytes:
+            drop = len(self._fb_audio) - max_bytes
+            del self._fb_audio[:drop]
+            self._fb_origin += drop / float(self._fb_rate * 2)
+        if speech:
+            self._fb_speech_seconds += secs
+            self._fb_quiet_seconds = 0.0
+            if (
+                self._fb_seg_start is None
+                and self._fb_speech_seconds >= self._FALLBACK_START_SECONDS
+            ):
+                self._fb_seg_start = self._fb_seconds - self._fb_speech_seconds
+        else:
+            self._fb_speech_seconds = 0.0
+            if self._fb_seg_start is not None:
+                self._fb_quiet_seconds += secs
+        if self._fb_seg_start is None:
+            return None
+        if self._fb_quiet_seconds >= self._FALLBACK_QUIET_SECONDS:
+            self._fallback_done = True
+            return (self._fb_seg_start, self._fb_seconds - self._fb_quiet_seconds)
+        if self._fb_seconds - self._fb_seg_start >= self._FALLBACK_MAX_SECONDS:
+            self._fallback_done = True
+            return (self._fb_seg_start, self._fb_seconds)
+        return None
+
+    def _fallback_slice(self, end: float) -> bytes:
+        """Everything heard from the wake to just after the utterance.
+
+        From the wake, not from where Silero first fired: at its default
+        confidence it flags about half of a short far-field question, and a
+        transcriber given the lead-in as well loses no words to that. The
+        wake word gated this one request, so nothing before it is in here.
+        """
+        bps = self._fb_rate * 2
+        b = end + self._FALLBACK_TAIL_SECONDS - self._fb_origin
+        return bytes(self._fb_audio[: int(b * bps)])
+
+    def _model_took_the_turn(self) -> bool:
+        return self._user_turn_seen or self._model_spoke or self.delegation_in_flight
+
+    async def _run_fallback(self, start: float, end: float) -> None:
+        # The model hears the same audio at real-time pace, a little behind
+        # the mic while the opening seconds replay: wait until it has the
+        # whole utterance, then give it a moment to open the turn itself.
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while (
+            self._sent_seconds < end + self._FALLBACK_TAIL_SECONDS
+            and asyncio.get_running_loop().time() < deadline
+        ):
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(self._FALLBACK_MODEL_GRACE_SECONDS)
+        if self._model_took_the_turn():
+            logger.debug("Live fallback: the model opened the turn itself")
+            return
+        text = await self._transcribe(self._fallback_slice(end))
+        if self._model_took_the_turn():
+            logger.info("Live fallback: heard %r, but the model took the turn meanwhile", text)
+            return
+        if len(text.split()) < 2:
+            logger.info("Live fallback: heard %r; too little to act on", text)
+            return
+        logger.info("Live fallback: heard %r; handing it to the model as text", text)
+        from pipecat.services.openai.live import events
+
+        item = {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        }
+        await self.send_client_event(events.ResponseItemCreateEvent(item=item))
+        await self.send_client_event(events.ResponseCreateEvent())
+
+    async def _transcribe(self, pcm: bytes) -> str:
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as out:
+            out.setnchannels(1)
+            out.setsampwidth(2)
+            out.setframerate(self._fb_rate)
+            out.writeframes(pcm)
+        if self._openai is None:
+            from openai import AsyncOpenAI
+
+            self._openai = AsyncOpenAI()
+        try:
+            result = await self._openai.audio.transcriptions.create(
+                model=self._fallback_model, file=("wake.wav", buf.getvalue())
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed backstop must not end the session
+            logger.warning("Live fallback: transcription failed: %s", exc)
+            return ""
+        return (result.text or "").strip()
+
+    async def _stop_fallback(self) -> None:
+        task, self._fallback_task = self._fallback_task, None
+        if task is not None and not task.done():
+            await self.cancel_task(task, timeout=1.0)
 
     @property
     def delegation_in_flight(self) -> bool:
@@ -319,7 +505,11 @@ class VoicePELiveService(OpenAILiveLLMService):
         zero turns.
         """
         frame = self._apply_input_gain(frame)
-        for ready in await self._gate_input(frame):
+        speech = await self._vad_speech(frame) if self._gate_vad is not None else False
+        segment = self._track_fallback_segment(frame, speech)
+        if segment is not None:
+            self._fallback_task = self.create_task(self._run_fallback(*segment))
+        for ready in await self._gate_input(frame, speech):
             if not self._session_started:
                 self._prestart_audio.append(ready)
                 self._prestart_seconds += self._frame_seconds(ready)
@@ -359,6 +549,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         )
 
     async def _send_to_model(self, frame: InputAudioRawFrame) -> None:
+        self._sent_seconds += self._frame_seconds(frame)
         if self._session_tape is not None:
             self._session_tape += frame.audio
         await super()._send_user_audio(frame)
@@ -474,8 +665,11 @@ class VoicePELiveService(OpenAILiveLLMService):
         # A fresh session owns no delegations. Clearing here is what makes a
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
+        self._user_turn_seen = False
         self._clear_prestart_audio()
         await self._stop_flush()
+        await self._stop_fallback()
+        self._reset_fallback()
         # Reuse the socket when it is alive: the handshake is the bulk of the
         # ~3s a cold open costs, and everything the user says during that
         # wait has to be replayed later. The socket is free to hold open; only
@@ -504,6 +698,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         running for however long the puck has been idle.
         """
         await self._stop_flush()
+        await self._stop_fallback()
         if self._session_tape is not None:
             self._write_session_tape()
         try:
@@ -721,6 +916,8 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         input_gate_vad=config.live_input_gate_vad,
         flush_pace=config.live_flush_pace,
         input_gain_db=config.live_input_gain_db,
+        fallback_transcription=config.live_fallback_transcription,
+        fallback_model=config.live_fallback_model,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
