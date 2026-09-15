@@ -14,7 +14,7 @@ Two behaviours the Realtime engine needed and this one does not:
   reset between wakes.
 - No `wait_for_user`. That tool existed to suppress a reply the Realtime
   turn model had already committed to. The live model chooses whether to
-  speak at all, so the far-field guidance below is instruction-only.
+  speak at all.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ from __future__ import annotations
 import array
 import asyncio
 import logging
-import math
 import os
 import time
 from collections import deque
@@ -83,38 +82,21 @@ class VoicePELiveService(OpenAILiveLLMService):
     #: slow open replays recent speech rather than a stale backlog.
     _MAX_PRESTART_AUDIO_SECONDS = 8.0
 
-    #: What gated frames are scaled by: 40 dB down, not digital zero. This is
-    #: the figure the replay experiments validated against the real device.
-    _GATE_ATTENUATION = 0.01
     #: Silero runs at 16 kHz on 512-sample chunks; anything at or above this
     #: confidence counts as speech.
-    _GATE_VAD_RATE = 16000
-    _GATE_VAD_CONFIDENCE = 0.5
-    #: Frames held back so the decision for a frame can use audio slightly
-    #: after it. Silero needs ~32 ms of audio before it reports an onset; two
-    #: 20 ms frames of look-ahead mean a word's first syllable is never the
-    #: casualty of that delay. 40 ms of added mic latency is inaudible.
-    _GATE_LOOKAHEAD_FRAMES = 2
-    #: Fallback when Silero is unavailable: level over a rolling window.
-    _GATE_WINDOW_SECONDS = 0.1
+    _VAD_RATE = 16000
+    _VAD_CONFIDENCE = 0.5
 
     def __init__(
         self,
         *,
-        input_gate_rms: float = 0.0,
-        input_gate_hold_ms: float = 250.0,
-        input_gate_vad: bool = True,
         flush_pace: float = 1.0,
-        input_gain_db: float = 0.0,
         fallback_transcription: bool = True,
         fallback_model: str = "gpt-4o-mini-transcribe",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._flush_pace = float(flush_pace)
-        self._input_gain = 10 ** (float(input_gain_db) / 20.0)
-        if input_gain_db:
-            logger.info("Live input gain: %+.1f dB", input_gain_db)
         # Audio waiting to go to the model at real-time pace once the session
         # is live: what was captured while it opened, then anything that
         # arrives while that is still draining, so order is preserved and
@@ -134,47 +116,24 @@ class VoicePELiveService(OpenAILiveLLMService):
         # Mic audio captured while the session was still opening, oldest first.
         self._prestart_audio: deque[InputAudioRawFrame] = deque()
         self._prestart_seconds = 0.0
-        # Input noise gate. 0 disables it. Speech is decided by Silero VAD,
-        # which is trained on exactly this kind of noisy far-field audio; a
-        # level threshold is the fallback, and it is a poor one here because
-        # the device's floor and its quieter speech overlap in level.
-        self._input_gate_rms = float(input_gate_rms)
-        self._gate_hold_seconds = float(input_gate_hold_ms) / 1000.0
-        self._gate_quiet_seconds = 0.0
-        self._gate_pending: deque[InputAudioRawFrame] = deque()
-        self._gate_vad = None
-        self._gate_resampler = None
-        self._gate_vad_buf = bytearray()
-        self._gate_vad_conf = 0.0
-        self._gate_window: deque[tuple[float, int, float]] = deque()  # (sum sq, n, secs)
-        self._gate_window_seconds = 0.0
-        self._gate_passed = 0
-        self._gate_attenuated = 0
-        # Silero is fed once per frame and read by both the gate and the
-        # transcription fallback, so it is built whenever it is available.
+        # Silero, fed once per frame, for the transcription fallback.
+        self._vad = None
+        self._vad_resampler = None
+        self._vad_buf = bytearray()
+        self._vad_conf = 0.0
         try:
             from pipecat.audio.utils import create_stream_resampler
             from pipecat.audio.vad.silero import SileroVADAnalyzer
 
-            self._gate_vad = SileroVADAnalyzer(sample_rate=self._GATE_VAD_RATE)
+            self._vad = SileroVADAnalyzer(sample_rate=self._VAD_RATE)
             # The constructor stores the rate; the model only sees it
             # once this is called (the transport normally does it).
-            self._gate_vad.set_sample_rate(self._GATE_VAD_RATE)
-            self._gate_resampler = create_stream_resampler()
+            self._vad.set_sample_rate(self._VAD_RATE)
+            self._vad_resampler = create_stream_resampler()
         except (ImportError, OSError, RuntimeError) as exc:
-            logger.warning(
-                "Silero VAD unavailable (%s); level gate only, no transcription fallback", exc
-            )
-        self._gate_use_vad = input_gate_vad and self._gate_vad is not None
-        logger.info(
-            "Live input gate: %s, floor attenuated 40 dB after %.0f ms quiet",
-            "off"
-            if self._input_gate_rms <= 0
-            else ("Silero VAD" if self._gate_use_vad else f"level rms<{self._input_gate_rms:.0f}"),
-            self._gate_hold_seconds * 1000,
-        )
+            logger.warning("Silero VAD unavailable (%s); no transcription fallback", exc)
         # Transcription fallback: see _track_fallback_segment.
-        self._fallback_enabled = bool(fallback_transcription) and self._gate_vad is not None
+        self._fallback_enabled = bool(fallback_transcription) and self._vad is not None
         self._fallback_model = fallback_model
         self._fallback_task = None
         self._openai = None
@@ -186,82 +145,16 @@ class VoicePELiveService(OpenAILiveLLMService):
 
     async def _vad_speech(self, frame: InputAudioRawFrame) -> bool:
         """Whether the newest audio is speech, by Silero. Fed exactly once per frame."""
-        pcm = await self._gate_resampler.resample(frame.audio, frame.sample_rate, self._GATE_VAD_RATE)
-        self._gate_vad_buf += pcm
-        need = self._gate_vad.num_frames_required() * 2
-        while len(self._gate_vad_buf) >= need:
-            chunk = bytes(self._gate_vad_buf[:need])
-            del self._gate_vad_buf[:need]
+        pcm = await self._vad_resampler.resample(frame.audio, frame.sample_rate, self._VAD_RATE)
+        self._vad_buf += pcm
+        need = self._vad.num_frames_required() * 2
+        while len(self._vad_buf) >= need:
+            chunk = bytes(self._vad_buf[:need])
+            del self._vad_buf[:need]
             # Silero hands back a 1-element array, not a scalar.
-            conf = self._gate_vad.voice_confidence(chunk)
-            self._gate_vad_conf = float(getattr(conf, "flat", [conf])[0])
-        return self._gate_vad_conf >= self._GATE_VAD_CONFIDENCE
-
-    def _level_speech(self, frame: InputAudioRawFrame) -> bool:
-        """Whether the newest audio is speech, by level alone."""
-        samples = array.array("h")
-        samples.frombytes(frame.audio[: len(frame.audio) // 2 * 2])
-        if not samples:
-            return False
-        secs = self._frame_seconds(frame)
-        frame_sq = float(sum(s * s for s in samples))
-        self._gate_window.append((frame_sq, len(samples), secs))
-        self._gate_window_seconds += secs
-        while self._gate_window_seconds > self._GATE_WINDOW_SECONDS and len(self._gate_window) > 1:
-            _, _, old = self._gate_window.popleft()
-            self._gate_window_seconds -= old
-        total_sq = sum(w[0] for w in self._gate_window)
-        total_n = sum(w[1] for w in self._gate_window) or 1
-        # Fast attack on the frame, slow release on the window.
-        rms = max(math.sqrt(frame_sq / len(samples)), math.sqrt(total_sq / total_n))
-        return rms >= self._input_gate_rms
-
-    async def _gate_input(
-        self, frame: InputAudioRawFrame, speech: bool
-    ) -> list[InputAudioRawFrame]:
-        """Attenuate frames that carry only the room's noise floor.
-
-        gpt-live-1 does its own turn detection, and on this device it never
-        opens a turn: the puck's mic path carries a constant floor of about
-        -40 dBFS (mains hum and a device tone) under and around the speech,
-        and the model treats that as "no one is talking" no matter how loud
-        the words on top of it are. The same recording with its between-word
-        floor pulled down 40 dB gets answered; clean synthetic speech, which
-        falls to digital zero between words, always did. Level, bandwidth,
-        leading silence and reverb were each ruled out by replaying the
-        device's own capture with one change at a time (2026-09-14).
-
-        So the floor is removed here, before the audio reaches the model.
-        Returns the frames now ready to send: none while the look-ahead
-        fills, then one per call.
-        """
-        if self._input_gate_rms <= 0:
-            return [frame]
-        if not self._gate_use_vad:
-            speech = self._level_speech(frame)
-        self._gate_pending.append(frame)
-        if len(self._gate_pending) <= self._GATE_LOOKAHEAD_FRAMES:
-            return []
-        out = self._gate_pending.popleft()
-        if speech:
-            self._gate_quiet_seconds = 0.0
-            self._gate_passed += 1
-            return [out]
-        self._gate_quiet_seconds += self._frame_seconds(out)
-        if self._gate_quiet_seconds <= self._gate_hold_seconds:
-            self._gate_passed += 1
-            return [out]
-        self._gate_attenuated += 1
-        samples = array.array("h")
-        samples.frombytes(out.audio[: len(out.audio) // 2 * 2])
-        quiet = array.array("h", (int(s * self._GATE_ATTENUATION) for s in samples))
-        return [
-            InputAudioRawFrame(
-                audio=quiet.tobytes(),
-                sample_rate=out.sample_rate,
-                num_channels=out.num_channels,
-            )
-        ]
+            conf = self._vad.voice_confidence(chunk)
+            self._vad_conf = float(getattr(conf, "flat", [conf])[0])
+        return self._vad_conf >= self._VAD_CONFIDENCE
 
     async def _open_turn(self, role: str) -> None:
         if role == "user":
@@ -506,49 +399,23 @@ class VoicePELiveService(OpenAILiveLLMService):
         nothing, the model having come alive to silence and hung up with
         zero turns.
         """
-        frame = self._apply_input_gain(frame)
-        speech = await self._vad_speech(frame) if self._gate_vad is not None else False
+        speech = await self._vad_speech(frame) if self._vad is not None else False
         segment = self._track_fallback_segment(frame, speech)
         if segment is not None:
             self._fallback_task = self.create_task(self._run_fallback(*segment))
-        for ready in await self._gate_input(frame, speech):
-            if not self._session_started:
-                self._prestart_audio.append(ready)
-                self._prestart_seconds += self._frame_seconds(ready)
-                while (
-                    self._prestart_audio
-                    and self._prestart_seconds > self._MAX_PRESTART_AUDIO_SECONDS
-                ):
-                    self._prestart_seconds -= self._frame_seconds(self._prestart_audio.popleft())
-                continue
-            if self._draining:
-                # The replay of the opening seconds is still going out; queue
-                # behind it rather than jumping the line, or the model hears
-                # the question with live silence spliced between its frames.
-                self._flush_queue.append(ready)
-                continue
-            await self._send_to_model(ready)
-
-    def _apply_input_gain(self, frame: InputAudioRawFrame) -> InputAudioRawFrame:
-        """Scale mic audio toward the level the model's turn detector expects.
-
-        Far-field speech from across the room arrives well under it; see
-        Config.live_input_gain_db for the measurement. Samples are clipped
-        at full scale rather than wrapped.
-        """
-        if self._input_gain == 1.0:
-            return frame
-        samples = array.array("h")
-        samples.frombytes(frame.audio[: len(frame.audio) // 2 * 2])
-        if not samples:
-            return frame
-        g = self._input_gain
-        louder = array.array("h", (max(-32768, min(32767, int(s * g))) for s in samples))
-        return InputAudioRawFrame(
-            audio=louder.tobytes(),
-            sample_rate=frame.sample_rate,
-            num_channels=frame.num_channels,
-        )
+        if not self._session_started:
+            self._prestart_audio.append(frame)
+            self._prestart_seconds += self._frame_seconds(frame)
+            while self._prestart_audio and self._prestart_seconds > self._MAX_PRESTART_AUDIO_SECONDS:
+                self._prestart_seconds -= self._frame_seconds(self._prestart_audio.popleft())
+            return
+        if self._draining:
+            # The replay of the opening seconds is still going out; queue
+            # behind it rather than jumping the line, or the model hears
+            # the question with live silence spliced between its frames.
+            self._flush_queue.append(frame)
+            return
+        await self._send_to_model(frame)
 
     async def _send_to_model(self, frame: InputAudioRawFrame) -> None:
         self._sent_seconds += self._frame_seconds(frame)
@@ -626,7 +493,6 @@ class VoicePELiveService(OpenAILiveLLMService):
         3s of the user asking a question" from "we held 3s of near-silence",
         which are the same line in the log otherwise.
         """
-        import array
         import wave
 
         samples = array.array("h")
@@ -718,52 +584,9 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._needs_session_config = True
                 self._live_open_responses.clear()
                 self._clear_prestart_audio()
-                if self._input_gate_rms > 0:
-                    logger.info(
-                        "Live input gate this session: %d frames passed, %d attenuated",
-                        self._gate_passed,
-                        self._gate_attenuated,
-                    )
-                self._gate_passed = self._gate_attenuated = 0
-                self._gate_quiet_seconds = 0.0
-                self._gate_window.clear()
-                self._gate_window_seconds = 0.0
-                self._gate_pending.clear()
-                self._gate_vad_buf.clear()
-                self._gate_vad_conf = 0.0
+                self._vad_buf.clear()
+                self._vad_conf = 0.0
 
-
-# Appended to the configured persona instructions. The device is far-field
-# and hears the whole room, so the model is told what not to answer. Unlike
-# the Realtime engine there is no tool to call for this: a full-duplex model
-# that decides to stay quiet simply does not speak.
-BACKGROUND_GUIDANCE = (
-    " IMPORTANT: You are a far-field home assistant; your microphone picks up the "
-    "whole room. Only respond to speech clearly addressed to you. If the audio is "
-    "a TV or other media, a side conversation between other people, or background "
-    "chatter, stay silent and keep listening. Do not narrate that you are waiting. "
-    "One strong exception: right after you answer, the next utterance is usually "
-    "the same user following up. A follow-up question, reaction, or challenge to "
-    "what you just said ('are you sure?', 'okay, and...', 'what about tomorrow?') "
-    "is addressed to you even when it does not name you. Answer it. When torn "
-    "between answering a plausible follow-up and staying silent, answer: a wrongly "
-    "ignored user must repeat themselves, which is worse than a wrongly answered "
-    "TV line."
-)
-
-# The opposite bias from BACKGROUND_GUIDANCE, for a wake-word device. The
-# wake word is consumed on the device, so the model never hears itself
-# addressed; without this it has only distant, noisy audio and no reason to
-# believe anyone is talking to it. The Live API has no input-side knob for
-# this (no turn-detection or noise-reduction setting exists in session.start),
-# so the prompt is the only lever.
-WAKE_GUIDANCE = (
-    " The user has just said your wake word, so they are speaking to you. They "
-    "are across the room, through a far-field microphone, so their voice may "
-    "sound quiet, distant or noisy. Treat what you hear right after the session "
-    "starts as a request addressed to you and answer it promptly. Do not wait to "
-    "hear your name, and do not stay silent because the audio is imperfect."
-)
 
 # Told to the frontend model only. Task knowledge lives in the backend
 # prompt; this is about conversation and when to hand off.
@@ -908,24 +731,15 @@ async def build_live_tools(mcp: MCPClient | None) -> ToolsSchema:
 
 def build_live_agent(config: Config) -> VoicePELiveService:
     """Create the Live service with an OpenAI-hosted backend model."""
-    guidance = (
-        (BACKGROUND_GUIDANCE if config.live_far_field_guidance else "")
-        + (WAKE_GUIDANCE if config.live_wake_guidance else "")
-        + DELEGATION_GUIDANCE
-    )
     return VoicePELiveService(
         api_key=config.openai_api_key,
-        input_gate_rms=config.live_input_gate_rms,
-        input_gate_hold_ms=config.live_input_gate_hold_ms,
-        input_gate_vad=config.live_input_gate_vad,
         flush_pace=config.live_flush_pace,
-        input_gain_db=config.live_input_gain_db,
         fallback_transcription=config.live_fallback_transcription,
         fallback_model=config.live_fallback_model,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
-            system_instruction=config.instructions + guidance,
+            system_instruction=config.instructions + DELEGATION_GUIDANCE,
         ),
         delegation=VoicePELiveService.ResponsesDelegation(
             settings=OpenAIResponsesLLMSettings(

@@ -107,42 +107,10 @@ class Config:
     # stuck session bills until someone notices.
     max_live_session_seconds: int = 180  # 3 min
 
-    # Live engine only. Frames whose RMS sits under this are treated as the
-    # room's noise floor and attenuated 40 dB before they reach the model.
-    # gpt-live-1 never opens a turn on the Voice PE's audio otherwise: the mic
-    # path carries a constant ~-40 dBFS floor (mains hum plus a device tone)
-    # and the model reads that as nobody talking, however loud the words on
-    # top. 400 is about -38 dBFS; the device's floor measures 250-300 and its
-    # speech 1000+. 0 disables the gate.
-    live_input_gate_rms: float = 400.0
-    # How long the gate stays open after the last loud frame, in audio time,
-    # so word tails and mid-sentence pauses are not chopped.
-    live_input_gate_hold_ms: float = 250.0
-    # Decide speech with Silero VAD (True) or by level alone (False).
-    live_input_gate_vad: bool = True
-    # Gain applied to the device's mic audio before it reaches the model, in
-    # dB. Clipped, never wrapped. Off: the +8 dB tried on 2026-09-15 drove a
-    # person speaking near the puck to full scale for every word, and the
-    # "0 dB answered 0 of 4, +8 dB 4 of 4" it rested on did not replicate.
-    live_input_gain_db: float = 0.0
     # How fast to replay audio captured while the session was opening, as a
     # multiple of real time. 1.0 feeds it at the pace it was spoken, which is
     # what a streaming turn detector expects; 0 dumps it all at once.
     live_flush_pace: float = 1.0
-    # Whether to append the "stay silent for TV, media and background chatter"
-    # instruction to the Live persona. Off: with gpt-live-1 the wake word is
-    # consumed on the device, so the model never hears itself addressed, and
-    # that instruction makes it treat real far-field questions as background
-    # and never open a turn. Replaying the device's own captures on
-    # 2026-09-14: floor removed + instruction on = silent; instruction off +
-    # floor left in = silent; both = answered. The on-device wake word already
-    # gates who the model listens to.
-    live_far_field_guidance: bool = False
-    # Tell the Live model the wake word was just said and the speaker is
-    # distant, so it treats imperfect far-field audio as a request to it.
-    # Off: measured no effect (0/6 cold replays of the device's capture with
-    # it on, 1/6 without, 2026-09-14). Kept as a switch for the next capture.
-    live_wake_guidance: bool = False
     # Live engine only. gpt-live-1 decides on its own whether someone spoke
     # to it, and on this device's real far-field audio it often decides
     # nobody did: a recording Whisper transcribes word-perfect gets "I
@@ -197,20 +165,7 @@ class Config:
             max_live_session_seconds=_non_negative(
                 "MAX_LIVE_SESSION_SECONDS", cls.max_live_session_seconds
             ),
-            live_input_gate_rms=_non_negative_float("LIVE_INPUT_GATE_RMS", cls.live_input_gate_rms),
-            live_input_gate_hold_ms=_non_negative_float(
-                "LIVE_INPUT_GATE_HOLD_MS", cls.live_input_gate_hold_ms
-            ),
-            live_input_gate_vad=os.environ.get("LIVE_INPUT_GATE_VAD", "1").lower()
-            in ("1", "true", "yes"),
             live_flush_pace=_non_negative_float("LIVE_FLUSH_PACE", cls.live_flush_pace),
-            live_input_gain_db=float(
-                os.environ.get("LIVE_INPUT_GAIN_DB", str(cls.live_input_gain_db))
-            ),
-            live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
-            in ("1", "true", "yes"),
-            live_wake_guidance=os.environ.get("LIVE_WAKE_GUIDANCE", "").lower()
-            in ("1", "true", "yes"),
             live_fallback_transcription=os.environ.get("LIVE_FALLBACK_TRANSCRIPTION", "1").lower()
             in ("1", "true", "yes"),
             live_fallback_model=os.environ.get("LIVE_FALLBACK_MODEL", cls.live_fallback_model),
