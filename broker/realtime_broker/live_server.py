@@ -415,7 +415,17 @@ async def _serve_live(config: Config, mcp) -> None:
     @transport.event_handler("on_client_connected")
     async def _on_connect(_transport, client):
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
+        # Each wake starts clean. The aggregator keeps every turn of every
+        # earlier wake, and the live model, seeded with them, answers them
+        # again before hearing anything: a 7 AM wake got last night's "It's
+        # 10:28 PM" and a stale trivia answer, and with the model already
+        # talking the transcription fallback stood down (2026-09-15).
+        # Memory across wakes wants a dated, tool-result-free transcript,
+        # not the raw history.
         async with session_lock:
+            # Under the lock: end_live_session closes the previous wake's
+            # turns, and those closing frames append to this same context.
+            context.set_messages([])
             await service.begin_live_session()
         hygiene.on_device_connect()
         # Seeds the context, which is what configures and starts the session.
