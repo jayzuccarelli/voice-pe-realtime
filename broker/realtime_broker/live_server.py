@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallInProgressFrame,
     LLMRunFrame,
     OutputAudioRawFrame,
     UserStartedSpeakingFrame,
@@ -192,6 +193,12 @@ class _LiveHygiene(FrameProcessor):
                 await self._close("end_conversation")
         elif isinstance(frame, UserStartedSpeakingFrame):
             self._user_speaking = True
+        elif isinstance(frame, FunctionCallInProgressFrame):
+            # A tool is running on the user's behalf: the reply is owed from
+            # now, under the same grace as any other, so the session neither
+            # hangs up mid-action nor waits out a slow tool on the meter.
+            self._reply_pending = True
+            self._reply_pending_since = asyncio.get_running_loop().time()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
             self._turns += 1

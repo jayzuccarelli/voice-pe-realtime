@@ -108,6 +108,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         self.on_prestart_replayed = None
         # Whether the model has reported hearing the user at all this session.
         self._user_turn_seen = False
+        # Whether a device is connected: the only time a session may start.
+        self._device_present = False
         # Debug aid: everything sent to the model this session, written to a
         # WAV at session end so a silent wake can be transcribed and heard.
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
@@ -526,8 +528,19 @@ class VoicePELiveService(OpenAILiveLLMService):
         except OSError as exc:  # debug aid only; never break a session for it
             logger.warning("Could not write captured audio: %s", exc)
 
+    async def _send_session_config(self) -> None:
+        # A tool result that lands after the device hung up pushes a context
+        # update, and upstream answers any context update by starting a
+        # session. With nobody there that is a billed session talking to
+        # itself (a 78 s Home Assistant call did exactly that, 2026-09-15).
+        if not self._device_present:
+            logger.info("Live: context updated with no device connected; not starting a session")
+            return
+        await super()._send_session_config()
+
     async def begin_live_session(self) -> None:
         """Open a billed session for a freshly connected device."""
+        self._device_present = True
         if self._session_started:
             return
         # A fresh session owns no delegations. Clearing here is what makes a
@@ -565,6 +578,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         when the whole worker shuts down, and by then the meter has been
         running for however long the puck has been idle.
         """
+        self._device_present = False
         await self._stop_flush()
         await self._stop_fallback()
         if self._session_tape is not None:
