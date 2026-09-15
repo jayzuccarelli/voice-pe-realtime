@@ -167,8 +167,10 @@ class VoicePELiveService(OpenAILiveLLMService):
             )
         self._gate_use_vad = input_gate_vad and self._gate_vad is not None
         logger.info(
-            "Live input gate: %s, floor attenuated 40 dB after %.0f ms quiet (0 = off)",
-            "Silero VAD" if self._gate_use_vad else f"level rms<{self._input_gate_rms:.0f}",
+            "Live input gate: %s, floor attenuated 40 dB after %.0f ms quiet",
+            "off"
+            if self._input_gate_rms <= 0
+            else ("Silero VAD" if self._gate_use_vad else f"level rms<{self._input_gate_rms:.0f}"),
             self._gate_hold_seconds * 1000,
         )
         # Transcription fallback: see _track_fallback_segment.
