@@ -71,7 +71,7 @@ _OUTPUT_SILENCE_RMS = 50.0
 # How long after the last audible frame quiet frames are still forwarded.
 # Pauses inside a reply (a comma, a breath) fall under the threshold too,
 # and dropping them punches holes in the stream: the puck's speaker runs dry
-# at each one and the voice breaks up (Jay, 2026-09-15). The mic stays muted
+# at each one and the voice breaks up (heard 2026-09-15). The mic stays muted
 # for this long after the last word, which the firmware's own 500 ms rule
 # nearly does anyway.
 _OUTPUT_SILENCE_HOLD_SECONDS = 0.8
