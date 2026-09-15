@@ -422,8 +422,10 @@ async def _serve_live(config: Config, mcp) -> None:
         # talking the transcription fallback stood down (2026-09-15).
         # Memory across wakes wants a dated, tool-result-free transcript,
         # not the raw history.
-        context.set_messages([])
         async with session_lock:
+            # Under the lock: end_live_session closes the previous wake's
+            # turns, and those closing frames append to this same context.
+            context.set_messages([])
             await service.begin_live_session()
         hygiene.on_device_connect()
         # Seeds the context, which is what configures and starts the session.
