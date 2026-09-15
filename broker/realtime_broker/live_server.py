@@ -304,21 +304,31 @@ class _LiveHygiene(FrameProcessor):
 
 async def run_live(config: Config) -> None:
     """Serve forever on the Live engine, one billed session per wake."""
-    mcp = None
-    if config.ha_control_enabled:
-        mcp = await mcp_client.connect(config.ha_mcp_url, config.ha_token)
-        # Pipecat's MCPClient is a managed connection now: constructing it is
-        # not enough, the SSE session has to be started before tools exist.
-        await mcp.start()
-    else:
+    if not config.ha_control_enabled:
         logger.info("Home Assistant control disabled (HA_MCP_URL/HA_TOKEN unset)")
 
     logger.info("Live broker listening on ws://%s:%d", config.ws_host, config.ws_port)
     while True:
+        # A fresh MCP client per attempt: the pipeline closes the one it was
+        # given when it ends, and rebuilding on the closed client raised
+        # "MCPClient is not connected" twice a second, forever (2026-09-14).
+        mcp = None
         try:
+            if config.ha_control_enabled:
+                mcp = await mcp_client.connect(config.ha_mcp_url, config.ha_token)
+                # Pipecat's MCPClient is a managed connection now: constructing
+                # it is not enough, the SSE session has to be started before
+                # tools exist.
+                await mcp.start()
             await _serve_live(config, mcp)
         except Exception:
             logger.exception("Live session crashed; rebuilding")
+        finally:
+            if mcp is not None:
+                try:
+                    await mcp.close()
+                except Exception as exc:  # noqa: BLE001 - already torn down is fine
+                    logger.debug("MCP client close: %s", exc)
         await asyncio.sleep(0.5)  # let the socket fully release before rebind
 
 
