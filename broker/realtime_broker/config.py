@@ -120,6 +120,12 @@ class Config:
     live_input_gate_hold_ms: float = 250.0
     # Decide speech with Silero VAD (True) or by level alone (False).
     live_input_gate_vad: bool = True
+    # Gain applied to the device's mic audio before it reaches the model, in
+    # dB. The puck's far-field capture of a person across the room sits at
+    # about a third of the level gpt-live-1's turn detector treats as
+    # speech: replaying the same real recording, 0 dB answered 0 of 4 and
+    # +8 dB answered 4 of 4 (2026-09-15). Clipped, never wrapped.
+    live_input_gain_db: float = 8.0
     # How fast to replay audio captured while the session was opening, as a
     # multiple of real time. 1.0 feeds it at the pace it was spoken, which is
     # what a streaming turn detector expects; 0 dumps it all at once.
@@ -190,6 +196,9 @@ class Config:
             live_input_gate_vad=os.environ.get("LIVE_INPUT_GATE_VAD", "1").lower()
             in ("1", "true", "yes"),
             live_flush_pace=_non_negative_float("LIVE_FLUSH_PACE", cls.live_flush_pace),
+            live_input_gain_db=float(
+                os.environ.get("LIVE_INPUT_GAIN_DB", str(cls.live_input_gain_db))
+            ),
             live_far_field_guidance=os.environ.get("LIVE_FAR_FIELD_GUIDANCE", "").lower()
             in ("1", "true", "yes"),
             live_wake_guidance=os.environ.get("LIVE_WAKE_GUIDANCE", "").lower()

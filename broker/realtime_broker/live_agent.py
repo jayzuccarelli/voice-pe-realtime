@@ -105,10 +105,14 @@ class VoicePELiveService(OpenAILiveLLMService):
         input_gate_hold_ms: float = 250.0,
         input_gate_vad: bool = True,
         flush_pace: float = 1.0,
+        input_gain_db: float = 0.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self._flush_pace = float(flush_pace)
+        self._input_gain = 10 ** (float(input_gain_db) / 20.0)
+        if input_gain_db:
+            logger.info("Live input gain: %+.1f dB", input_gain_db)
         # Audio waiting to go to the model at real-time pace once the session
         # is live: what was captured while it opened, then anything that
         # arrives while that is still draining, so order is preserved and
@@ -314,6 +318,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         nothing, the model having come alive to silence and hung up with
         zero turns.
         """
+        frame = self._apply_input_gain(frame)
         for ready in await self._gate_input(frame):
             if not self._session_started:
                 self._prestart_audio.append(ready)
@@ -331,6 +336,27 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._flush_queue.append(ready)
                 continue
             await self._send_to_model(ready)
+
+    def _apply_input_gain(self, frame: InputAudioRawFrame) -> InputAudioRawFrame:
+        """Scale mic audio toward the level the model's turn detector expects.
+
+        Far-field speech from across the room arrives well under it; see
+        Config.live_input_gain_db for the measurement. Samples are clipped
+        at full scale rather than wrapped.
+        """
+        if self._input_gain == 1.0:
+            return frame
+        samples = array.array("h")
+        samples.frombytes(frame.audio[: len(frame.audio) // 2 * 2])
+        if not samples:
+            return frame
+        g = self._input_gain
+        louder = array.array("h", (max(-32768, min(32767, int(s * g))) for s in samples))
+        return InputAudioRawFrame(
+            audio=louder.tobytes(),
+            sample_rate=frame.sample_rate,
+            num_channels=frame.num_channels,
+        )
 
     async def _send_to_model(self, frame: InputAudioRawFrame) -> None:
         if self._session_tape is not None:
@@ -694,6 +720,7 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         input_gate_hold_ms=config.live_input_gate_hold_ms,
         input_gate_vad=config.live_input_gate_vad,
         flush_pace=config.live_flush_pace,
+        input_gain_db=config.live_input_gain_db,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
