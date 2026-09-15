@@ -53,7 +53,7 @@ def _mic_frame(ms: int = 20) -> InputAudioRawFrame:
 async def test_fallback_tracks_only_the_first_utterance():
     """The first thing said after the wake is bounded once; the room after it is not.
 
-    A blip shorter than 100 ms does not open it, a pause shorter than 900 ms
+    A blip shorter than 100 ms does not open it, a pause shorter than 700 ms
     does not close it, and once it has closed nothing else (a TV, a second
     remark) is ever handed to the model as text: the wake word gated one
     request.

@@ -284,10 +284,10 @@ class VoicePELiveService(OpenAILiveLLMService):
 
     _FALLBACK_BUFFER_SECONDS = 12.0
     _FALLBACK_START_SECONDS = 0.1  # speech this long opens the utterance
-    _FALLBACK_QUIET_SECONDS = 0.9  # quiet this long closes it
+    _FALLBACK_QUIET_SECONDS = 0.7  # quiet this long closes it
     _FALLBACK_MAX_SECONDS = 6.0  # a TV never goes quiet; a question is shorter than this
     _FALLBACK_TAIL_SECONDS = 0.5
-    _FALLBACK_MODEL_GRACE_SECONDS = 0.6
+    _FALLBACK_MODEL_GRACE_SECONDS = 0.4
 
     def _reset_fallback(self) -> None:
         self._fallback_done = False
@@ -773,7 +773,9 @@ DELEGATION_GUIDANCE = (
     "chit-chat, questions about this conversation, and ordinary general "
     "knowledge. Delegate only what you cannot answer from your own knowledge: "
     "controlling the home (lights, music, TV, scenes), reading live state "
-    "(weather, whether something is on, what is playing), and genuine lookups. "
+    "(the time and date, weather, whether something is on, what is playing), "
+    "and genuine lookups. Never guess live state; you have no clock of your "
+    "own, so the time always comes from the backend. "
     "Hand off as soon as you know the request is for the backend, keep the "
     "conversation going while it works, and relay the result when it lands. "
     "Ignore results the conversation has already moved past. Never make the "

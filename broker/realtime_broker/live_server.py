@@ -66,8 +66,15 @@ logger = logging.getLogger(__name__)
 _REPLY_OVERDUE_SECONDS = 12.0
 
 # Output frames quieter than this (RMS, 16-bit) are the model's idle stream,
-# not speech, and are not sent to the device.
+# not speech, and are not sent to the device once the reply is over.
 _OUTPUT_SILENCE_RMS = 50.0
+# How long after the last audible frame quiet frames are still forwarded.
+# Pauses inside a reply (a comma, a breath) fall under the threshold too,
+# and dropping them punches holes in the stream: the puck's speaker runs dry
+# at each one and the voice breaks up (Jay, 2026-09-15). The mic stays muted
+# for this long after the last word, which the firmware's own 500 ms rule
+# nearly does anyway.
+_OUTPUT_SILENCE_HOLD_SECONDS = 0.8
 
 
 class _OutputSilenceFilter(FrameProcessor):
@@ -82,8 +89,9 @@ class _OutputSilenceFilter(FrameProcessor):
     ever hears what was captured before session start, which is the wake
     chime. That was the whole on-device failure (2026-09-14).
 
-    Dropping silent frames is safe on the device side: the firmware keeps its
-    own audio chain warm with silence between replies.
+    Dropping silent frames is safe on the device side between replies: the
+    firmware keeps its own audio chain warm with silence. Inside a reply
+    they are kept, so the stream the speaker plays has no holes.
     """
 
     def __init__(self) -> None:
@@ -91,16 +99,20 @@ class _OutputSilenceFilter(FrameProcessor):
         self._dropped = 0
         self._sent = 0
         self._last_sent_at = 0.0
+        self._last_loud_at = 0.0
         self._burst_frames = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             rms = _rms16(frame.audio)
-            if rms < _OUTPUT_SILENCE_RMS:
-                self._dropped += 1
-                return
             now = asyncio.get_running_loop().time()
+            if rms < _OUTPUT_SILENCE_RMS:
+                if now - self._last_loud_at > _OUTPUT_SILENCE_HOLD_SECONDS:
+                    self._dropped += 1
+                    return
+            else:
+                self._last_loud_at = now
             if now - self._last_sent_at > 1.0:
                 # Start of a burst of audio to the device. Anything here that
                 # is not the model talking is what mutes the puck's mic.
