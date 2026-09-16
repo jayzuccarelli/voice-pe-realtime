@@ -95,6 +95,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         fallback_transcription: bool = True,
         fallback_model: str = "gpt-4o-mini-transcribe",
         fallback_language: str = "en",
+        memory_turns: int = 8,
+        memory_minutes: float = 60.0,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -112,6 +114,12 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._user_turn_seen = False
         # Whether a device is connected: the only time a session may start.
         self._device_present = False
+        # What was said in recent wakes: (wall time, role, text). Only what
+        # the two of them actually said; see _memory_digest.
+        self._memory: deque[tuple[float, str, str]] = deque()
+        self._memory_turns = int(memory_turns)
+        self._memory_seconds = float(memory_minutes) * 60.0
+        self._memory_announced = False
         # Debug aid: everything sent to the model this session, written to a
         # WAV at session end so a silent wake can be transcribed and heard.
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
@@ -185,7 +193,84 @@ class VoicePELiveService(OpenAILiveLLMService):
         turn = self._user_turn if role == "user" else self._assistant_turn
         if turn.open and turn.text.strip():
             logger.info("Live %s said: %r", "user" if role == "user" else "model", turn.text.strip())
+            self._remember(role, turn.text)
         await super()._end_turn(role)
+
+    #
+    # Memory across wakes
+    #
+
+    #: Assistant turns shorter than this are acknowledgements ("Mm-hmm."),
+    #: not content. A user turn of one word can still be the whole request.
+    _MEMORY_MIN_ASSISTANT_WORDS = 2
+    _MEMORY_MAX_CHARS = 200
+
+    def _remember(self, role: str, text: str) -> None:
+        """Keep one side of an exchange for the next wake to see."""
+        if self._memory_turns <= 0:
+            return
+        text = " ".join(text.split())[: self._MEMORY_MAX_CHARS]
+        if not text:
+            return
+        if role != "user" and len(text.split()) < self._MEMORY_MIN_ASSISTANT_WORDS:
+            return
+        if self._memory and self._memory[-1][1:] == (role, text):
+            return
+        self._memory.append((time.time(), role, text))
+        while len(self._memory) > self._memory_turns:
+            self._memory.popleft()
+
+    def _memory_digest(self) -> str:
+        """Recent exchanges, as text for the next session's instructions.
+
+        Only what was said: no tool results, no live state. Carrying those
+        across wakes is what had the assistant insisting on a time it had
+        looked up minutes earlier. Ages are relative for the same reason: an
+        absolute clock reading in here would be a fact the model could repeat
+        long after it stopped being true.
+        """
+        if self._memory_turns <= 0:
+            return ""
+        now = time.time()
+        while self._memory and now - self._memory[0][0] > self._memory_seconds:
+            self._memory.popleft()
+        if not self._memory:
+            return ""
+        lines = []
+        for when, role, text in self._memory:
+            ago = now - when
+            if ago < 90:
+                stamp = "just now"
+            elif ago < 3600:
+                stamp = f"{round(ago / 60)} minutes ago"
+            else:
+                hours = round(ago / 3600)
+                stamp = f"{hours} hour{'s' if hours != 1 else ''} ago"
+            speaker = "they said" if role == "user" else "you replied"
+            lines.append(f"- {stamp}, {speaker}: {text}")
+        return (
+            " Earlier in this conversation, across previous wake words:\n"
+            + "\n".join(lines)
+            + "\nTreat it as what was said, not as current fact: anything about the "
+            "state of the house or the time must be looked up again before you "
+            "repeat it. Do not bring it up unless it is relevant to what is asked now."
+        )
+
+    def _invocation_params(self):
+        # The digest rides on the instructions rather than the startup
+        # history: instructions are never spoken, and a trailing developer
+        # message would be read aloud as an opening line.
+        params = super()._invocation_params()
+        digest = self._memory_digest()
+        if digest:
+            params["instructions"] = (params.get("instructions") or "") + digest
+            if not self._memory_announced:
+                # Upstream builds the params more than once per session start.
+                self._memory_announced = True
+                logger.info(
+                    "Live memory: carrying %d earlier turns into this wake", len(self._memory)
+                )
+        return params
 
     #
     # Transcription fallback
@@ -308,6 +393,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             logger.info("Live fallback: heard %r; too little to act on", text)
             return
         logger.info("Live fallback: heard %r; handing it to the model as text", text)
+        self._remember("user", text)
         from pipecat.services.openai.live import events
 
         item = {
@@ -581,6 +667,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
         self._user_turn_seen = False
+        self._memory_announced = False
         await self._stop_flush()
         await self._stop_fallback()
         # What the mic captured since the device connected is kept: a wake
@@ -802,6 +889,8 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         fallback_transcription=config.live_fallback_transcription,
         fallback_model=config.live_fallback_model,
         fallback_language=config.live_fallback_language,
+        memory_turns=config.live_memory_turns,
+        memory_minutes=config.live_memory_minutes,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
