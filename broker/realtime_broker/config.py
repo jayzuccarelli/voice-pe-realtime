@@ -120,6 +120,10 @@ class Config:
     # the words are handed to it as text. Once per wake.
     live_fallback_transcription: bool = True
     live_fallback_model: str = "gpt-4o-mini-transcribe"
+    # ISO-639-1 code the household speaks to the device in. Pinned because
+    # the transcriber, left to detect it on a few seconds of far-field
+    # audio, guessed wrong and returned nonsense.
+    live_fallback_language: str = "en"
 
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
@@ -169,4 +173,7 @@ class Config:
             live_fallback_transcription=os.environ.get("LIVE_FALLBACK_TRANSCRIPTION", "1").lower()
             in ("1", "true", "yes"),
             live_fallback_model=os.environ.get("LIVE_FALLBACK_MODEL", cls.live_fallback_model),
+            live_fallback_language=os.environ.get(
+                "LIVE_FALLBACK_LANGUAGE", cls.live_fallback_language
+            ),
         )
