@@ -23,6 +23,7 @@ import array
 import asyncio
 import logging
 import os
+import pathlib
 import time
 from collections import deque
 
@@ -346,8 +347,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             logger.warning("Live fallback: transcription failed: %s", exc)
             if self._session_tape is not None:
                 path = f"/tmp/claude/fallback-rejected-{int(time.time())}.wav"
-                with open(path, "wb") as out:
-                    out.write(buf.getvalue())
+                await asyncio.to_thread(pathlib.Path(path).write_bytes, buf.getvalue())
                 logger.info("Live fallback: rejected clip written to %s", path)
             return ""
         return (result.text or "").strip()
