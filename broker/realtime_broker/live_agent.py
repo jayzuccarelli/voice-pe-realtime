@@ -93,6 +93,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         flush_pace: float = 1.0,
         fallback_transcription: bool = True,
         fallback_model: str = "gpt-4o-mini-transcribe",
+        fallback_language: str = "en",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -137,6 +138,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         # Transcription fallback: see _track_fallback_segment.
         self._fallback_enabled = bool(fallback_transcription) and self._vad is not None
         self._fallback_model = fallback_model
+        self._fallback_language = fallback_language
         self._fallback_task = None
         self._openai = None
         self._reset_fallback()
@@ -157,6 +159,17 @@ class VoicePELiveService(OpenAILiveLLMService):
             conf = self._vad.voice_confidence(chunk)
             self._vad_conf = float(getattr(conf, "flat", [conf])[0])
         return self._vad_conf >= self._VAD_CONFIDENCE
+
+    async def _run_function_call(self, runner_item) -> None:
+        # The backend fills every slot of a Home Assistant tool, empty ones
+        # included ('floor': '', 'device_class': []), and Home Assistant
+        # answers "invalid slot info" and does nothing: three tries to switch
+        # the living room lights off all failed that way (2026-09-15). Only
+        # the arguments that carry a value are sent.
+        args = runner_item.arguments
+        if isinstance(args, dict):
+            runner_item.arguments = {k: v for k, v in args.items() if v not in ("", [], None)}
+        await super()._run_function_call(runner_item)
 
     async def _open_turn(self, role: str) -> None:
         if role == "user":
@@ -182,7 +195,7 @@ class VoicePELiveService(OpenAILiveLLMService):
     _FALLBACK_QUIET_SECONDS = 0.7  # quiet this long closes it
     _FALLBACK_MAX_SECONDS = 6.0  # a TV never goes quiet; a question is shorter than this
     _FALLBACK_TAIL_SECONDS = 0.5
-    _FALLBACK_MODEL_GRACE_SECONDS = 0.4
+    _FALLBACK_MODEL_GRACE_SECONDS = 1.0
 
     def _reset_fallback(self) -> None:
         self._fallback_done = False
@@ -260,8 +273,13 @@ class VoicePELiveService(OpenAILiveLLMService):
         b = end + self._FALLBACK_TAIL_SECONDS - self._fb_origin
         return bytes(self._fb_audio[: int(b * bps)])
 
-    def _model_took_the_turn(self) -> bool:
-        return self._user_turn_seen or self._model_spoke or self.delegation_in_flight
+    def _model_heard_it(self) -> bool:
+        # Only a user transcript counts. The model also starts talking, and
+        # even hands off to the backend, on audio it did not make out, and
+        # what comes of that is a guess ("Sure, living room lights off" with
+        # nothing switched; a hand-off that produced "[gasp]"). Handing it
+        # the words anyway costs at worst a repeated answer.
+        return self._user_turn_seen
 
     async def _run_fallback(self, start: float, end: float) -> None:
         # The model hears the same audio at real-time pace, a little behind
@@ -274,12 +292,16 @@ class VoicePELiveService(OpenAILiveLLMService):
         ):
             await asyncio.sleep(0.05)
         await asyncio.sleep(self._FALLBACK_MODEL_GRACE_SECONDS)
-        if self._model_took_the_turn():
-            logger.debug("Live fallback: the model opened the turn itself")
+        if self._model_heard_it():
+            logger.info("Live fallback: the model heard the user itself")
             return
-        text = await self._transcribe(self._fallback_slice(end))
-        if self._model_took_the_turn():
-            logger.info("Live fallback: heard %r, but the model took the turn meanwhile", text)
+        clip = self._fallback_slice(end)
+        if not self._fb_rate or len(clip) < int(0.3 * self._fb_rate * 2):
+            logger.info("Live fallback: only %d bytes of audio to transcribe; skipping", len(clip))
+            return
+        text = await self._transcribe(clip)
+        if self._model_heard_it():
+            logger.info("Live fallback: heard %r, but the model heard it too", text)
             return
         if len(text.split()) < 2:
             logger.info("Live fallback: heard %r; too little to act on", text)
@@ -310,11 +332,23 @@ class VoicePELiveService(OpenAILiveLLMService):
 
             self._openai = AsyncOpenAI()
         try:
+            # Language and vocabulary pinned: left to guess on a few seconds
+            # of far-field audio, the transcriber picked other languages and
+            # returned nonsense ("Did you from the legal group think" for
+            # "Can you turn the living room lights off", 2026-09-15).
             result = await self._openai.audio.transcriptions.create(
-                model=self._fallback_model, file=("wake.wav", buf.getvalue())
+                model=self._fallback_model,
+                file=("wake.wav", buf.getvalue()),
+                language=self._fallback_language,
+                prompt=FALLBACK_VOCABULARY,
             )
         except Exception as exc:  # noqa: BLE001 - a failed backstop must not end the session
             logger.warning("Live fallback: transcription failed: %s", exc)
+            if self._session_tape is not None:
+                path = f"/tmp/claude/fallback-rejected-{int(time.time())}.wav"
+                with open(path, "wb") as out:
+                    out.write(buf.getvalue())
+                logger.info("Live fallback: rejected clip written to %s", path)
             return ""
         return (result.text or "").strip()
 
@@ -608,6 +642,15 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._live_open_responses.clear()
 
 
+# Shown to the transcriber as prior context: the kind of thing said to the
+# device, so short far-field clips resolve to home commands, not to other
+# languages or to whatever the room's TV is saying.
+FALLBACK_VOCABULARY = (
+    "Requests to a smart-home voice assistant: turn the living room lights off, "
+    "put Netflix on the TV, what time is it, what's the weather, play music in "
+    "the den, set a timer, how's it going."
+)
+
 # Told to the frontend model only. Task knowledge lives in the backend
 # prompt; this is about conversation and when to hand off.
 DELEGATION_GUIDANCE = (
@@ -619,10 +662,12 @@ DELEGATION_GUIDANCE = (
     "(the time and date, weather, whether something is on, what is playing), "
     "and genuine lookups. Never guess live state; you have no clock of your "
     "own, so the time always comes from the backend. "
-    "Hand off as soon as you know the request is for the backend, keep the "
-    "conversation going while it works, and relay the result when it lands. "
-    "Ignore results the conversation has already moved past. Never make the "
-    "user wait in silence: if a hand-off is taking a moment, say so briefly."
+    "Hand off as soon as you know the request is for the backend and relay "
+    "the result when it lands. Ignore results the conversation has already "
+    "moved past. While the backend works, stay silent: no filler, no "
+    "'checking', no 'one moment'; speak only once the answer is in. Never "
+    "announce or describe an action you have not completed, and never guess "
+    "what the request was."
 )
 
 WEATHER_TOOL = FunctionSchema(
@@ -756,6 +801,7 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         flush_pace=config.live_flush_pace,
         fallback_transcription=config.live_fallback_transcription,
         fallback_model=config.live_fallback_model,
+        fallback_language=config.live_fallback_language,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
