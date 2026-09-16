@@ -547,10 +547,12 @@ class VoicePELiveService(OpenAILiveLLMService):
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
         self._user_turn_seen = False
-        self._clear_prestart_audio()
         await self._stop_flush()
         await self._stop_fallback()
-        self._reset_fallback()
+        # What the mic captured since the device connected is kept: a wake
+        # that lands while the previous session is still closing has its
+        # question in that buffer already, and end_live_session cleared its
+        # own leftovers before it started closing.
         # Reuse the socket when it is alive: the handshake is the bulk of the
         # ~3s a cold open costs, and everything the user says during that
         # wait has to be replayed later. The socket is free to hold open; only
@@ -581,6 +583,13 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._device_present = False
         await self._stop_flush()
         await self._stop_fallback()
+        # Cleared now, not after the close: a re-wake can connect while the
+        # close below is still in flight, and its first words land in these
+        # buffers. Clearing them afterwards threw that question away.
+        self._clear_prestart_audio()
+        self._reset_fallback()
+        self._vad_buf.clear()
+        self._vad_conf = 0.0
         if self._session_tape is not None:
             self._write_session_tape()
         try:
@@ -597,9 +606,6 @@ class VoicePELiveService(OpenAILiveLLMService):
             finally:
                 self._needs_session_config = True
                 self._live_open_responses.clear()
-                self._clear_prestart_audio()
-                self._vad_buf.clear()
-                self._vad_conf = 0.0
 
 
 # Told to the frontend model only. Task knowledge lives in the backend
