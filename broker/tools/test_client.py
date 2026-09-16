@@ -21,7 +21,9 @@ QUESTION = sys.argv[2] if len(sys.argv) > 2 else (
     "Hi! In one short sentence, what is the capital of France?"
 )
 RATE = 24000
-KEY = os.environ["OPENAI_API_KEY"]
+KEY = os.environ.get("OPENAI_API_KEY")
+if not KEY:
+    raise SystemExit("OPENAI_API_KEY is required")
 
 
 def synth_pcm(text: str) -> bytes:
