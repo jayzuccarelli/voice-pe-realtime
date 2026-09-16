@@ -38,6 +38,14 @@ REF_TEXT = (
 )
 
 
+def _required(name: str) -> str:
+    """Read an env var a tool cannot run without, and say so if it is unset."""
+    value = os.environ.get(name)
+    if not value:
+        raise SystemExit(f"{name} is required")
+    return value
+
+
 def _wav(pcm: bytes) -> bytes:
     n = len(pcm)
     return (b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt "
@@ -46,7 +54,7 @@ def _wav(pcm: bytes) -> bytes:
 
 
 def synth_ref(path: Path, voice: str) -> None:
-    key = os.environ["OPENAI_API_KEY"]
+    key = _required("OPENAI_API_KEY")
     req = urllib.request.Request(
         "https://api.openai.com/v1/audio/speech",
         data=json.dumps({
@@ -101,7 +109,7 @@ def main() -> None:
             "media_content_type": "music",
         }).encode(),
         headers={
-            "Authorization": f"Bearer {os.environ['HA_TOKEN']}",
+            "Authorization": f"Bearer {_required('HA_TOKEN')}",
             "Content-Type": "application/json",
         },
     )

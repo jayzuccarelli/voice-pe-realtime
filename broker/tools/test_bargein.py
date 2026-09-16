@@ -21,7 +21,9 @@ import websockets
 
 WS_URL = sys.argv[1] if len(sys.argv) > 1 else "ws://127.0.0.1:8766"
 RATE = 24000
-KEY = os.environ["OPENAI_API_KEY"]
+KEY = os.environ.get("OPENAI_API_KEY")
+if not KEY:
+    raise SystemExit("OPENAI_API_KEY is required")
 CHUNK = int(RATE * 0.02) * 2  # 20ms PCM16
 
 Q1 = ("Please count slowly out loud from one all the way to fifty, "
