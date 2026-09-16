@@ -11,6 +11,8 @@ the audio harness.
 from __future__ import annotations
 
 import asyncio
+import collections
+import time
 import os
 import sys
 import types
@@ -34,6 +36,46 @@ def _response_evt(inner: str, response_id: str | None):
         item_id=None,
         event_id=None,
     )
+
+
+class _MemoryOnly(VoicePELiveService):
+    """The cross-wake memory without any of the websocket machinery."""
+
+    def __init__(self, turns=8, minutes=60.0):
+        self._memory = collections.deque()
+        self._memory_turns = turns
+        self._memory_seconds = minutes * 60.0
+
+
+def test_memory_digest_carries_speech_and_nothing_else():
+    """Recent turns come back as relative-time text; stale and empty ones do not.
+
+    Ages are relative on purpose: an absolute clock reading carried into the
+    next wake is a fact the model repeats long after it stopped being true,
+    which is exactly how "it's still 9:01" happened.
+    """
+    svc = _MemoryOnly(turns=4, minutes=30)
+    now = time.time()
+    svc._remember("user", "what time is it")
+    svc._remember("assistant", "Mm-hmm.")  # an acknowledgement, not content
+    svc._remember("assistant", "It's 9:01 PM on Tuesday.")
+    svc._remember("user", "what time is it")  # repeat of the last user line, kept
+    digest = svc._memory_digest()
+    assert "Mm-hmm" not in digest, digest
+    assert "what time is it" in digest and "9:01 PM" in digest, digest
+    assert "just now" in digest, digest
+    assert "looked up again" in digest, digest
+
+    # Older than the window, and beyond the turn cap, both drop out.
+    svc._memory[0] = (now - 3600, "user", "yesterday's question")
+    assert "yesterday's question" not in svc._memory_digest()
+    for i in range(6):
+        svc._remember("user", f"question {i}")
+    assert len(svc._memory) == 4, svc._memory
+    assert "question 0" not in svc._memory_digest()
+
+    assert _MemoryOnly(turns=0)._memory_digest() == "", "memory off must produce nothing"
+    print("PASS: the digest carries what was said, relative and bounded")
 
 
 class _FallbackOnly(VoicePELiveService):

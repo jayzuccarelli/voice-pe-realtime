@@ -124,6 +124,19 @@ class Config:
     # the transcriber, left to detect it on a few seconds of far-field
     # audio, guessed wrong and returned nonsense.
     live_fallback_language: str = "en"
+    # How many recent turns (both sides) a new wake is told about, and how
+    # long they stay relevant. The raw conversation history cannot be reused
+    # for this: seeded with it the model answered the previous wake's
+    # question before hearing the new one, and repeated tool results as
+    # current fact. 0 turns disables memory across wakes.
+    live_memory_turns: int = 8
+    live_memory_minutes: float = 60.0
+    # Live engine only. Port for the health endpoint a watchdog reads. The
+    # obvious check, opening a websocket as a device would, starts a billed
+    # session every time it runs; this one costs nothing and reports what
+    # actually goes wrong (a rebuild loop), which a port check cannot see.
+    # 0 disables the endpoint.
+    live_health_port: int = 8775
 
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
@@ -175,5 +188,10 @@ class Config:
             live_fallback_model=os.environ.get("LIVE_FALLBACK_MODEL", cls.live_fallback_model),
             live_fallback_language=os.environ.get(
                 "LIVE_FALLBACK_LANGUAGE", cls.live_fallback_language
+            ),
+            live_memory_turns=_non_negative("LIVE_MEMORY_TURNS", cls.live_memory_turns),
+            live_health_port=_non_negative("LIVE_HEALTH_PORT", cls.live_health_port),
+            live_memory_minutes=_non_negative_float(
+                "LIVE_MEMORY_MINUTES", cls.live_memory_minutes
             ),
         )
