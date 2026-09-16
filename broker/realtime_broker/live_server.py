@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
 
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
@@ -341,12 +343,83 @@ class _LiveHygiene(FrameProcessor):
             await self.on_close()
 
 
+class _Health:
+    """What a watchdog needs to know, without starting a billed session.
+
+    A websocket probe is what a watchdog reaches for, but the broker answers
+    one by opening a session: on a per-minute meter that is a real cost every
+    few minutes, forever. A port check is free and proves nothing, which is
+    the hole this fills: the failure actually seen on this deployment was the
+    pipeline rebuilding twice a second behind a port that stayed open
+    (2026-09-14), and that shows up here as a rebuild count rather than as a
+    refused connection.
+    """
+
+    #: Rebuilds inside the window past which the broker is judged wedged.
+    _REBUILD_LIMIT = 5
+    _REBUILD_WINDOW_SECONDS = 300.0
+
+    def __init__(self) -> None:
+        self.started = time.time()
+        self.serving = False
+        self.last_device = 0.0
+        self.last_error = ""
+        self._rebuilds: deque[float] = deque()
+
+    def note_rebuild(self, error: str) -> None:
+        self._rebuilds.append(time.time())
+        self.last_error = error[:200]
+        self._expire()
+
+    def _expire(self) -> None:
+        now = time.time()
+        while self._rebuilds and now - self._rebuilds[0] > self._REBUILD_WINDOW_SECONDS:
+            self._rebuilds.popleft()
+
+    def snapshot(self) -> dict:
+        self._expire()
+        looping = len(self._rebuilds) >= self._REBUILD_LIMIT
+        return {
+            "ok": bool(self.serving and not looping),
+            "engine": "live",
+            "serving": self.serving,
+            "uptime_seconds": round(time.time() - self.started),
+            "recent_rebuilds": len(self._rebuilds),
+            "seconds_since_last_wake": (
+                round(time.time() - self.last_device) if self.last_device else None
+            ),
+            "last_error": self.last_error,
+        }
+
+
+async def _serve_health(config: Config, health: _Health) -> None:
+    """Serve the snapshot on /health. Never touches the voice path."""
+    from aiohttp import web
+
+    async def handler(_request):
+        snap = health.snapshot()
+        return web.json_response(snap, status=200 if snap["ok"] else 503)
+
+    app = web.Application()
+    app.router.add_get("/health", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", config.live_health_port).start()
+    logger.info("Health endpoint on http://0.0.0.0:%d/health", config.live_health_port)
+
+
 async def run_live(config: Config) -> None:
     """Serve forever on the Live engine, one billed session per wake."""
     if not config.ha_control_enabled:
         logger.info("Home Assistant control disabled (HA_MCP_URL/HA_TOKEN unset)")
 
     logger.info("Live broker listening on ws://%s:%d", config.ws_host, config.ws_port)
+    health = _Health()
+    if config.live_health_port:
+        try:
+            await _serve_health(config, health)
+        except OSError as exc:
+            logger.warning("Health endpoint unavailable: %s", exc)
     while True:
         # A fresh MCP client per attempt: the pipeline closes the one it was
         # given when it ends, and rebuilding on the closed client raised
@@ -359,10 +432,12 @@ async def run_live(config: Config) -> None:
                 # it is not enough, the SSE session has to be started before
                 # tools exist.
                 await mcp.start()
-            await _serve_live(config, mcp)
-        except Exception:
+            await _serve_live(config, mcp, health)
+        except Exception as exc:
             logger.exception("Live session crashed; rebuilding")
+            health.note_rebuild(f"{type(exc).__name__}: {exc}")
         finally:
+            health.serving = False
             if mcp is not None:
                 try:
                     await mcp.close()
@@ -371,7 +446,7 @@ async def run_live(config: Config) -> None:
         await asyncio.sleep(0.5)  # let the socket fully release before rebind
 
 
-async def _serve_live(config: Config, mcp) -> None:
+async def _serve_live(config: Config, mcp, health: _Health | None = None) -> None:
     service = build_live_agent(config)
     tools = await build_live_tools(mcp)
 
@@ -454,6 +529,8 @@ async def _serve_live(config: Config, mcp) -> None:
     @transport.event_handler("on_client_connected")
     async def _on_connect(_transport, client):
         logger.info("Device connected: %s", getattr(client, "remote_address", client))
+        if health is not None:
+            health.last_device = time.time()
         # Each wake starts clean. The aggregator keeps every turn of every
         # earlier wake, and the live model, seeded with them, answers them
         # again before hearing anything: a 7 AM wake got last night's "It's
@@ -480,4 +557,6 @@ async def _serve_live(config: Config, mcp) -> None:
         await hygiene.on_device_disconnect()
         await _end_session()
 
+    if health is not None:
+        health.serving = True
     await runner.run()
