@@ -25,6 +25,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     Frame,
+    FunctionCallInProgressFrame,
     LLMRunFrame,
     OutputAudioRawFrame,
     UserStartedSpeakingFrame,
@@ -75,6 +76,13 @@ _OUTPUT_SILENCE_RMS = 50.0
 # for this long after the last word, which the firmware's own 500 ms rule
 # nearly does anyway.
 _OUTPUT_SILENCE_HOLD_SECONDS = 0.8
+# Audio held back at the start of each reply before any of it is sent. The
+# live model produces speech at exactly playback speed, so without this the
+# device plays each chunk the moment it lands and has nothing in reserve:
+# measured at the broker, a 4.7 s reply arrived with 13 gaps the device's
+# buffer could not cover, and words broke in the middle (2026-09-15). Held
+# audio becomes that reserve; the whole reply then plays from 0.4 s behind.
+_OUTPUT_PREROLL_SECONDS = 0.4
 
 
 class _OutputSilenceFilter(FrameProcessor):
@@ -101,6 +109,8 @@ class _OutputSilenceFilter(FrameProcessor):
         self._last_sent_at = 0.0
         self._last_loud_at = 0.0
         self._burst_frames = 0
+        self._preroll: list[OutputAudioRawFrame] = []
+        self._preroll_seconds = 0.0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
@@ -113,7 +123,7 @@ class _OutputSilenceFilter(FrameProcessor):
                     return
             else:
                 self._last_loud_at = now
-            if now - self._last_sent_at > 1.0:
+            if now - self._last_sent_at > 1.0 and not self._preroll:
                 # Start of a burst of audio to the device. Anything here that
                 # is not the model talking is what mutes the puck's mic.
                 if self._burst_frames:
@@ -122,8 +132,19 @@ class _OutputSilenceFilter(FrameProcessor):
                 self._burst_frames = 0
                 self._dropped = 0
             self._burst_frames += 1
-            self._last_sent_at = now
             self._sent += 1
+            if self._burst_frames <= 1 or self._preroll:
+                self._preroll.append(frame)
+                self._preroll_seconds += len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
+                if self._preroll_seconds < _OUTPUT_PREROLL_SECONDS:
+                    return
+                held, self._preroll = self._preroll, []
+                self._preroll_seconds = 0.0
+                self._last_sent_at = now
+                for f in held:
+                    await self.push_frame(f, direction)
+                return
+            self._last_sent_at = now
         await self.push_frame(frame, direction)
 
 
@@ -192,6 +213,12 @@ class _LiveHygiene(FrameProcessor):
                 await self._close("end_conversation")
         elif isinstance(frame, UserStartedSpeakingFrame):
             self._user_speaking = True
+        elif isinstance(frame, FunctionCallInProgressFrame):
+            # A tool is running on the user's behalf: the reply is owed from
+            # now, under the same grace as any other, so the session neither
+            # hangs up mid-action nor waits out a slow tool on the meter.
+            self._reply_pending = True
+            self._reply_pending_since = asyncio.get_running_loop().time()
         elif isinstance(frame, UserStoppedSpeakingFrame):
             self._user_speaking = False
             self._turns += 1

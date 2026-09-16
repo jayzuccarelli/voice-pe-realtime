@@ -108,6 +108,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         self.on_prestart_replayed = None
         # Whether the model has reported hearing the user at all this session.
         self._user_turn_seen = False
+        # Whether a device is connected: the only time a session may start.
+        self._device_present = False
         # Debug aid: everything sent to the model this session, written to a
         # WAV at session end so a silent wake can be transcribed and heard.
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
@@ -526,18 +528,31 @@ class VoicePELiveService(OpenAILiveLLMService):
         except OSError as exc:  # debug aid only; never break a session for it
             logger.warning("Could not write captured audio: %s", exc)
 
+    async def _send_session_config(self) -> None:
+        # A tool result that lands after the device hung up pushes a context
+        # update, and upstream answers any context update by starting a
+        # session. With nobody there that is a billed session talking to
+        # itself (a 78 s Home Assistant call did exactly that, 2026-09-15).
+        if not self._device_present:
+            logger.info("Live: context updated with no device connected; not starting a session")
+            return
+        await super()._send_session_config()
+
     async def begin_live_session(self) -> None:
         """Open a billed session for a freshly connected device."""
+        self._device_present = True
         if self._session_started:
             return
         # A fresh session owns no delegations. Clearing here is what makes a
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
         self._user_turn_seen = False
-        self._clear_prestart_audio()
         await self._stop_flush()
         await self._stop_fallback()
-        self._reset_fallback()
+        # What the mic captured since the device connected is kept: a wake
+        # that lands while the previous session is still closing has its
+        # question in that buffer already, and end_live_session cleared its
+        # own leftovers before it started closing.
         # Reuse the socket when it is alive: the handshake is the bulk of the
         # ~3s a cold open costs, and everything the user says during that
         # wait has to be replayed later. The socket is free to hold open; only
@@ -565,8 +580,16 @@ class VoicePELiveService(OpenAILiveLLMService):
         when the whole worker shuts down, and by then the meter has been
         running for however long the puck has been idle.
         """
+        self._device_present = False
         await self._stop_flush()
         await self._stop_fallback()
+        # Cleared now, not after the close: a re-wake can connect while the
+        # close below is still in flight, and its first words land in these
+        # buffers. Clearing them afterwards threw that question away.
+        self._clear_prestart_audio()
+        self._reset_fallback()
+        self._vad_buf.clear()
+        self._vad_conf = 0.0
         if self._session_tape is not None:
             self._write_session_tape()
         try:
@@ -583,9 +606,6 @@ class VoicePELiveService(OpenAILiveLLMService):
             finally:
                 self._needs_session_config = True
                 self._live_open_responses.clear()
-                self._clear_prestart_audio()
-                self._vad_buf.clear()
-                self._vad_conf = 0.0
 
 
 # Told to the frontend model only. Task knowledge lives in the backend
