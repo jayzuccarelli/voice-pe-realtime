@@ -169,15 +169,37 @@ class VoicePELiveService(OpenAILiveLLMService):
             self._vad_conf = float(getattr(conf, "flat", [conf])[0])
         return self._vad_conf >= self._VAD_CONFIDENCE
 
+    #: The Home Assistant slot that narrows a match by physical device class.
+    #: Guessing it wrong turns a good name into no match at all, and it is
+    #: pure invention: nothing the user says identifies a "receiver" or an
+    #: "outlet". `domain` is left alone, being the one slot that legitimately
+    #: separates two things sharing a name.
+    _TYPE_SLOTS = ("device_class",)
+
     async def _run_function_call(self, runner_item) -> None:
-        # The backend fills every slot of a Home Assistant tool, empty ones
-        # included ('floor': '', 'device_class': []), and Home Assistant
-        # answers "invalid slot info" and does nothing: three tries to switch
-        # the living room lights off all failed that way (2026-09-15). Only
-        # the arguments that carry a value are sent.
         args = runner_item.arguments
         if isinstance(args, dict):
-            runner_item.arguments = {k: v for k, v in args.items() if v not in ("", [], None)}
+            # The backend fills every slot of a Home Assistant tool, empty
+            # ones included ('floor': '', 'device_class': []), and Home
+            # Assistant answers "invalid slot info" and does nothing: three
+            # tries to switch the living room lights off failed that way
+            # (2026-09-15). Only arguments that carry a value are sent.
+            args = {k: v for k, v in args.items() if v not in ("", [], None)}
+            # And when it names a device, it also guesses what kind of thing
+            # that device is, which Home Assistant matches strictly: "fire up
+            # the PlayStation 5" took four calls and six seconds because the
+            # name was right every time and the guessed type was wrong three
+            # times (2026-09-17). The name is what the user said; the type is
+            # invented here, so it goes.
+            if args.get("name") and any(k in args for k in self._TYPE_SLOTS):
+                dropped = {k: args.pop(k) for k in self._TYPE_SLOTS if k in args}
+                logger.info(
+                    "Tool %s: matching %r by name; dropped guessed %s",
+                    runner_item.function_name,
+                    args["name"],
+                    dropped,
+                )
+            runner_item.arguments = args
         await super()._run_function_call(runner_item)
 
     async def _open_turn(self, role: str) -> None:
@@ -437,6 +459,20 @@ class VoicePELiveService(OpenAILiveLLMService):
                 logger.info("Live fallback: rejected clip written to %s", path)
             return ""
         return (result.text or "").strip()
+
+    async def refresh_idle_socket(self) -> bool:
+        """Replace the idle OpenAI connection so the next wake stays warm.
+
+        Only safe between wakes: reconnecting under a live session would
+        drop the conversation. Costs nothing, the connection is not the
+        meter. Returns whether it did anything.
+        """
+        if self._session_started or self._device_present:
+            return False
+        await self._disconnect()
+        await self._connect()
+        logger.info("Live: refreshed the idle OpenAI connection")
+        return True
 
     async def _stop_fallback(self) -> None:
         task, self._fallback_task = self._fallback_task, None
@@ -749,6 +785,12 @@ DELEGATION_GUIDANCE = (
     "(the time and date, weather, whether something is on, what is playing), "
     "and genuine lookups. Never guess live state; you have no clock of your "
     "own, so the time always comes from the backend. "
+    "Never ask what the user wants while you are already acting on what they "
+    "asked: saying 'how can I help?' in the middle of switching their lights "
+    "reads as a failure even though the lights went off. "
+    "Target devices by a name that exists in the house, an area or an entity "
+    "as listed; do not invent one by joining a room to a device type "
+    "('Living room lights' matches nothing when the area is 'Living Room'). "
     "Hand off as soon as you know the request is for the backend and relay "
     "the result when it lands. Ignore results the conversation has already "
     "moved past. While the backend works, stay silent: no filler, no "

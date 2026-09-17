@@ -559,4 +559,22 @@ async def _serve_live(config: Config, mcp, health: _Health | None = None) -> Non
 
     if health is not None:
         health.serving = True
-    await runner.run()
+    refresh = config.live_socket_refresh_seconds
+    keepalive = (
+        asyncio.create_task(_keep_socket_warm(service, refresh)) if refresh > 0 else None
+    )
+    try:
+        await runner.run()
+    finally:
+        if keepalive is not None:
+            keepalive.cancel()
+
+
+async def _keep_socket_warm(service, every: float) -> None:
+    """Replace the idle OpenAI connection before OpenAI drops it."""
+    while True:
+        await asyncio.sleep(every)
+        try:
+            await service.refresh_idle_socket()
+        except Exception as exc:  # noqa: BLE001 - a failed refresh must not end the pipeline
+            logger.warning("Live: idle connection refresh failed: %s", exc)
