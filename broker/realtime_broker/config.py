@@ -137,6 +137,15 @@ class Config:
     # actually goes wrong (a rebuild loop), which a port check cannot see.
     # 0 disables the endpoint.
     live_health_port: int = 8775
+    # Live engine only. How often to replace the idle OpenAI connection.
+    # The connection is free (only an open session bills) and the broker
+    # holds one between wakes so a wake pays only session.start, ~0.3 s.
+    # OpenAI drops it after a couple of idle hours, and the next wake then
+    # pays the full handshake instead: measured at 2.8 s, during which the
+    # user is already talking, so their question is buffered and replayed
+    # and the answer lands ~5 s late (2026-09-16). Refreshing it below that
+    # idle limit keeps every wake warm. 0 disables.
+    live_socket_refresh_seconds: float = 3600.0
 
     # An idle Realtime session goes stale server-side WITHOUT the socket dying:
     # a 47-min-old session accepted audio and returned nothing while ws.state
@@ -191,6 +200,9 @@ class Config:
             ),
             live_memory_turns=_non_negative("LIVE_MEMORY_TURNS", cls.live_memory_turns),
             live_health_port=_non_negative("LIVE_HEALTH_PORT", cls.live_health_port),
+            live_socket_refresh_seconds=_non_negative_float(
+                "LIVE_SOCKET_REFRESH_SECONDS", cls.live_socket_refresh_seconds
+            ),
             live_memory_minutes=_non_negative_float(
                 "LIVE_MEMORY_MINUTES", cls.live_memory_minutes
             ),
