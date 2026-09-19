@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 from pipecat.frames.frames import InputAudioRawFrame
 
 from realtime_broker.live_agent import VoicePELiveService, transcripts_agree
-from realtime_broker.live_server import _LiveHygiene
+from realtime_broker.live_server import _LiveHygiene, _OutputSilenceFilter
 
 
 def _response_evt(inner: str, response_id: str | None):
@@ -194,24 +194,104 @@ async def test_fallback_gives_up_on_speech_that_never_stops():
     print("PASS: an utterance that never goes quiet is closed at the cap")
 
 
-class _TrackerOnly(VoicePELiveService):
-    """The delegation tracker without any of the websocket machinery."""
+def test_filler_is_muted_while_the_backend_works_and_the_answer_is_not():
+    """Filler is dropped, the answer is heard whole, and no word is cut.
+
+    Built from the orders measured on 2026-09-19: filler while the backend
+    works; the answer arriving all loud after silence; the answer starting
+    inside the settle moment after the backend finished.
+    """
+    f = _OutputSilenceFilter.__new__(_OutputSilenceFilter)
+    state = {"v": (False, False)}
+    f._output_hold = lambda: state["v"]
+    f._muting = False
+    f._muted_frames = 0
+    f._recover = []
+    f._last_loud_at = 0.0
+    LOUD = 2000.0
+    idle, working, settling, unheard = (False, False), (True, False), (True, True), (True, False)
+
+    t = 10.0
+    assert f._admit("a", LOUD, t) == ["a"], "speech with nothing pending passes"
+
+    state["v"] = working
+    t += 0.5
+    assert f._admit("filler1", LOUD, t) == [], "filler while the backend works is dropped"
+    t += 0.1
+    assert f._admit("filler2", LOUD, t) == [], "the rest of it too"
+
+    # The answer starts inside the settle moment, then the hold lifts.
+    state["v"] = settling
+    t += 0.5
+    assert f._admit("ans1", LOUD, t) == [], "held a moment..."
+    t += 0.02
+    assert f._admit("ans2", LOUD, t) == [], "...still held..."
+    state["v"] = idle
+    t += 0.02
+    assert f._admit("ans3", LOUD, t) == ["ans1", "ans2", "ans3"], "...then replayed whole"
+
+    # Not heard yet: a guess is dropped and never replayed.
+    state["v"] = unheard
+    t += 1.0
+    assert f._admit("guess", LOUD, t) == []
+    state["v"] = idle
+    t += 3.0  # nothing at all arrives in between
+    assert f._admit("answer", LOUD, t) == ["answer"], "an all-loud answer after silence passes"
+
+    # The hold arrives while the model is mid-word: the word is not cut.
+    state["v"] = working
+    t += 0.05
+    assert f._admit("mid", LOUD, t) == ["mid"], "must not mute mid-utterance"
+    print("PASS: filler dropped, answers whole, no word cut")
+
+
+class _HoldOnly(VoicePELiveService):
+    """The output-hold state without the websocket machinery."""
 
     def __init__(self):
+        self._request_known = False
+        self._answer_text_started = False
         self._live_open_responses = set()
+        self._response_started = {}
+        self._backstop_at = None
+        self._current_response_at = 0.0
+        self._last_response_done = 0.0
+        self._user_turn_seen = False
+
+
+async def test_hold_lifts_when_the_answer_text_starts():
+    """Replays the backend events of a real "what time is it" (2026-09-19).
+
+    Held while unheard and through the tool call; lifted the moment the
+    backend starts writing the answer, before it has formally finished.
+    """
+    s = _HoldOnly()
+
+    async def evt(inner, key):
+        VoicePELiveService._follow_response(s, types.SimpleNamespace(
+            inner_type=inner, type="response.event",
+            event={"response": {"id": key}} if key else {},
+            delegation_id=None, item_id=key, event_id=None,
+        ))
+
+    assert s.output_hold()[0], "held before the request is heard"
+    s._request_known = True
+    await evt("response.created", "r1")
+    assert s.output_hold() == (True, False), "held while the backend calls a tool"
+    await evt("response.completed", "r1")
+    await evt("response.created", "r2")
+    assert s.output_hold()[0], "still held: no answer text yet"
+    await evt("response.content_part.added", "item2")
+    assert s.output_hold() == (False, False), "answer text: the model may speak"
+    print("PASS: the hold lifts when the backend starts writing the answer")
+
+
+class _TrackerOnly(_HoldOnly):
+    """The real delegation tracker, without the websocket machinery."""
 
     async def _handle_evt_response(self, evt):
-        # Skip the parent chain, which would need a live session.
-        inner = getattr(evt, "inner_type", None)
-        key = self._response_key(evt)
-        if inner == "response.created":
-            if key is not None:
-                self._live_open_responses.add(key)
-        elif inner in self._RESPONSE_DONE:
-            if key is not None:
-                self._live_open_responses.discard(key)
-            elif self._live_open_responses:
-                self._live_open_responses.pop()
+        # The parent chain would need a live session; the tracking is ours.
+        self._follow_response(evt)
 
 
 async def test_delegation_tracker_opens_and_closes():
@@ -414,3 +494,32 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+def test_no_accidental_overrides_of_pipecat():
+    """Every name we share with pipecat's Live service is a deliberate override.
+
+    A helper that happens to share a name with a pipecat method silently
+    replaces it: `_track_response` did, pipecat got None where it expected
+    a key, and every tool call crashed the receive loop (2026-09-19). A new
+    override must be added here on purpose.
+    """
+    from pipecat.services.openai.live.llm import OpenAILiveLLMService
+
+    ours = {n for n in VoicePELiveService.__dict__ if not n.startswith("__")}
+    parent = {n for c in OpenAILiveLLMService.__mro__ for n in c.__dict__}
+    intended = {
+        "_abc_impl",
+        "_end_turn",
+        "_handle_evt_response",
+        "_handle_evt_session_started",
+        "_invocation_params",
+        "_open_turn",
+        "_run_function_call",
+        "_send_session_config",
+        "_send_user_audio",
+        "push_error",
+    }
+    unexpected = (ours & parent) - intended
+    assert not unexpected, f"shadows a pipecat method by accident: {sorted(unexpected)}"
+    print("PASS: no accidental overrides of pipecat")
