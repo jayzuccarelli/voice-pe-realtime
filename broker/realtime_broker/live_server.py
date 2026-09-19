@@ -85,6 +85,8 @@ _OUTPUT_SILENCE_HOLD_SECONDS = 0.8
 # buffer could not cover, and words broke in the middle (2026-09-15). Held
 # audio becomes that reserve; the whole reply then plays from 0.4 s behind.
 _OUTPUT_PREROLL_SECONDS = 0.4
+# Quiet needed after muted filler before the model may be heard again.
+_MUTE_RELEASE_SECONDS = 0.3
 
 
 class _OutputSilenceFilter(FrameProcessor):
@@ -104,7 +106,7 @@ class _OutputSilenceFilter(FrameProcessor):
     they are kept, so the stream the speaker plays has no holes.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, output_hold=None) -> None:
         super().__init__()
         self._dropped = 0
         self._sent = 0
@@ -113,40 +115,94 @@ class _OutputSilenceFilter(FrameProcessor):
         self._burst_frames = 0
         self._preroll: list[OutputAudioRawFrame] = []
         self._preroll_seconds = 0.0
+        # (hold, keep): see VoicePELiveService.output_hold.
+        self._output_hold = output_hold or (lambda: (False, False))
+        self._muting = False
+        self._muted_frames = 0
+        self._recover: list = []
+
+    def _admit(self, frame, rms: float, now: float) -> list:
+        """The frames to send on for this one: none, it, or it plus the
+        answer's start that was held back a moment too long.
+
+        While the backend runs a tool the live model fills the silence, and
+        what it says has nothing to do with the outcome: "Sure, resetting
+        it" to a time question, "Sure, switching it on" during a turn-off,
+        "How can I help?" with the lights already going off (2026-09-18/19).
+        Told in the prompt not to, it does it anyway, so it is dropped here.
+        A mute only ever begins at the start of an utterance, never inside a
+        word; it lifts the moment the hold does, and whatever was held back
+        after the backend finished is sent first, since that was the answer.
+        """
+        hold, keep = self._output_hold()
+        loud = rms >= _OUTPUT_SILENCE_RMS
+        if not self._muting:
+            starts_utterance = now - self._last_loud_at >= _MUTE_RELEASE_SECONDS
+            if not (hold and loud and starts_utterance):
+                if loud:
+                    self._last_loud_at = now
+                return [frame]
+            self._muting = True
+            self._recover = []
+            logger.info("output: holding the model back (not heard yet, or backend working)")
+        if loud:
+            self._last_loud_at = now
+        if not hold:
+            self._muting = False
+            recovered, self._recover = self._recover, []
+            logger.info(
+                "output: released; dropped %d frames, recovered %d of the answer",
+                self._muted_frames,
+                len(recovered),
+            )
+            self._muted_frames = 0
+            return recovered + [frame]
+        if keep:
+            self._recover.append(frame)
+        else:
+            self._muted_frames += len(self._recover) + 1
+            self._recover = []
+        return []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         if isinstance(frame, OutputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             rms = _rms16(frame.audio)
             now = asyncio.get_running_loop().time()
-            if rms < _OUTPUT_SILENCE_RMS:
-                if now - self._last_loud_at > _OUTPUT_SILENCE_HOLD_SECONDS:
-                    self._dropped += 1
-                    return
-            else:
-                self._last_loud_at = now
-            if now - self._last_sent_at > 1.0 and not self._preroll:
-                # Start of a burst of audio to the device. Anything here that
-                # is not the model talking is what mutes the puck's mic.
-                if self._burst_frames:
-                    logger.info("output: previous burst was %d frames", self._burst_frames)
-                logger.info("output: burst starts, rms %.0f (%d dropped as silence since last)", rms, self._dropped)
-                self._burst_frames = 0
-                self._dropped = 0
-            self._burst_frames += 1
-            self._sent += 1
-            if self._burst_frames <= 1 or self._preroll:
-                self._preroll.append(frame)
-                self._preroll_seconds += len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
-                if self._preroll_seconds < _OUTPUT_PREROLL_SECONDS:
-                    return
-                held, self._preroll = self._preroll, []
-                self._preroll_seconds = 0.0
-                self._last_sent_at = now
-                for f in held:
-                    await self.push_frame(f, direction)
+            for out in self._admit(frame, rms, now):
+                await self._forward(out, rms if out is frame else _rms16(out.audio), now, direction)
+            return
+        await self.push_frame(frame, direction)
+
+    async def _forward(self, frame, rms: float, now: float, direction: FrameDirection) -> None:
+        if rms < _OUTPUT_SILENCE_RMS:
+            if now - self._last_loud_at > _OUTPUT_SILENCE_HOLD_SECONDS:
+                self._dropped += 1
                 return
+        else:
+            self._last_loud_at = now
+        if now - self._last_sent_at > 1.0 and not self._preroll:
+            # Start of a burst of audio to the device. Anything here that
+            # is not the model talking is what mutes the puck's mic.
+            if self._burst_frames:
+                logger.info("output: previous burst was %d frames", self._burst_frames)
+            logger.info("output: burst starts, rms %.0f (%d dropped as silence since last)", rms, self._dropped)
+            self._burst_frames = 0
+            self._dropped = 0
+        self._burst_frames += 1
+        self._sent += 1
+        if self._burst_frames <= 1 or self._preroll:
+            self._preroll.append(frame)
+            self._preroll_seconds += len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
+            if self._preroll_seconds < _OUTPUT_PREROLL_SECONDS:
+                return
+            held, self._preroll = self._preroll, []
+            self._preroll_seconds = 0.0
             self._last_sent_at = now
+            for f in held:
+                await self.push_frame(f, direction)
+            return
+        self._last_sent_at = now
         await self.push_frame(frame, direction)
 
 
@@ -501,7 +557,7 @@ async def _serve_live(config: Config, mcp, health: _Health | None = None) -> Non
             hygiene,
             # Last before the wire: the device must never receive the model's
             # idle silence, or its firmware mutes the mic (see the class).
-            _OutputSilenceFilter(),
+            _OutputSilenceFilter(output_hold=service.output_hold),
             transport.output(),
             aggregator.assistant(),
         ]

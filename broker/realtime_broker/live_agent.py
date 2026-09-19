@@ -75,6 +75,12 @@ class VoicePELiveService(OpenAILiveLLMService):
 
     #: Terminal states for a delegated backend response.
     _RESPONSE_DONE = ("response.completed", "response.incomplete", "response.failed")
+    #: The backend writing answer text, as opposed to calling a tool.
+    _ANSWER_TEXT = (
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+    )
 
     #: How much speech to hold while the billed session is opening. Opening
     #: costs ~3s (our websocket handshake, then the API's own session.start),
@@ -113,6 +119,10 @@ class VoicePELiveService(OpenAILiveLLMService):
         self.on_prestart_replayed = None
         # Whether the model has reported hearing the user at all this session.
         self._user_turn_seen = False
+        # Whether we know what the user asked this wake: the model
+        # transcribed them, or the backstop handed over agreed words, or
+        # the backstop gave up and asked them to repeat.
+        self._request_known = False
         # Whether a device is connected: the only time a session may start.
         self._device_present = False
         # What was said in recent wakes: (wall time, role, text). Only what
@@ -129,6 +139,15 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
         # Ids of delegated responses still open, for the CURRENT session only.
         self._live_open_responses: set[str] = set()
+        self._last_response_done = 0.0
+        # Set when the backstop hands the model the user's words; cleared
+        # once a backend response started after that has completed.
+        self._backstop_at: float | None = None
+        self._response_started: dict[str, float] = {}
+        # When the latest backend response was created, and whether the
+        # backend has begun writing the answer to the current request.
+        self._current_response_at = 0.0
+        self._answer_text_started = False
         # Mic audio captured while the session was still opening, oldest first.
         self._prestart_audio: deque[InputAudioRawFrame] = deque()
         self._prestart_seconds = 0.0
@@ -217,6 +236,9 @@ class VoicePELiveService(OpenAILiveLLMService):
     async def _open_turn(self, role: str) -> None:
         if role == "user":
             self._user_turn_seen = True
+            self._request_known = True
+            # A new request: its answer has not been written yet.
+            self._answer_text_started = False
         else:
             self._model_spoke = True
         await super()._open_turn(role)
@@ -406,9 +428,12 @@ class VoicePELiveService(OpenAILiveLLMService):
         transcriber given the lead-in as well loses no words to that. The
         wake word gated this one request, so nothing before it is in here.
         """
-        bps = self._fb_rate * 2
         b = end + self._FALLBACK_TAIL_SECONDS - self._fb_origin
-        return bytes(self._fb_audio[: int(b * bps)])
+        # Whole 16-bit samples only. Cut at a time-derived byte offset, about
+        # one clip in fourteen came out an odd length, and the transcriber
+        # rejects that WAV as "unsupported format", taking the backstop down
+        # for the wake (2026-09-19).
+        return bytes(self._fb_audio[: int(b * self._fb_rate) * 2])
 
     def _model_heard_it(self) -> bool:
         # Only a user transcript counts. The model also starts talking, and
@@ -435,6 +460,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         clip = self._fallback_slice(end)
         if not self._fb_rate or len(clip) < int(0.3 * self._fb_rate * 2):
             logger.info("Live fallback: only %d bytes of audio to transcribe; skipping", len(clip))
+            await self._say_unheard()
             return
         if self._fallback_check_model:
             text, check = await asyncio.gather(
@@ -448,6 +474,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             return
         if len(text.split()) < 2:
             logger.info("Live fallback: heard %r; too little to act on", text)
+            await self._say_unheard()
             return
         if check is not None and not transcripts_agree(text, check):
             # Handing the model a transcript that is not what was said is
@@ -460,7 +487,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             logger.info(
                 "Live fallback: transcribers disagree (%r vs %r); asking to repeat", text, check
             )
-            await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
+            await self._say_unheard()
             return
         logger.info("Live fallback: heard %r; handing it to the model as text", text)
         self._remember("user", text)
@@ -471,8 +498,21 @@ class VoicePELiveService(OpenAILiveLLMService):
             "role": "user",
             "content": [{"type": "input_text", "text": text}],
         }
+        # Anything the model says from here until the backend has worked on
+        # these words is its own guess at audio it did not make out: on a
+        # "what time is it" it began "the capital of France is..." from the
+        # wake before (2026-09-19). The output filter holds it back.
+        self._backstop_at = time.monotonic()
+        self._request_known = True
         await self.send_client_event(events.ResponseItemCreateEvent(item=item))
         await self.send_client_event(events.ResponseCreateEvent())
+
+    async def _say_unheard(self) -> None:
+        """Tell the user, once, that they were not understood."""
+        if self._model_heard_it():
+            return
+        self._request_known = True
+        await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
 
     async def _transcribe(self, pcm: bytes, model: str) -> str:
         import io
@@ -532,6 +572,47 @@ class VoicePELiveService(OpenAILiveLLMService):
         """Whether a delegated backend response is still being worked on."""
         return bool(self._live_open_responses)
 
+    #: A tool call and its answer are two backend responses, the second
+    #: created ~0.2 s after the first completes. Counting that gap as still
+    #: busy keeps the chain one piece. The spoken answer starts 0.5-1 s after
+    #: the last completion (measured over five wakes, 2026-09-19), so this
+    #: settle cannot reach into it.
+    _BACKEND_SETTLE_SECONDS = 0.25
+
+    @property
+    def request_known(self) -> bool:
+        """Whether what the user asked this wake is known.
+
+        Until it is, anything the model says is a guess at audio it did not
+        make out, and it guesses from whatever it has: with the backstop down
+        on a "turn the living room lights off", it answered the time, because
+        the two wakes before had asked for it (2026-09-19).
+        """
+        return self._request_known
+
+    def output_hold(self) -> tuple[bool, bool]:
+        """Whether the model must not be heard now, and whether what it says
+        now is probably the start of the answer.
+
+        Returns (hold, keep). Held until the request is known (anything
+        before is a guess) and while the backend is only calling tools
+        (anything then is filler). Released as soon as the backend starts
+        writing the answer: the model speaks it from that text, sometimes
+        before the backend has formally finished, and a hold kept until then
+        cut the start off the answer ("21 p.m. on Saturday", 2026-09-19).
+        Without answer text, a moment after the backend finishes is still
+        held but kept, and replayed if it turns out to be the answer.
+        """
+        if not self._request_known:
+            return True, False
+        if self._answer_text_started:
+            return False, False
+        if self._live_open_responses or self._backstop_at is not None:
+            return True, False
+        if time.monotonic() - self._last_response_done < self._BACKEND_SETTLE_SECONDS:
+            return True, True
+        return False, False
+
     @staticmethod
     def _response_key(evt) -> str | None:
         """Identify the delegated response an envelope belongs to."""
@@ -549,6 +630,10 @@ class VoicePELiveService(OpenAILiveLLMService):
         return None
 
     async def _handle_evt_response(self, evt) -> None:
+        self._follow_response(evt)
+        await super()._handle_evt_response(evt)
+
+    def _follow_response(self, evt) -> None:
         """Track which delegated responses are open, by id.
 
         Tracked here rather than read off upstream's `_pending_responses`,
@@ -567,10 +652,29 @@ class VoicePELiveService(OpenAILiveLLMService):
         """
         inner = getattr(evt, "inner_type", None)
         key = self._response_key(evt)
+        if os.environ.get("LIVE_TRACE_RESPONSES") and inner and not inner.endswith(".delta"):
+            logger.info("TRACE response %s %s", inner, key)
         if inner == "response.created":
+            self._current_response_at = time.monotonic()
             if key is not None:
                 self._live_open_responses.add(key)
+                self._response_started[key] = time.monotonic()
+        elif inner in self._ANSWER_TEXT and not self._answer_text_started:
+            # Responses run one at a time, so this text belongs to the one
+            # created last. Text from a guess started before the backstop
+            # handed over the user's words is not the answer to them.
+            if self._backstop_at is None or self._current_response_at >= self._backstop_at:
+                self._answer_text_started = True
         elif inner in self._RESPONSE_DONE:
+            self._last_response_done = time.monotonic()
+            started = self._response_started.pop(key, None) if key is not None else None
+            if (
+                self._backstop_at is not None
+                and started is not None
+                and started >= self._backstop_at
+            ):
+                # The backend has now worked on what the user actually said.
+                self._backstop_at = None
             if key is not None:
                 self._live_open_responses.discard(key)
             elif self._live_open_responses:
@@ -578,7 +682,6 @@ class VoicePELiveService(OpenAILiveLLMService):
                 # forever; the pending-reply grace and the hard cap still
                 # bound the session either way.
                 self._live_open_responses.pop()
-        await super()._handle_evt_response(evt)
 
     @staticmethod
     def _frame_seconds(frame: InputAudioRawFrame) -> float:
@@ -750,7 +853,11 @@ class VoicePELiveService(OpenAILiveLLMService):
         # A fresh session owns no delegations. Clearing here is what makes a
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
+        self._response_started.clear()
+        self._backstop_at = None
+        self._answer_text_started = False
         self._user_turn_seen = False
+        self._request_known = False
         self._memory_announced = False
         await self._stop_flush()
         await self._stop_fallback()
