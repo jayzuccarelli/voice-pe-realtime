@@ -119,7 +119,14 @@ class Config:
     # model has not opened a turn on it by the time the speaker goes quiet,
     # the words are handed to it as text. Once per wake.
     live_fallback_transcription: bool = True
-    live_fallback_model: str = "gpt-4o-mini-transcribe"
+    # gpt-4o-mini-transcribe returned garbage on one of two passes over a
+    # far-field "turn the living room TV off"; gpt-4o-transcribe and
+    # whisper-1, both told the language, were right on every pass over three
+    # of the household's recordings (2026-09-19).
+    live_fallback_model: str = "gpt-4o-transcribe"
+    # A second, independent transcriber run in parallel as a check: the
+    # backstop acts only when the two agree. Empty disables the check.
+    live_fallback_check_model: str = "whisper-1"
     # ISO-639-1 code the household speaks to the device in. Pinned because
     # the transcriber, left to detect it on a few seconds of far-field
     # audio, guessed wrong and returned nonsense.
@@ -195,6 +202,9 @@ class Config:
             live_fallback_transcription=os.environ.get("LIVE_FALLBACK_TRANSCRIPTION", "1").lower()
             in ("1", "true", "yes"),
             live_fallback_model=os.environ.get("LIVE_FALLBACK_MODEL", cls.live_fallback_model),
+            live_fallback_check_model=os.environ.get(
+                "LIVE_FALLBACK_CHECK_MODEL", cls.live_fallback_check_model
+            ),
             live_fallback_language=os.environ.get(
                 "LIVE_FALLBACK_LANGUAGE", cls.live_fallback_language
             ),
