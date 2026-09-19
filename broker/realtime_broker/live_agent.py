@@ -93,7 +93,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         *,
         flush_pace: float = 1.0,
         fallback_transcription: bool = True,
-        fallback_model: str = "gpt-4o-mini-transcribe",
+        fallback_model: str = "gpt-4o-transcribe",
+        fallback_check_model: str = "whisper-1",
         fallback_language: str = "en",
         memory_turns: int = 8,
         memory_minutes: float = 60.0,
@@ -120,6 +121,9 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._memory_turns = int(memory_turns)
         self._memory_seconds = float(memory_minutes) * 60.0
         self._memory_announced = False
+        # This wake's turns, held back until it ends; see _commit_wake_memory.
+        self._wake_turns: list[tuple[float, str, str]] = []
+        self._wake_acted = False
         # Debug aid: everything sent to the model this session, written to a
         # WAV at session end so a silent wake can be transcribed and heard.
         self._session_tape = bytearray() if os.environ.get("LIVE_SESSION_TAPE") else None
@@ -147,6 +151,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         # Transcription fallback: see _track_fallback_segment.
         self._fallback_enabled = bool(fallback_transcription) and self._vad is not None
         self._fallback_model = fallback_model
+        self._fallback_check_model = fallback_check_model
         self._fallback_language = fallback_language
         self._fallback_task = None
         self._openai = None
@@ -176,7 +181,14 @@ class VoicePELiveService(OpenAILiveLLMService):
     #: separates two things sharing a name.
     _TYPE_SLOTS = ("device_class",)
 
+    @staticmethod
+    def _is_read_only_tool(name: str) -> bool:
+        """Whether a tool only looks things up. Home Assistant's are named Get*."""
+        return name.startswith("Get") or name == "get_weather"
+
     async def _run_function_call(self, runner_item) -> None:
+        if not self._is_read_only_tool(runner_item.function_name):
+            self._wake_acted = True
         args = runner_item.arguments
         if isinstance(args, dict):
             # The backend fills every slot of a Home Assistant tool, empty
@@ -228,7 +240,7 @@ class VoicePELiveService(OpenAILiveLLMService):
     _MEMORY_MAX_CHARS = 200
 
     def _remember(self, role: str, text: str) -> None:
-        """Keep one side of an exchange for the next wake to see."""
+        """Hold one side of an exchange; it reaches memory when the wake ends."""
         if self._memory_turns <= 0:
             return
         text = " ".join(text.split())[: self._MEMORY_MAX_CHARS]
@@ -236,9 +248,26 @@ class VoicePELiveService(OpenAILiveLLMService):
             return
         if role != "user" and len(text.split()) < self._MEMORY_MIN_ASSISTANT_WORDS:
             return
-        if self._memory and self._memory[-1][1:] == (role, text):
+        if self._wake_turns and self._wake_turns[-1][1:] == (role, text):
             return
-        self._memory.append((time.time(), role, text))
+        self._wake_turns.append((time.time(), role, text))
+
+    def _commit_wake_memory(self) -> None:
+        """Carry this wake's turns into memory, unless it acted on the house.
+
+        A command in memory is a command the model will carry out again: a
+        "what time is it" called the TV's turn-off twice because the wake
+        before had asked for it and failed (2026-09-19). Telling it not to is
+        not enough, so a wake that ran anything but a lookup is simply not
+        remembered. Questions and answers still carry over; commands never do.
+        """
+        turns, self._wake_turns = self._wake_turns, []
+        acted, self._wake_acted = self._wake_acted, False
+        if acted:
+            if turns:
+                logger.info("Live memory: not keeping %d turns from a wake that acted", len(turns))
+            return
+        self._memory.extend(turns)
         while len(self._memory) > self._memory_turns:
             self._memory.popleft()
 
@@ -407,12 +436,31 @@ class VoicePELiveService(OpenAILiveLLMService):
         if not self._fb_rate or len(clip) < int(0.3 * self._fb_rate * 2):
             logger.info("Live fallback: only %d bytes of audio to transcribe; skipping", len(clip))
             return
-        text = await self._transcribe(clip)
+        if self._fallback_check_model:
+            text, check = await asyncio.gather(
+                self._transcribe(clip, self._fallback_model),
+                self._transcribe(clip, self._fallback_check_model),
+            )
+        else:
+            text, check = await self._transcribe(clip, self._fallback_model), None
         if self._model_heard_it():
             logger.info("Live fallback: heard %r, but the model heard it too", text)
             return
         if len(text.split()) < 2:
             logger.info("Live fallback: heard %r; too little to act on", text)
+            return
+        if check is not None and not transcripts_agree(text, check):
+            # Handing the model a transcript that is not what was said is
+            # worse than handing it nothing: it answered "Sure" to "Trova di
+            # vincitivi", a far-field "turn the living room TV off" read as
+            # Italian, then said it could not understand (2026-09-19). Two
+            # independent transcribers rarely invent the same words, so when
+            # they differ the audio was not intelligible and the honest
+            # answer is to ask again, once.
+            logger.info(
+                "Live fallback: transcribers disagree (%r vs %r); asking to repeat", text, check
+            )
+            await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
             return
         logger.info("Live fallback: heard %r; handing it to the model as text", text)
         self._remember("user", text)
@@ -426,7 +474,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         await self.send_client_event(events.ResponseItemCreateEvent(item=item))
         await self.send_client_event(events.ResponseCreateEvent())
 
-    async def _transcribe(self, pcm: bytes) -> str:
+    async def _transcribe(self, pcm: bytes, model: str) -> str:
         import io
         import wave
 
@@ -446,13 +494,13 @@ class VoicePELiveService(OpenAILiveLLMService):
             # returned nonsense ("Did you from the legal group think" for
             # "Can you turn the living room lights off", 2026-09-15).
             result = await self._openai.audio.transcriptions.create(
-                model=self._fallback_model,
+                model=model,
                 file=("wake.wav", buf.getvalue()),
                 language=self._fallback_language,
                 prompt=FALLBACK_VOCABULARY,
             )
         except Exception as exc:  # noqa: BLE001 - a failed backstop must not end the session
-            logger.warning("Live fallback: transcription failed: %s", exc)
+            logger.warning("Live fallback: %s transcription failed: %s", model, exc)
             if self._session_tape is not None:
                 path = f"/tmp/claude/fallback-rejected-{int(time.time())}.wav"
                 await asyncio.to_thread(pathlib.Path(path).write_bytes, buf.getvalue())
@@ -739,7 +787,11 @@ class VoicePELiveService(OpenAILiveLLMService):
         """
         self._device_present = False
         await self._stop_flush()
+        # The backstop records what it heard once its transcription returns,
+        # so it is stopped before the wake's memory is committed: otherwise a
+        # late turn lands in the next wake's memory instead of this one's.
         await self._stop_fallback()
+        self._commit_wake_memory()
         # Cleared now, not after the close: a re-wake can connect while the
         # close below is still in flight, and its first words land in these
         # buffers. Clearing them afterwards threw that question away.
@@ -768,6 +820,52 @@ class VoicePELiveService(OpenAILiveLLMService):
 # Shown to the transcriber as prior context: the kind of thing said to the
 # device, so short far-field clips resolve to home commands, not to other
 # languages or to whatever the room's TV is saying.
+def transcripts_agree(a: str, b: str) -> bool:
+    """Whether two transcripts of one clip plausibly say the same thing.
+
+    Word overlap against the longer of the two, ignoring case and
+    punctuation: "Turn the living room TV off." and "turn the living room
+    tv off" agree; "turn the living room TV off." and "Drogadmeni group
+    TVApps." do not.
+    """
+    import re
+
+    def words(s: str) -> set[str]:
+        return set(re.findall(r"[a-z0-9']+", s.lower()))
+
+    def decisive(ws: set[str]) -> set[str]:
+        return {w for w in ws if w in _DECISIVE_WORDS or w.isdigit()}
+
+    wa, wb = words(a), words(b)
+    if not wa or not wb:
+        return False
+    # Overlap alone would pass "turn the TV off" against "turn the TV on":
+    # five of six words agree and the one that differs is the whole command.
+    # The words that decide what happens, and any number, must match exactly.
+    if decisive(wa) != decisive(wb):
+        return False
+    return len(wa & wb) / max(len(wa), len(wb)) >= 0.5
+
+
+# Words that flip what a command does. Two transcripts that differ on any of
+# these are describing different commands however much else they share.
+_DECISIVE_WORDS = frozenset(
+    {
+        "on", "off", "up", "down", "open", "close", "closed", "lock", "unlock",
+        "start", "stop", "play", "pause", "resume", "enable", "disable", "arm",
+        "disarm", "raise", "lower", "increase", "decrease", "mute", "unmute",
+        "not", "don't", "never", "no",
+    }
+)
+
+
+# Spoken when the backstop could not make out the request: one line, no
+# pretending to act on it.
+UNHEARD_PROMPT = (
+    "You could not make out what the user just said. Say only that you did not "
+    "catch it and ask them to say it again, in one short sentence."
+)
+
 FALLBACK_VOCABULARY = (
     "Requests to a smart-home voice assistant: turn the living room lights off, "
     "put Netflix on the TV, what time is it, what's the weather, play music in "
@@ -930,6 +1028,7 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         flush_pace=config.live_flush_pace,
         fallback_transcription=config.live_fallback_transcription,
         fallback_model=config.live_fallback_model,
+        fallback_check_model=config.live_fallback_check_model,
         fallback_language=config.live_fallback_language,
         memory_turns=config.live_memory_turns,
         memory_minutes=config.live_memory_minutes,

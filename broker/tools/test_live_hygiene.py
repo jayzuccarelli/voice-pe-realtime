@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from pipecat.frames.frames import InputAudioRawFrame
 
-from realtime_broker.live_agent import VoicePELiveService
+from realtime_broker.live_agent import VoicePELiveService, transcripts_agree
 from realtime_broker.live_server import _LiveHygiene
 
 
@@ -45,6 +45,8 @@ class _MemoryOnly(VoicePELiveService):
         self._memory = collections.deque()
         self._memory_turns = turns
         self._memory_seconds = minutes * 60.0
+        self._wake_turns = []
+        self._wake_acted = False
 
 
 def test_memory_digest_carries_speech_and_nothing_else():
@@ -60,6 +62,7 @@ def test_memory_digest_carries_speech_and_nothing_else():
     svc._remember("assistant", "Mm-hmm.")  # an acknowledgement, not content
     svc._remember("assistant", "It's 9:01 PM on Tuesday.")
     svc._remember("user", "what time is it")  # repeat of the last user line, kept
+    svc._commit_wake_memory()
     digest = svc._memory_digest()
     assert "Mm-hmm" not in digest, digest
     assert "what time is it" in digest and "9:01 PM" in digest, digest
@@ -71,11 +74,64 @@ def test_memory_digest_carries_speech_and_nothing_else():
     assert "yesterday's question" not in svc._memory_digest()
     for i in range(6):
         svc._remember("user", f"question {i}")
+    svc._commit_wake_memory()
     assert len(svc._memory) == 4, svc._memory
     assert "question 0" not in svc._memory_digest()
 
     assert _MemoryOnly(turns=0)._memory_digest() == "", "memory off must produce nothing"
     print("PASS: the digest carries what was said, relative and bounded")
+
+
+def test_a_wake_that_acted_is_never_remembered():
+    """A command in memory is a command the model carries out again.
+
+    A "what time is it" called the TV's turn-off twice because the wake
+    before had asked for it (2026-09-19). Lookups keep their turns;
+    anything that acted on the house leaves none behind.
+    """
+    svc = _MemoryOnly()
+    svc._remember("user", "turn the living room TV off")
+    svc._remember("assistant", "Done, the living room TV is off.")
+    svc._wake_acted = True
+    svc._commit_wake_memory()
+    assert not svc._memory, svc._memory
+    assert svc._memory_digest() == ""
+
+    svc._remember("user", "what is the capital of France")
+    svc._remember("assistant", "Paris is the capital.")
+    svc._commit_wake_memory()
+    assert "France" in svc._memory_digest()
+    assert "TV" not in svc._memory_digest()
+
+    assert VoicePELiveService._is_read_only_tool("GetDateTime")
+    assert VoicePELiveService._is_read_only_tool("get_weather")
+    assert not VoicePELiveService._is_read_only_tool("HassTurnOff")
+    assert not VoicePELiveService._is_read_only_tool("tv_remote")
+    print("PASS: commands never reach memory; questions do")
+
+
+def test_transcripts_agree_filters_garbage():
+    """Two transcripts of the same clip must agree before the backstop acts.
+
+    Taken from real passes over one far-field request: the two good ones
+    agree whatever their punctuation, and the garbage one agrees with
+    neither.
+    """
+    good_a = "Turn the living room TV off."
+    good_b = "turn the living room tv off"
+    garbage = "Drogadmeni group TVApps."
+    italian = "Trova di vincitivi."
+    assert transcripts_agree(good_a, good_b)
+    assert not transcripts_agree(good_a, garbage)
+    assert not transcripts_agree(good_a, italian)
+    assert not transcripts_agree(good_a, "")
+    assert transcripts_agree("What time is it?", "what time is it,")
+    # Mostly the same words, opposite command: must not agree.
+    assert not transcripts_agree("turn the living room TV off", "turn the living room TV on")
+    assert not transcripts_agree("set the thermostat to 20", "set the thermostat to 70")
+    assert not transcripts_agree("lock the front door", "unlock the front door")
+    assert transcripts_agree("Turn the TV off.", "turn the tv off")
+    print("PASS: the backstop only acts when two transcribers agree")
 
 
 class _FallbackOnly(VoicePELiveService):
