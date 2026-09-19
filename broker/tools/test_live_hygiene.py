@@ -126,6 +126,11 @@ def test_transcripts_agree_filters_garbage():
     assert not transcripts_agree(good_a, italian)
     assert not transcripts_agree(good_a, "")
     assert transcripts_agree("What time is it?", "what time is it,")
+    # Mostly the same words, opposite command: must not agree.
+    assert not transcripts_agree("turn the living room TV off", "turn the living room TV on")
+    assert not transcripts_agree("set the thermostat to 20", "set the thermostat to 70")
+    assert not transcripts_agree("lock the front door", "unlock the front door")
+    assert transcripts_agree("Turn the TV off.", "turn the tv off")
     print("PASS: the backstop only acts when two transcribers agree")
 
 

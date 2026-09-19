@@ -786,9 +786,12 @@ class VoicePELiveService(OpenAILiveLLMService):
         running for however long the puck has been idle.
         """
         self._device_present = False
-        self._commit_wake_memory()
         await self._stop_flush()
+        # The backstop records what it heard once its transcription returns,
+        # so it is stopped before the wake's memory is committed: otherwise a
+        # late turn lands in the next wake's memory instead of this one's.
         await self._stop_fallback()
+        self._commit_wake_memory()
         # Cleared now, not after the close: a re-wake can connect while the
         # close below is still in flight, and its first words land in these
         # buffers. Clearing them afterwards threw that question away.
@@ -830,10 +833,30 @@ def transcripts_agree(a: str, b: str) -> bool:
     def words(s: str) -> set[str]:
         return set(re.findall(r"[a-z0-9']+", s.lower()))
 
+    def decisive(ws: set[str]) -> set[str]:
+        return {w for w in ws if w in _DECISIVE_WORDS or w.isdigit()}
+
     wa, wb = words(a), words(b)
     if not wa or not wb:
         return False
+    # Overlap alone would pass "turn the TV off" against "turn the TV on":
+    # five of six words agree and the one that differs is the whole command.
+    # The words that decide what happens, and any number, must match exactly.
+    if decisive(wa) != decisive(wb):
+        return False
     return len(wa & wb) / max(len(wa), len(wb)) >= 0.5
+
+
+# Words that flip what a command does. Two transcripts that differ on any of
+# these are describing different commands however much else they share.
+_DECISIVE_WORDS = frozenset(
+    {
+        "on", "off", "up", "down", "open", "close", "closed", "lock", "unlock",
+        "start", "stop", "play", "pause", "resume", "enable", "disable", "arm",
+        "disarm", "raise", "lower", "increase", "decrease", "mute", "unmute",
+        "not", "don't", "never", "no",
+    }
+)
 
 
 # Spoken when the backstop could not make out the request: one line, no
