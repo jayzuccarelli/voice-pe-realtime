@@ -206,7 +206,7 @@ def test_filler_is_muted_while_the_backend_works_and_the_answer_is_not():
     f._output_hold = lambda: state["v"]
     f._muting = False
     f._muted_frames = 0
-    f._recover = []
+    f._run, f._runs, f._run_keep = [], 0, False
     f._last_loud_at = 0.0
     LOUD = 2000.0
     idle, working, settling, unheard = (False, False), (True, False), (True, True), (True, False)
@@ -229,6 +229,19 @@ def test_filler_is_muted_while_the_backend_works_and_the_answer_is_not():
     state["v"] = idle
     t += 0.02
     assert f._admit("ans3", LOUD, t) == ["ans1", "ans2", "ans3"], "...then replayed whole"
+
+    # The answer starts while the backend still says it is working, and the
+    # release lands mid-word: the words already spoken are not lost.
+    state["v"] = working
+    t += 1.0
+    assert f._admit("filler", LOUD, t) == [], "filler dropped"
+    t += 0.5  # a gap, then the answer begins while still held
+    assert f._admit("a1", LOUD, t) == []
+    t += 0.02
+    assert f._admit("a2", LOUD, t) == []
+    state["v"] = idle
+    t += 0.02
+    assert f._admit("a3", LOUD, t) == ["a1", "a2", "a3"], "the answer is sent whole"
 
     # Not heard yet: a guess is dropped and never replayed.
     state["v"] = unheard
@@ -494,6 +507,38 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
+async def test_a_short_reply_is_not_held_waiting_for_more():
+    """A reply shorter than the reserve still goes out, on the deadline.
+
+    The model can stop sending audio altogether after a short answer, so a
+    reserve that waits to fill would hold "Done." for ever.
+    """
+    f = _OutputSilenceFilter.__new__(_OutputSilenceFilter)
+    f._dropped = f._sent = f._burst_frames = 0
+    f._last_sent_at = f._last_loud_at = f._preroll_since = 0.0
+    f._preroll, f._preroll_seconds = [], 0.0
+    sent = []
+
+    async def _push(frame, direction):
+        sent.append(frame)
+
+    f.push_frame = _push
+
+    class _Frame:
+        num_channels, sample_rate = 1, 24000
+        audio = b"\x10\x00" * 480  # 20 ms, loud
+
+    t = 100.0
+    for _ in range(10):  # 200 ms of speech, far short of the reserve
+        await f._forward(_Frame(), 2000.0, t, None)
+        t += 0.02
+    assert not sent, "held while the reserve fills"
+    t += 1.7  # past the deadline
+    await f._forward(_Frame(), 2000.0, t, None)
+    assert len(sent) == 11, f"the whole short reply goes out on the deadline: {len(sent)}"
+    print("PASS: a short reply is not held waiting for more")
 
 
 def test_no_accidental_overrides_of_pipecat():

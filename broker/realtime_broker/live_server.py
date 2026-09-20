@@ -84,7 +84,12 @@ _OUTPUT_SILENCE_HOLD_SECONDS = 0.8
 # measured at the broker, a 4.7 s reply arrived with 13 gaps the device's
 # buffer could not cover, and words broke in the middle (2026-09-15). Held
 # audio becomes that reserve; the whole reply then plays from 0.4 s behind.
-_OUTPUT_PREROLL_SECONDS = 0.4
+_OUTPUT_PREROLL_SECONDS = 1.2
+#: A reply this many seconds old is sent on even if the model has not
+#: produced enough audio to fill the reserve: it can stop sending
+#: altogether after a short answer, and a reserve waiting to fill would
+#: hold "Done." for ever.
+_OUTPUT_PREROLL_DEADLINE = 1.6
 # Quiet needed after muted filler before the model may be heard again.
 _MUTE_RELEASE_SECONDS = 0.3
 
@@ -115,11 +120,16 @@ class _OutputSilenceFilter(FrameProcessor):
         self._burst_frames = 0
         self._preroll: list[OutputAudioRawFrame] = []
         self._preroll_seconds = 0.0
+        self._preroll_since = 0.0
         # (hold, keep): see VoicePELiveService.output_hold.
         self._output_hold = output_hold or (lambda: (False, False))
         self._muting = False
         self._muted_frames = 0
-        self._recover: list = []
+        # The utterance being held right now, and whether it is the first of
+        # this hold (the filler) or a later one (which may be the answer).
+        self._run: list = []
+        self._runs = 0
+        self._run_keep = False
 
     def _admit(self, frame, rms: float, now: float) -> list:
         """The frames to send on for this one: none, it, or it plus the
@@ -131,37 +141,42 @@ class _OutputSilenceFilter(FrameProcessor):
         "How can I help?" with the lights already going off (2026-09-18/19).
         Told in the prompt not to, it does it anyway, so it is dropped here.
         A mute only ever begins at the start of an utterance, never inside a
-        word; it lifts the moment the hold does, and whatever was held back
-        after the backend finished is sent first, since that was the answer.
+        word, and it lifts the moment the hold does. The utterance in
+        progress at that moment is sent whole rather than from the middle:
+        the release can arrive after the answer has already begun, which
+        cost the start of one ("pm on Sunday", 2026-09-19). Only the first
+        utterance of a hold is thrown away, because that is the filler the
+        hold exists for.
         """
         hold, keep = self._output_hold()
         loud = rms >= _OUTPUT_SILENCE_RMS
+        gap = now - self._last_loud_at >= _MUTE_RELEASE_SECONDS
         if not self._muting:
-            starts_utterance = now - self._last_loud_at >= _MUTE_RELEASE_SECONDS
-            if not (hold and loud and starts_utterance):
+            if not (hold and loud and gap):
                 if loud:
                     self._last_loud_at = now
                 return [frame]
             self._muting = True
-            self._recover = []
+            self._run, self._runs, self._run_keep = [], 0, False
             logger.info("output: holding the model back (not heard yet, or backend working)")
+        if loud and (gap or not self._runs):
+            # A new utterance inside the hold.
+            self._muted_frames += len(self._run)
+            self._run, self._runs, self._run_keep = [], self._runs + 1, keep
         if loud:
             self._last_loud_at = now
         if not hold:
             self._muting = False
-            recovered, self._recover = self._recover, []
+            recovered = self._run if (self._runs > 1 or self._run_keep) else []
+            self._muted_frames += len(self._run) - len(recovered)
             logger.info(
-                "output: released; dropped %d frames, recovered %d of the answer",
+                "output: released; dropped %d frames, kept %d of the answer",
                 self._muted_frames,
                 len(recovered),
             )
-            self._muted_frames = 0
+            self._run, self._muted_frames = [], 0
             return recovered + [frame]
-        if keep:
-            self._recover.append(frame)
-        else:
-            self._muted_frames += len(self._recover) + 1
-            self._recover = []
+        self._run.append(frame)
         return []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -192,9 +207,18 @@ class _OutputSilenceFilter(FrameProcessor):
         self._burst_frames += 1
         self._sent += 1
         if self._burst_frames <= 1 or self._preroll:
+            if not self._preroll:
+                self._preroll_since = now
             self._preroll.append(frame)
             self._preroll_seconds += len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
-            if self._preroll_seconds < _OUTPUT_PREROLL_SECONDS:
+            # The reserve the device plays from while the model's own stream
+            # stalls: gpt-live-1 sends at exactly playback speed and pauses
+            # mid-sentence for up to 1.3 s, and anything it has not sent by
+            # then is a hole in the speaker (2026-09-19).
+            if (
+                self._preroll_seconds < _OUTPUT_PREROLL_SECONDS
+                and now - self._preroll_since < _OUTPUT_PREROLL_DEADLINE
+            ):
                 return
             held, self._preroll = self._preroll, []
             self._preroll_seconds = 0.0
