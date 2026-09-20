@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
+import wave
 from collections import deque
 
 from pipecat.frames.frames import (
@@ -84,7 +86,12 @@ _OUTPUT_SILENCE_HOLD_SECONDS = 0.8
 # measured at the broker, a 4.7 s reply arrived with 13 gaps the device's
 # buffer could not cover, and words broke in the middle (2026-09-15). Held
 # audio becomes that reserve; the whole reply then plays from 0.4 s behind.
-_OUTPUT_PREROLL_SECONDS = 0.4
+_OUTPUT_PREROLL_SECONDS = 1.2
+#: A reply this many seconds old is sent on even if the model has not
+#: produced enough audio to fill the reserve: it can stop sending
+#: altogether after a short answer, and a reserve waiting to fill would
+#: hold "Done." for ever.
+_OUTPUT_PREROLL_DEADLINE = 1.6
 # Quiet needed after muted filler before the model may be heard again.
 _MUTE_RELEASE_SECONDS = 0.3
 
@@ -115,11 +122,49 @@ class _OutputSilenceFilter(FrameProcessor):
         self._burst_frames = 0
         self._preroll: list[OutputAudioRawFrame] = []
         self._preroll_seconds = 0.0
+        self._preroll_task = None
         # (hold, keep): see VoicePELiveService.output_hold.
         self._output_hold = output_hold or (lambda: (False, False))
         self._muting = False
         self._muted_frames = 0
-        self._recover: list = []
+        # The utterance being held right now, and whether it is the first of
+        # this hold (the filler) or a later one (which may be the answer).
+        self._run: list = []
+        self._runs = 0
+        self._run_keep = False
+        # Two tapes of one session: what the speaker played, and what this
+        # filter took out of it. Counters say how many frames went each way,
+        # never which words, and the difference is the whole question: an
+        # answer cut to "Hər" and two fillers let through read identically
+        # in the log (2026-09-20). Off unless LIVE_OUTPUT_TAPE is set.
+        taping = bool(os.environ.get("LIVE_OUTPUT_TAPE"))
+        self._passed_tape = bytearray() if taping else None
+        self._dropped_tape = bytearray() if taping else None
+
+    def _tape(self, tape, frames) -> None:
+        if tape is None:
+            return
+        for f in frames:
+            audio = getattr(f, "audio", None)
+            if audio:
+                tape.extend(audio)
+
+    def write_tapes(self) -> None:
+        """Write the session's two tapes, if taping is on."""
+        if not self._passed_tape and not self._dropped_tape:
+            return
+        stamp = int(time.time())
+        for name, tape in (("passed", self._passed_tape), ("dropped", self._dropped_tape)):
+            if not tape:
+                continue
+            path = f"/tmp/claude/output-{name}-{stamp}.wav"
+            with wave.open(path, "wb") as out:
+                out.setnchannels(1)
+                out.setsampwidth(2)
+                out.setframerate(24000)
+                out.writeframes(bytes(tape))
+            logger.info("output tape: %s written to %s", name, path)
+            tape.clear()
 
     def _admit(self, frame, rms: float, now: float) -> list:
         """The frames to send on for this one: none, it, or it plus the
@@ -131,37 +176,49 @@ class _OutputSilenceFilter(FrameProcessor):
         "How can I help?" with the lights already going off (2026-09-18/19).
         Told in the prompt not to, it does it anyway, so it is dropped here.
         A mute only ever begins at the start of an utterance, never inside a
-        word; it lifts the moment the hold does, and whatever was held back
-        after the backend finished is sent first, since that was the answer.
+        word, and it lifts the moment the hold does. The utterance in
+        progress at that moment is sent whole rather than from the middle:
+        the release can arrive after the answer has already begun, which
+        cost the start of one ("pm on Sunday", 2026-09-19). Only the first
+        utterance of a hold is thrown away, because that is the filler the
+        hold exists for.
         """
         hold, keep = self._output_hold()
         loud = rms >= _OUTPUT_SILENCE_RMS
+        gap = now - self._last_loud_at >= _MUTE_RELEASE_SECONDS
         if not self._muting:
-            starts_utterance = now - self._last_loud_at >= _MUTE_RELEASE_SECONDS
-            if not (hold and loud and starts_utterance):
+            if not (hold and loud and gap):
                 if loud:
                     self._last_loud_at = now
                 return [frame]
             self._muting = True
-            self._recover = []
+            self._run, self._runs, self._run_keep = [], 0, False
             logger.info("output: holding the model back (not heard yet, or backend working)")
+        if loud and (gap or not self._runs):
+            # A new utterance inside the hold.
+            self._muted_frames += len(self._run)
+            self._tape(self._dropped_tape, self._run)
+            self._run, self._runs, self._run_keep = [], self._runs + 1, keep
         if loud:
             self._last_loud_at = now
+        if hold and not keep:
+            # Still held, but no longer worth replaying: the words held were
+            # an answer to something the user did not say.
+            self._run_keep = False
         if not hold:
             self._muting = False
-            recovered, self._recover = self._recover, []
+            recovered = self._run if (self._runs > 1 or self._run_keep) else []
+            self._muted_frames += len(self._run) - len(recovered)
+            if not recovered:
+                self._tape(self._dropped_tape, self._run)
             logger.info(
-                "output: released; dropped %d frames, recovered %d of the answer",
+                "output: released; dropped %d frames, kept %d of the answer",
                 self._muted_frames,
                 len(recovered),
             )
-            self._muted_frames = 0
+            self._run, self._muted_frames = [], 0
             return recovered + [frame]
-        if keep:
-            self._recover.append(frame)
-        else:
-            self._muted_frames += len(self._recover) + 1
-            self._recover = []
+        self._run.append(frame)
         return []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
@@ -169,9 +226,16 @@ class _OutputSilenceFilter(FrameProcessor):
         if isinstance(frame, OutputAudioRawFrame) and direction == FrameDirection.DOWNSTREAM:
             rms = _rms16(frame.audio)
             now = asyncio.get_running_loop().time()
-            for out in self._admit(frame, rms, now):
+            admitted = self._admit(frame, rms, now)
+            self._tape(self._passed_tape, admitted)
+            for out in admitted:
                 await self._forward(out, rms if out is frame else _rms16(out.audio), now, direction)
             return
+        if isinstance(frame, (EndFrame, CancelFrame)):
+            # Nothing more is coming: whatever is held goes now, in order,
+            # before the frame that ends the stream.
+            await self._flush_preroll(direction)
+            self.write_tapes()
         await self.push_frame(frame, direction)
 
     async def _forward(self, frame, rms: float, now: float, direction: FrameDirection) -> None:
@@ -192,18 +256,44 @@ class _OutputSilenceFilter(FrameProcessor):
         self._burst_frames += 1
         self._sent += 1
         if self._burst_frames <= 1 or self._preroll:
+            if not self._preroll:
+                # The model can stop sending after a short reply, so the
+                # reserve is released on its own clock as well as when it
+                # fills; waiting for a frame that never comes would hold
+                # "Done." for ever.
+                self._preroll_task = self.create_task(self._flush_preroll_later(direction))
             self._preroll.append(frame)
             self._preroll_seconds += len(frame.audio) / (2 * frame.num_channels * frame.sample_rate)
+            # The reserve the device plays from while the model's own stream
+            # stalls: gpt-live-1 sends at exactly playback speed and pauses
+            # mid-sentence for up to 1.3 s, and anything it has not sent by
+            # then is a hole in the speaker (2026-09-19).
             if self._preroll_seconds < _OUTPUT_PREROLL_SECONDS:
                 return
-            held, self._preroll = self._preroll, []
-            self._preroll_seconds = 0.0
-            self._last_sent_at = now
-            for f in held:
-                await self.push_frame(f, direction)
+            await self._flush_preroll(direction, now)
             return
         self._last_sent_at = now
         await self.push_frame(frame, direction)
+
+    async def _flush_preroll(self, direction: FrameDirection, now: float | None = None) -> None:
+        """Send the held reserve on, in order."""
+        task, self._preroll_task = self._preroll_task, None
+        if task is not None and not task.done():
+            await self.cancel_task(task, timeout=1.0)
+        held, self._preroll = self._preroll, []
+        if not held:
+            return
+        self._preroll_seconds = 0.0
+        self._last_sent_at = now if now is not None else asyncio.get_running_loop().time()
+        for f in held:
+            await self.push_frame(f, direction)
+
+    async def _flush_preroll_later(self, direction: FrameDirection) -> None:
+        await asyncio.sleep(_OUTPUT_PREROLL_DEADLINE)
+        if self._preroll:
+            logger.info("output: reserve released on its deadline (%d frames)", len(self._preroll))
+            self._preroll_task = None  # this task is the one flushing
+            await self._flush_preroll(direction)
 
 
 def _rms16(pcm: bytes) -> float:
@@ -546,6 +636,7 @@ async def _serve_live(config: Config, mcp, health: _Health | None = None) -> Non
 
     context = LLMContext(tools=tools)
     aggregator = LLMContextAggregatorPair(context)
+    silence = _OutputSilenceFilter(output_hold=service.output_hold)
     pipeline = Pipeline(
         [
             transport.input(),
@@ -557,7 +648,7 @@ async def _serve_live(config: Config, mcp, health: _Health | None = None) -> Non
             hygiene,
             # Last before the wire: the device must never receive the model's
             # idle silence, or its firmware mutes the mic (see the class).
-            _OutputSilenceFilter(output_hold=service.output_hold),
+            silence,
             transport.output(),
             aggregator.assistant(),
         ]
@@ -610,6 +701,7 @@ async def _serve_live(config: Config, mcp, health: _Health | None = None) -> Non
             logger.info("Stale connection closed; device still connected")
             return
         logger.info("Device disconnected")
+        silence.write_tapes()
         await hygiene.on_device_disconnect()
         await _end_session()
 
