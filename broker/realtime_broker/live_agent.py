@@ -208,6 +208,7 @@ class VoicePELiveService(OpenAILiveLLMService):
     async def _run_function_call(self, runner_item) -> None:
         if not self._is_read_only_tool(runner_item.function_name):
             self._wake_acted = True
+            self._utterance_acted = True
         args = runner_item.arguments
         if isinstance(args, dict):
             # The backend fills every slot of a Home Assistant tool, empty
@@ -360,9 +361,12 @@ class VoicePELiveService(OpenAILiveLLMService):
 
     def _reset_fallback(self) -> None:
         self._verifying = False
+        self._pending_utterances: deque[tuple[float, float]] = deque()
         self._utterances = 0
         self._live_text = ""
         self._live_heard_at = None
+        self._held_since = None
+        self._utterance_acted = False
         self._model_spoke = False
         self._fb_audio = bytearray()
         self._fb_rate = 0
@@ -403,7 +407,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         (2026-09-20). What it produces is a plausible continuation, not a
         transcription, so every turn is checked against one.
         """
-        if not self._fallback_enabled or self._verifying:
+        if not self._fallback_enabled:
             return None
         secs = self._frame_seconds(frame)
         if not self._fb_rate:
@@ -424,9 +428,12 @@ class VoicePELiveService(OpenAILiveLLMService):
             ):
                 self._fb_seg_start = self._fb_seconds - self._fb_speech_seconds
                 # Someone is speaking again: what they want is not known
-                # until this utterance has been read back.
+                # until this utterance has been read back, and nothing has
+                # been done about it yet.
                 self._live_text = ""
                 self._live_heard_at = None
+                self._held_since = time.monotonic()
+                self._utterance_acted = False
                 self._request_known = False
                 self._answer_text_started = False
         else:
@@ -441,6 +448,24 @@ class VoicePELiveService(OpenAILiveLLMService):
             self._fb_quiet_seconds = 0.0
             return self._end_utterance()
         return None
+
+    async def _check_utterances(self, segment: tuple[float, float]) -> None:
+        """Read utterances back one at a time, in the order they were said.
+
+        Tracking never stops while one is being read, or a follow-up spoken
+        during the check would reach the model unchecked; the checks
+        themselves are serialised so two cannot answer at once.
+        """
+        self._pending_utterances.append(segment)
+        if self._verifying:
+            return
+        self._verifying = True
+        try:
+            while self._pending_utterances and self._device_present:
+                start, end = self._pending_utterances.popleft()
+                await self._verify_utterance(start, end, first=self._utterances <= 1)
+        finally:
+            self._verifying = False
 
     def _fallback_slice(self, start: float, end: float) -> bytes:
         """The audio of one utterance, with a little either side.
@@ -469,15 +494,6 @@ class VoicePELiveService(OpenAILiveLLMService):
         # the words anyway costs at worst a repeated answer.
         return self._user_turn_seen
 
-    async def _run_fallback(self, start: float, end: float) -> None:
-        """Read one utterance back and, if the model misheard it, correct it."""
-        self._verifying = True
-        first = self._utterances <= 1
-        try:
-            await self._verify_utterance(start, end, first)
-        finally:
-            self._verifying = False
-
     async def _verify_utterance(self, start: float, end: float, first: bool) -> None:
         # The model hears the same audio at real-time pace, a little behind
         # the mic while the opening seconds replay: wait until it has the
@@ -501,7 +517,19 @@ class VoicePELiveService(OpenAILiveLLMService):
             )
         else:
             text, check = await self._transcribe(clip, self._fallback_model), None
+        if not self._device_present:
+            # The mic keeps running for a few seconds after a wake ends, so
+            # an utterance can close, and come back read, with nobody left
+            # to say it to. Sending it anyway puts an event on a closed
+            # session, which OpenAI answers by tearing the socket down, and
+            # the puck is deaf until something restarts the broker
+            # (2026-09-20).
+            return
         live = self._live_text
+        if echoes_vocabulary(text) or (check is not None and echoes_vocabulary(check)):
+            logger.info("Live check: read back %r, which is the prompt; no speech in the clip", text)
+            await self._unreadable(first)
+            return
         if len(text.split()) < 2:
             logger.info("Live check: read %r; too little to act on (model heard %r)", text, live)
             await self._unreadable(first)
@@ -555,7 +583,9 @@ class VoicePELiveService(OpenAILiveLLMService):
         of them is a lie (2026-09-20).
         """
         self._request_known = True
-        if self._wake_acted:
+        if not self._device_present:
+            return
+        if self._utterance_acted:
             logger.info("Live check: could not read it back, but the house was already acted on")
             return
         if first or self._live_text:
@@ -637,10 +667,13 @@ class VoicePELiveService(OpenAILiveLLMService):
         """
         return self._request_known
 
-    #: How long the model is held back waiting to be checked. Long enough
-    #: for two transcriptions of a few seconds of audio; past it, whatever
-    #: the model made of the audio is all there is.
-    _VERIFY_DEADLINE_SECONDS = 4.0
+    #: How long the model is held back waiting for its hearing to be
+    #: checked, measured from the moment the utterance began. Long enough
+    #: for the utterance to end and two transcriptions to come back; past
+    #: it, whatever the model made of the audio is all there is, and
+    #: silence would be worse. Bounded well under the 12 s the hygiene
+    #: watcher allows for a first reply.
+    _VERIFY_DEADLINE_SECONDS = 8.0
 
     def output_hold(self) -> tuple[bool, bool]:
         """Whether the model must not be heard now, and whether what it says
@@ -657,14 +690,18 @@ class VoicePELiveService(OpenAILiveLLMService):
         """
         if not self._request_known:
             if (
-                self._live_heard_at is not None
-                and time.monotonic() - self._live_heard_at > self._VERIFY_DEADLINE_SECONDS
+                self._held_since is not None
+                and time.monotonic() - self._held_since > self._VERIFY_DEADLINE_SECONDS
             ):
                 # The check never came back; the model's own hearing is all
                 # there is, and silence would be worse.
                 self._request_known = True
             else:
-                return True, False
+                # Kept: the model may be answering from its own hearing, and
+                # if the check confirms that hearing this is the answer. If
+                # the check corrects it instead, the correction turns keep
+                # off and what was held is dropped as the wrong answer.
+                return True, True
         if self._answer_text_started:
             return False, False
         if self._live_open_responses or self._backstop_at is not None:
@@ -771,7 +808,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         speech = await self._vad_speech(frame) if self._vad is not None else False
         segment = self._track_fallback_segment(frame, speech)
         if segment is not None:
-            self._fallback_task = self.create_task(self._run_fallback(*segment))
+            self._fallback_task = self.create_task(self._check_utterances(segment))
         if not self._session_started:
             self._prestart_audio.append(frame)
             self._prestart_seconds += self._frame_seconds(frame)
@@ -987,6 +1024,28 @@ class VoicePELiveService(OpenAILiveLLMService):
 # Shown to the transcriber as prior context: the kind of thing said to the
 # device, so short far-field clips resolve to home commands, not to other
 # languages or to whatever the room's TV is saying.
+def echoes_vocabulary(text: str) -> bool:
+    """Whether a transcript is the vocabulary prompt read back.
+
+    Given a clip with no speech in it, a prompted transcriber returns the
+    prompt: an empty one came back as the whole example list, which opens
+    with "turn the living room lights off" (2026-09-20). Both transcribers
+    are prompted with the same words, so this is the one mishearing they
+    can agree on, and it agrees on a command. One example is what a real
+    request looks like; three in a breath is the prompt.
+    """
+    import re
+
+    said = _bare(text)
+    return sum(1 for phrase in re.split(r"[:,]", FALLBACK_VOCABULARY) if _bare(phrase) in said) >= 3
+
+
+def _bare(s: str) -> str:
+    import re
+
+    return " ".join(re.findall(r"[a-z0-9']+", s.lower()))
+
+
 def transcripts_agree(a: str, b: str) -> bool:
     """Whether two transcripts of one clip plausibly say the same thing.
 

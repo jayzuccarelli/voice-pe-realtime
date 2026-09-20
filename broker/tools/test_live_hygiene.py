@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 import time
 import os
 import sys
@@ -21,7 +22,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 
 from pipecat.frames.frames import InputAudioRawFrame
 
-from realtime_broker.live_agent import VoicePELiveService, transcripts_agree
+from realtime_broker.live_agent import (
+    VoicePELiveService,
+    echoes_vocabulary,
+    transcripts_agree,
+)
 from realtime_broker.live_server import _LiveHygiene, _OutputSilenceFilter
 
 
@@ -223,6 +228,7 @@ def test_filler_is_muted_while_the_backend_works_and_the_answer_is_not():
     f._muting = False
     f._muted_frames = 0
     f._run, f._runs, f._run_keep = [], 0, False
+    f._passed_tape = f._dropped_tape = None
     f._last_loud_at = 0.0
     LOUD = 2000.0
     idle, working, settling, unheard = (False, False), (True, False), (True, True), (True, False)
@@ -259,13 +265,29 @@ def test_filler_is_muted_while_the_backend_works_and_the_answer_is_not():
     t += 0.02
     assert f._admit("a3", LOUD, t) == ["a1", "a2", "a3"], "the answer is sent whole"
 
-    # Not heard yet: a guess is dropped and never replayed.
-    state["v"] = unheard
+    # Not heard yet, and the check then confirms the model heard right: what
+    # it said while the check ran is the answer, and is sent, not lost.
+    unverified = (True, True)
+    state["v"] = unverified
     t += 1.0
-    assert f._admit("guess", LOUD, t) == []
+    assert f._admit("maybe1", LOUD, t) == []
+    t += 0.02
+    assert f._admit("maybe2", LOUD, t) == []
+    state["v"] = idle
+    t += 0.02
+    assert f._admit("maybe3", LOUD, t) == ["maybe1", "maybe2", "maybe3"], "confirmed: kept"
+
+    # Not heard yet, and the check corrects it: what it said was an answer to
+    # something that was never asked, and is thrown away.
+    state["v"] = unverified
+    t += 1.0
+    assert f._admit("wrong1", LOUD, t) == []
+    state["v"] = unheard  # the correction goes in; keep turns off
+    t += 0.02
+    assert f._admit("wrong2", LOUD, t) == []
     state["v"] = idle
     t += 3.0  # nothing at all arrives in between
-    assert f._admit("answer", LOUD, t) == ["answer"], "an all-loud answer after silence passes"
+    assert f._admit("answer", LOUD, t) == ["answer"], "corrected: only the real answer passes"
 
     # The hold arrives while the model is mid-word: the word is not cut.
     state["v"] = working
@@ -281,6 +303,7 @@ class _HoldOnly(VoicePELiveService):
         self._request_known = False
         self._answer_text_started = False
         self._live_heard_at = None
+        self._held_since = None
         self._live_open_responses = set()
         self._response_started = {}
         self._backstop_at = None
@@ -509,39 +532,30 @@ async def test_turn_budget_waits_for_the_reply():
     print("PASS: turn budget waits for the owed reply")
 
 
-async def main():
-    await test_delegation_tracker_opens_and_closes()
-    await test_stale_completion_cannot_release_a_new_session()
-    await test_unidentifiable_completion_does_not_hold_forever()
-    await test_delegation_holds_the_window()
-    await test_window_closes_when_idle()
-    await test_fresh_wake_waits_for_the_first_reply()
-    await test_pending_reply_defers_then_fails_open()
-    await test_hard_cap_fires_regardless()
-    await test_turn_budget_waits_for_the_reply()
-    print("\nall live-hygiene tests passed")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
 
 
 async def test_a_short_reply_is_not_held_waiting_for_more():
-    """A reply shorter than the reserve still goes out, on the deadline.
+    """A reply shorter than the reserve still goes out, on its own clock.
 
     The model can stop sending audio altogether after a short answer, so a
-    reserve that waits to fill would hold "Done." for ever.
+    reserve released only when the next frame arrives would hold "Done."
+    for ever: it is released by a timer the filter owns.
     """
     f = _OutputSilenceFilter.__new__(_OutputSilenceFilter)
     f._dropped = f._sent = f._burst_frames = 0
-    f._last_sent_at = f._last_loud_at = f._preroll_since = 0.0
-    f._preroll, f._preroll_seconds = [], 0.0
-    sent = []
+    f._last_sent_at = f._last_loud_at = 0.0
+    f._preroll, f._preroll_seconds, f._preroll_task = [], 0.0, None
+    sent, timers = [], []
 
     async def _push(frame, direction):
         sent.append(frame)
 
+    def _create_task(coro, *a, **kw):
+        timers.append(coro)  # the deadline, fired by hand below
+        return None
+
     f.push_frame = _push
+    f.create_task = _create_task
 
     class _Frame:
         num_channels, sample_rate = 1, 24000
@@ -552,9 +566,13 @@ async def test_a_short_reply_is_not_held_waiting_for_more():
         await f._forward(_Frame(), 2000.0, t, None)
         t += 0.02
     assert not sent, "held while the reserve fills"
-    t += 1.7  # past the deadline
-    await f._forward(_Frame(), 2000.0, t, None)
-    assert len(sent) == 11, f"the whole short reply goes out on the deadline: {len(sent)}"
+    assert len(timers) == 1, "a deadline is armed when the reserve starts filling"
+
+    await f._flush_preroll(None)  # what the deadline does when it fires
+    assert len(sent) == 10, f"the whole short reply goes out: {len(sent)}"
+    assert not f._preroll
+    for coro in timers:
+        coro.close()
     print("PASS: a short reply is not held waiting for more")
 
 
@@ -585,3 +603,82 @@ def test_no_accidental_overrides_of_pipecat():
     unexpected = (ours & parent) - intended
     assert not unexpected, f"shadows a pipecat method by accident: {sorted(unexpected)}"
     print("PASS: no accidental overrides of pipecat")
+
+
+def test_the_prompt_is_not_mistaken_for_a_request():
+    """A transcriber handed silence reads its own prompt back.
+
+    Both transcribers get the same vocabulary prompt, so this is the one
+    mishearing they can agree on, and what they agree on is a command:
+    left alone it would turn the lights off on an empty room.
+    """
+    echo = (
+        "Turn the living room lights off, put Netflix on the TV, what time is it, "
+        "what's the weather, play music in the den, set a timer, how's it going."
+    )
+    assert echoes_vocabulary(echo)
+    assert echoes_vocabulary(echo.lower().replace(".", ""))
+    # What someone actually says is one of those, not the list.
+    assert not echoes_vocabulary("turn the living room lights off")
+    assert not echoes_vocabulary("what time is it")
+    assert not echoes_vocabulary("put netflix on the tv and turn the lights off")
+    print("PASS: the prompt read back is not mistaken for a request")
+
+
+async def test_nothing_is_said_into_a_wake_that_is_over():
+    """A check that comes back after the wake ended says nothing.
+
+    The mic runs for a few seconds after the session closes, so an
+    utterance can close, and come back read, with nobody to say it to.
+    Sending it anyway put an event on a closed session, OpenAI answered
+    "the first Live event must be session.start", and the service was torn
+    down for the rest of the night (2026-09-20).
+    """
+    svc = _FallbackOnly()
+    said = []
+
+    async def _append(*a, **kw):
+        said.append(a)
+
+    svc._send_context_append = _append
+    svc._utterance_acted = False
+
+    svc._device_present = False
+    await svc._unreadable(first=True)
+    assert not said, "spoke into a closed session"
+
+    svc._device_present = True
+    await svc._unreadable(first=True)
+    assert said, "stayed silent with the device still there"
+
+    # And a queued check is not even read back once the wake is over.
+    read = []
+
+    async def _verify(*a, **kw):
+        read.append(a)
+
+    svc._verify_utterance = _verify
+    svc._verifying = False
+    svc._device_present = False
+    await svc._check_utterances((0.0, 1.0))
+    assert not read, "transcribed for a wake that had ended"
+    print("PASS: nothing is said into a wake that is over")
+
+
+
+async def main():
+    """Run every test in the file, in the order they are written.
+
+    Named one by one, a test written below the entry point is never run:
+    two of these sat there passing in name only until the file was read
+    (2026-09-20).
+    """
+    for name, fn in [(k, v) for k, v in list(globals().items()) if k.startswith("test_")]:
+        result = fn()
+        if inspect.isawaitable(result):
+            await result
+    print("\nall live-hygiene tests passed")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
