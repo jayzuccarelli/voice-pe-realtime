@@ -139,6 +139,8 @@ class _FallbackOnly(VoicePELiveService):
 
     def __init__(self):
         self._fallback_enabled = True
+        self._request_known = False
+        self._answer_text_started = False
         self._reset_fallback()
 
 
@@ -148,13 +150,14 @@ def _mic_frame(ms: int = 20) -> InputAudioRawFrame:
     )
 
 
-async def test_fallback_tracks_only_the_first_utterance():
-    """The first thing said after the wake is bounded once; the room after it is not.
+async def test_every_utterance_is_bounded_for_checking():
+    """Each thing said is bounded on its own, the follow-ups included.
 
-    A blip shorter than 100 ms does not open it, a pause shorter than 700 ms
-    does not close it, and once it has closed nothing else (a TV, a second
-    remark) is ever handed to the model as text: the wake word gated one
-    request.
+    A blip shorter than 100 ms does not open one, a pause shorter than
+    700 ms does not close one. The first is cut from the wake, since Silero
+    flags only about half of a short far-field question; a follow-up is cut
+    from just before itself, so it is not read together with everything
+    already said and answered.
     """
     svc = _FallbackOnly()
 
@@ -172,13 +175,26 @@ async def test_fallback_tracks_only_the_first_utterance():
     assert feed(True, 1500) is None  # the question
     assert feed(False, 400) is None  # a mid-sentence pause
     assert feed(True, 500) is None  # ...the question continues
-    seg = feed(False, 1000)  # quiet: the utterance is over
-    assert seg is not None, "the utterance never closed"
-    start, end = seg
-    assert abs(start - 0.76) < 0.03 and abs(end - 3.16) < 0.03, seg
-    assert len(svc._fallback_slice(end)) == int((end + 0.5) * 48000)  # from the wake, not Silero
-    assert feed(True, 1500) is None and feed(False, 1000) is None, "a second utterance was bounded"
-    print("PASS: only the first utterance after the wake is bounded for transcription")
+    first = feed(False, 1000)  # quiet: the utterance is over
+    assert first is not None, "the utterance never closed"
+    start, end = first
+    assert abs(start - 0.76) < 0.03 and abs(end - 3.16) < 0.03, first
+    assert svc._utterances == 1
+    # The first is read from the wake, so nothing of it can be missed.
+    assert len(svc._fallback_slice(start, end)) == int((end + 0.5) * 48000)
+
+    # A follow-up a few seconds later is bounded too, and read alone.
+    assert feed(False, 3000) is None
+    assert feed(True, 1200) is None
+    second = feed(False, 1000)
+    assert second is not None, "the follow-up was never bounded"
+    s2, e2 = second
+    assert s2 > end, second
+    assert svc._utterances == 2
+    clip = svc._fallback_slice(s2, e2)
+    assert len(clip) == int((e2 + 0.5) * 48000) - int((s2 - 0.5) * 48000), "cut around the follow-up"
+    assert len(clip) < int((e2 + 0.5) * 48000), "not the whole conversation"
+    print("PASS: every utterance is bounded, the first from the wake")
 
 
 async def test_fallback_gives_up_on_speech_that_never_stops():
@@ -264,6 +280,7 @@ class _HoldOnly(VoicePELiveService):
     def __init__(self):
         self._request_known = False
         self._answer_text_started = False
+        self._live_heard_at = None
         self._live_open_responses = set()
         self._response_started = {}
         self._backstop_at = None

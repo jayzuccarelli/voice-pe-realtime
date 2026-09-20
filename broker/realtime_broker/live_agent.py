@@ -236,7 +236,7 @@ class VoicePELiveService(OpenAILiveLLMService):
     async def _open_turn(self, role: str) -> None:
         if role == "user":
             self._user_turn_seen = True
-            self._request_known = True
+            self._live_heard_at = time.monotonic()
             # A new request: its answer has not been written yet.
             self._answer_text_started = False
         else:
@@ -250,6 +250,8 @@ class VoicePELiveService(OpenAILiveLLMService):
         if turn.open and turn.text.strip():
             logger.info("Live %s said: %r", "user" if role == "user" else "model", turn.text.strip())
             self._remember(role, turn.text)
+            if role == "user":
+                self._live_text = turn.text.strip()
         await super()._end_turn(role)
 
     #
@@ -357,7 +359,10 @@ class VoicePELiveService(OpenAILiveLLMService):
     _FALLBACK_MODEL_GRACE_SECONDS = 1.0
 
     def _reset_fallback(self) -> None:
-        self._fallback_done = False
+        self._verifying = False
+        self._utterances = 0
+        self._live_text = ""
+        self._live_heard_at = None
         self._model_spoke = False
         self._fb_audio = bytearray()
         self._fb_rate = 0
@@ -367,6 +372,15 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._fb_quiet_seconds = 0.0
         self._fb_seg_start = None
         self._sent_seconds = 0.0  # mic audio actually sent to the model this session
+
+    def _end_utterance(self) -> tuple[float, float]:
+        """Close the utterance being tracked and return its bounds."""
+        bounds = (self._fb_seg_start, self._fb_seconds - self._fb_quiet_seconds)
+        self._fb_seg_start = None
+        self._fb_quiet_seconds = 0.0
+        self._fb_speech_seconds = 0.0
+        self._utterances += 1
+        return bounds
 
     def _track_fallback_segment(
         self, frame: InputAudioRawFrame, speech: bool
@@ -382,11 +396,14 @@ class VoicePELiveService(OpenAILiveLLMService):
         Silero, and if the model has not opened a turn on it by the time the
         speaker goes quiet, the words go to it as text instead.
 
-        Once per wake, and only the first utterance: the wake word gated
-        exactly one request, and anything after it (a TV, the room) is not
-        one. Follow-ups after a reply stay the model's job.
+        Every utterance, not only the first: the model's hearing is no
+        better on a follow-up, and left to it the answers went with it.
+        Across one real exchange it read "you didn't catch that, dude" as
+        "again, catch up" and "fuck off" as "ha ha", and answered those
+        (2026-09-20). What it produces is a plausible continuation, not a
+        transcription, so every turn is checked against one.
         """
-        if not self._fallback_enabled or self._fallback_done:
+        if not self._fallback_enabled or self._verifying:
             return None
         secs = self._frame_seconds(frame)
         if not self._fb_rate:
@@ -406,6 +423,12 @@ class VoicePELiveService(OpenAILiveLLMService):
                 and self._fb_speech_seconds >= self._FALLBACK_START_SECONDS
             ):
                 self._fb_seg_start = self._fb_seconds - self._fb_speech_seconds
+                # Someone is speaking again: what they want is not known
+                # until this utterance has been read back.
+                self._live_text = ""
+                self._live_heard_at = None
+                self._request_known = False
+                self._answer_text_started = False
         else:
             self._fb_speech_seconds = 0.0
             if self._fb_seg_start is not None:
@@ -413,27 +436,30 @@ class VoicePELiveService(OpenAILiveLLMService):
         if self._fb_seg_start is None:
             return None
         if self._fb_quiet_seconds >= self._FALLBACK_QUIET_SECONDS:
-            self._fallback_done = True
-            return (self._fb_seg_start, self._fb_seconds - self._fb_quiet_seconds)
+            return self._end_utterance()
         if self._fb_seconds - self._fb_seg_start >= self._FALLBACK_MAX_SECONDS:
-            self._fallback_done = True
-            return (self._fb_seg_start, self._fb_seconds)
+            self._fb_quiet_seconds = 0.0
+            return self._end_utterance()
         return None
 
-    def _fallback_slice(self, end: float) -> bytes:
-        """Everything heard from the wake to just after the utterance.
+    def _fallback_slice(self, start: float, end: float) -> bytes:
+        """The audio of one utterance, with a little either side.
 
-        From the wake, not from where Silero first fired: at its default
-        confidence it flags about half of a short far-field question, and a
-        transcriber given the lead-in as well loses no words to that. The
-        wake word gated this one request, so nothing before it is in here.
+        The first utterance is cut from the wake rather than from where
+        Silero first fired: at its default confidence it flags about half of
+        a short far-field question, and a transcriber given the lead-in as
+        well loses no words to that. Later ones are cut from just before the
+        utterance, so a follow-up is not read together with everything
+        already said and answered.
         """
+        a = 0.0 if self._utterances <= 1 else max(0.0, start - self._FALLBACK_TAIL_SECONDS)
+        a = max(0.0, a - self._fb_origin)
         b = end + self._FALLBACK_TAIL_SECONDS - self._fb_origin
         # Whole 16-bit samples only. Cut at a time-derived byte offset, about
         # one clip in fourteen came out an odd length, and the transcriber
         # rejects that WAV as "unsupported format", taking the backstop down
         # for the wake (2026-09-19).
-        return bytes(self._fb_audio[: int(b * self._fb_rate) * 2])
+        return bytes(self._fb_audio[int(a * self._fb_rate) * 2 : int(b * self._fb_rate) * 2])
 
     def _model_heard_it(self) -> bool:
         # Only a user transcript counts. The model also starts talking, and
@@ -444,9 +470,18 @@ class VoicePELiveService(OpenAILiveLLMService):
         return self._user_turn_seen
 
     async def _run_fallback(self, start: float, end: float) -> None:
+        """Read one utterance back and, if the model misheard it, correct it."""
+        self._verifying = True
+        first = self._utterances <= 1
+        try:
+            await self._verify_utterance(start, end, first)
+        finally:
+            self._verifying = False
+
+    async def _verify_utterance(self, start: float, end: float, first: bool) -> None:
         # The model hears the same audio at real-time pace, a little behind
         # the mic while the opening seconds replay: wait until it has the
-        # whole utterance, then give it a moment to open the turn itself.
+        # whole utterance, then give it a moment to transcribe it itself.
         deadline = asyncio.get_running_loop().time() + 5.0
         while (
             self._sent_seconds < end + self._FALLBACK_TAIL_SECONDS
@@ -454,13 +489,10 @@ class VoicePELiveService(OpenAILiveLLMService):
         ):
             await asyncio.sleep(0.05)
         await asyncio.sleep(self._FALLBACK_MODEL_GRACE_SECONDS)
-        if self._model_heard_it():
-            logger.info("Live fallback: the model heard the user itself")
-            return
-        clip = self._fallback_slice(end)
+        clip = self._fallback_slice(start, end)
         if not self._fb_rate or len(clip) < int(0.3 * self._fb_rate * 2):
-            logger.info("Live fallback: only %d bytes of audio to transcribe; skipping", len(clip))
-            await self._say_unheard()
+            logger.info("Live check: only %d bytes of audio; skipping", len(clip))
+            await self._unreadable(first)
             return
         if self._fallback_check_model:
             text, check = await asyncio.gather(
@@ -469,12 +501,10 @@ class VoicePELiveService(OpenAILiveLLMService):
             )
         else:
             text, check = await self._transcribe(clip, self._fallback_model), None
-        if self._model_heard_it():
-            logger.info("Live fallback: heard %r, but the model heard it too", text)
-            return
+        live = self._live_text
         if len(text.split()) < 2:
-            logger.info("Live fallback: heard %r; too little to act on", text)
-            await self._say_unheard()
+            logger.info("Live check: read %r; too little to act on (model heard %r)", text, live)
+            await self._unreadable(first)
             return
         if check is not None and not transcripts_agree(text, check):
             # Handing the model a transcript that is not what was said is
@@ -485,11 +515,18 @@ class VoicePELiveService(OpenAILiveLLMService):
             # they differ the audio was not intelligible and the honest
             # answer is to ask again, once.
             logger.info(
-                "Live fallback: transcribers disagree (%r vs %r); asking to repeat", text, check
+                "Live check: transcribers disagree (%r vs %r); asking to repeat", text, check
             )
-            await self._say_unheard()
+            await self._unreadable(first)
             return
-        logger.info("Live fallback: heard %r; handing it to the model as text", text)
+        if live and transcripts_agree(live, text):
+            logger.info("Live check: the model heard %r correctly", live)
+            self._request_known = True
+            return
+        if live:
+            logger.info("Live check: the model heard %r, but they said %r; correcting", live, text)
+        else:
+            logger.info("Live check: the model heard nothing; they said %r", text)
         self._remember("user", text)
         from pipecat.services.openai.live import events
 
@@ -507,12 +544,22 @@ class VoicePELiveService(OpenAILiveLLMService):
         await self.send_client_event(events.ResponseItemCreateEvent(item=item))
         await self.send_client_event(events.ResponseCreateEvent())
 
-    async def _say_unheard(self) -> None:
-        """Tell the user, once, that they were not understood."""
-        if self._model_heard_it():
-            return
+    async def _unreadable(self, first: bool) -> None:
+        """Nothing could be read back from this utterance.
+
+        After the wake word, or when the model thinks it heard something,
+        someone was talking to it and deserves to be told. Otherwise it was
+        the room, and the honest response is to stay quiet. Never when the
+        model has already acted on it: "I didn't catch that" on top of
+        "Done, those lights are off" is two answers to one request, and one
+        of them is a lie (2026-09-20).
+        """
         self._request_known = True
-        await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
+        if self._wake_acted:
+            logger.info("Live check: could not read it back, but the house was already acted on")
+            return
+        if first or self._live_text:
+            await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
 
     async def _transcribe(self, pcm: bytes, model: str) -> str:
         import io
@@ -590,6 +637,11 @@ class VoicePELiveService(OpenAILiveLLMService):
         """
         return self._request_known
 
+    #: How long the model is held back waiting to be checked. Long enough
+    #: for two transcriptions of a few seconds of audio; past it, whatever
+    #: the model made of the audio is all there is.
+    _VERIFY_DEADLINE_SECONDS = 4.0
+
     def output_hold(self) -> tuple[bool, bool]:
         """Whether the model must not be heard now, and whether what it says
         now is probably the start of the answer.
@@ -604,7 +656,15 @@ class VoicePELiveService(OpenAILiveLLMService):
         held but kept, and replayed if it turns out to be the answer.
         """
         if not self._request_known:
-            return True, False
+            if (
+                self._live_heard_at is not None
+                and time.monotonic() - self._live_heard_at > self._VERIFY_DEADLINE_SECONDS
+            ):
+                # The check never came back; the model's own hearing is all
+                # there is, and silence would be worse.
+                self._request_known = True
+            else:
+                return True, False
         if self._answer_text_started:
             return False, False
         if self._live_open_responses or self._backstop_at is not None:
