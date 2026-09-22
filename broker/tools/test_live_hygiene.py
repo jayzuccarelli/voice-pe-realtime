@@ -144,6 +144,7 @@ class _FallbackOnly(VoicePELiveService):
 
     def __init__(self):
         self._fallback_enabled = True
+        self._open_function_calls = {}
         self._request_known = False
         self._answer_text_started = False
         self._reset_fallback()
@@ -663,6 +664,53 @@ async def test_nothing_is_said_into_a_wake_that_is_over():
     await svc._check_utterances((0.0, 1.0))
     assert not read, "transcribed for a wake that had ended"
     print("PASS: nothing is said into a wake that is over")
+
+
+
+async def test_a_tool_that_never_answers_does_not_mute_the_model():
+    """Every function call gets exactly one output, whatever the tool does.
+
+    The MCP call is awaited with no timeout, so a Home Assistant tool that
+    takes a request and never returns leaves the call open for the life of
+    the socket, which is kept warm between wakes. The API then refuses
+    every `response.create`, and the model is mute for that wake and for
+    every wake after it (2026-09-22).
+    """
+    svc = _FallbackOnly()
+    svc._device_present = True
+    svc._TOOL_ANSWER_SECONDS = 0.02
+    answered = []
+
+    async def _out(call_id, output):
+        answered.append((call_id, output))
+        svc._open_function_calls.pop(call_id, None)
+
+    svc._send_function_call_output = _out
+
+    svc._open_function_calls["stuck"] = "response-1"
+    await svc._answer_if_stuck("stuck")
+    assert [c for c, _ in answered] == ["stuck"], "the stuck call was never answered"
+    assert "error" in answered[0][1]
+    assert not svc._open_function_calls, "the call is closed once answered"
+
+    # A call the tool answered itself is not answered a second time: the
+    # API takes one output per call and rejects the second.
+    answered.clear()
+    await svc._answer_if_stuck("already-done")
+    assert not answered
+
+    # And nothing is written into a wake that is over.
+    svc._open_function_calls["late"] = "response-2"
+    svc._device_present = False
+    await svc._answer_if_stuck("late")
+    assert not answered, "wrote into a closed session"
+    assert "late" not in svc._open_function_calls, "left a call to poison the next wake"
+
+    # The backstop waits for open calls, and gives up rather than hanging.
+    svc._TOOL_ANSWER_SECONDS = 0.0
+    svc._open_function_calls["never"] = "response-3"
+    await svc._await_open_calls()
+    print("PASS: a tool that never answers does not mute the model")
 
 
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import array
 import asyncio
+import json
 import logging
 import os
 import pathlib
@@ -205,10 +206,17 @@ class VoicePELiveService(OpenAILiveLLMService):
         """Whether a tool only looks things up. Home Assistant's are named Get*."""
         return name.startswith("Get") or name == "get_weather"
 
+    #: How long a tool has to come back before the broker answers for it.
+    #: Home Assistant answers in milliseconds; this is the point past which
+    #: it is not coming, and still leaves the model time to speak inside
+    #: the hygiene watcher's 12 s.
+    _TOOL_ANSWER_SECONDS = 6.0
+
     async def _run_function_call(self, runner_item) -> None:
         if not self._is_read_only_tool(runner_item.function_name):
             self._wake_acted = True
             self._utterance_acted = True
+        self.create_task(self._answer_if_stuck(runner_item.tool_call_id))
         args = runner_item.arguments
         if isinstance(args, dict):
             # The backend fills every slot of a Home Assistant tool, empty
@@ -233,6 +241,42 @@ class VoicePELiveService(OpenAILiveLLMService):
                 )
             runner_item.arguments = args
         await super()._run_function_call(runner_item)
+
+    async def _answer_if_stuck(self, call_id: str) -> None:
+        """Answer a function call that the tool never answered.
+
+        The MCP call is awaited with no timeout, so a Home Assistant tool
+        that takes the request and never returns leaves the call open for
+        the life of the socket, which we deliberately keep warm between
+        wakes. The Live API refuses every `response.create` while one is
+        unanswered, so the model goes mute: not for that wake, but for
+        every wake after it. One evening it launched an app on the TV and
+        then said nothing, twice, while the puck played silence
+        (2026-09-22). Exactly one output per call is the API's invariant,
+        and the broker keeps it whatever the tool does.
+        """
+        await asyncio.sleep(self._TOOL_ANSWER_SECONDS)
+        if call_id not in self._open_function_calls:
+            return
+        if not self._device_present:
+            # Nobody to answer; drop it rather than write to a closed session.
+            self._open_function_calls.pop(call_id, None)
+            return
+        logger.warning("Tool call %s never came back; answering it so the model can reply", call_id)
+        await self._send_function_call_output(
+            call_id, json.dumps({"error": "The device did not answer in time."})
+        )
+
+    async def _await_open_calls(self) -> None:
+        """Wait until every function call has been answered.
+
+        `response.create` with one still open is rejected outright and
+        takes the service down with it, so the backstop never asks for a
+        reply over the top of a tool call.
+        """
+        deadline = time.monotonic() + self._TOOL_ANSWER_SECONDS + 1.0
+        while self._open_function_calls and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
 
     async def _open_turn(self, role: str) -> None:
         if role == "user":
@@ -569,6 +613,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         # wake before (2026-09-19). The output filter holds it back.
         self._backstop_at = time.monotonic()
         self._request_known = True
+        await self._await_open_calls()
         await self.send_client_event(events.ResponseItemCreateEvent(item=item))
         await self.send_client_event(events.ResponseCreateEvent())
 
@@ -589,6 +634,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             logger.info("Live check: could not read it back, but the house was already acted on")
             return
         if first or self._live_text:
+            await self._await_open_calls()
             await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
 
     async def _transcribe(self, pcm: bytes, model: str) -> str:
@@ -950,6 +996,10 @@ class VoicePELiveService(OpenAILiveLLMService):
         # A fresh session owns no delegations. Clearing here is what makes a
         # late completion from the previous session harmless.
         self._live_open_responses.clear()
+        # A call the tool never answered belongs to a wake that is over.
+        # Left in place it is pending for the life of the socket, and the
+        # socket is deliberately kept warm between wakes (2026-09-22).
+        self._open_function_calls.clear()
         self._response_started.clear()
         self._backstop_at = None
         self._answer_text_started = False
