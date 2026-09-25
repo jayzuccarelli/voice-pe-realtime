@@ -714,6 +714,36 @@ async def test_a_tool_that_never_answers_does_not_mute_the_model():
 
 
 
+async def test_it_never_apologises_over_its_own_answer():
+    """"I didn't catch that" is never said on top of an answer.
+
+    The check failing to read the audio back says nothing about whether
+    the model heard it. It answered "Humans live on Earth.", the two
+    transcribers then disagreed with each other, and it apologised over
+    the top of its own correct answer (2026-09-25).
+    """
+    svc = _FallbackOnly()
+    svc._device_present = True
+    svc._utterance_acted = False
+    said = []
+
+    async def _append(*a, **kw):
+        said.append(a)
+
+    svc._send_context_append = _append
+
+    svc._answer_text_started = True
+    await svc._unreadable(first=True)
+    assert not said, "apologised over its own answer"
+
+    # With nothing answered and nothing done, it still speaks up.
+    svc._answer_text_started = False
+    await svc._unreadable(first=True)
+    assert said, "stayed silent when it really had not caught it"
+    print("PASS: it never apologises over its own answer")
+
+
+
 async def main():
     """Run every test in the file, in the order they are written.
 

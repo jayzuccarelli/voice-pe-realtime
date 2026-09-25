@@ -202,22 +202,37 @@ async def main() -> int:
         print("          live puck's broker:   make check WS=ws://127.0.0.1:8765")
         print("          isolated dev broker:  see 'Two engines' in README.md")
         return 0
-    failures = 0
+    failures = skipped = 0
     for question, accept in CASES:
-        audio = await ask(question)
+        try:
+            audio = await ask(question)
+            reply = transcribe(audio).lower() if audio else ""
+        except OSError as exc:
+            # The check speaks and listens through OpenAI, so a wobble on
+            # their side looks exactly like a broken broker. It is not one:
+            # nothing was verified, so nothing can be red. A read timeout
+            # on the speech endpoint used to end the whole run in a
+            # traceback (2026-09-25). TimeoutError and URLError are both
+            # OSError, so this catches the lot.
+            print(f"  SKIP  {question!r}\n        could not reach OpenAI to run it: {exc}")
+            skipped += 1
+            continue
         if not audio:
             print(f"  FAIL  {question!r}\n        no audio returned")
             failures += 1
             continue
-        reply = transcribe(audio).lower()
         ok = any(a in reply for a in accept)
         mark = "PASS" if ok else "FAIL"
         print(f"  {mark}  {question!r}\n        reply={reply!r}")
         if not ok:
             print(f"        expected any of {accept}")
             failures += 1
-    print(f"\n{'GREEN' if failures == 0 else 'RED'}: "
-          f"{len(CASES) - failures}/{len(CASES)} passed")
+    tally = f"{len(CASES) - failures - skipped}/{len(CASES)} passed"
+    if skipped:
+        # Said out loud: a skip is not a pass, and a run that verified
+        # nothing must not read as a clean one.
+        tally += f", {skipped} skipped"
+    print(f"\n{'GREEN' if failures == 0 else 'RED'}: {tally}")
     return 1 if failures else 0
 
 

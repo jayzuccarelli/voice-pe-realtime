@@ -633,6 +633,14 @@ class VoicePELiveService(OpenAILiveLLMService):
         if self._utterance_acted:
             logger.info("Live check: could not read it back, but the house was already acted on")
             return
+        if self._answer_text_started:
+            # It has already answered this one. "I'm sorry, I didn't catch
+            # that" on top of "Humans live on Earth." is two answers to one
+            # question and the second is false: the check failing to read
+            # the audio back says nothing about whether the model heard it
+            # (2026-09-25).
+            logger.info("Live check: could not read it back, but it has already answered")
+            return
         if first or self._live_text:
             await self._await_open_calls()
             await self._send_context_append(None, UNHEARD_PROMPT, spoken=True)
