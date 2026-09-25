@@ -145,6 +145,8 @@ class _FallbackOnly(VoicePELiveService):
     def __init__(self):
         self._fallback_enabled = True
         self._open_function_calls = {}
+        self._live_open_responses = set()
+        self._utterance_answered = False
         self._request_known = False
         self._answer_text_started = False
         self._reset_fallback()
@@ -732,12 +734,23 @@ async def test_it_never_apologises_over_its_own_answer():
 
     svc._send_context_append = _append
 
-    svc._answer_text_started = True
+    svc._live_open_responses = set()
+
+    # A direct answer, with no delegation: this is the one that used to slip
+    # through, because only a delegated answer set _answer_text_started.
+    svc._utterance_answered = True
+    svc._answer_text_started = False
     await svc._unreadable(first=True)
     assert not said, "apologised over its own answer"
 
-    # With nothing answered and nothing done, it still speaks up.
-    svc._answer_text_started = False
+    # The backend is still writing the answer: it is coming, so stay quiet.
+    svc._utterance_answered = False
+    svc._live_open_responses = {"resp-1"}
+    await svc._unreadable(first=True)
+    assert not said, "apologised while the answer was still being written"
+
+    # Nothing answered, nothing in flight, nothing done: it speaks up.
+    svc._live_open_responses = set()
     await svc._unreadable(first=True)
     assert said, "stayed silent when it really had not caught it"
     print("PASS: it never apologises over its own answer")
