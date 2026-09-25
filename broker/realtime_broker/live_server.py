@@ -30,6 +30,7 @@ from pipecat.frames.frames import (
     EndFrame,
     Frame,
     FunctionCallInProgressFrame,
+    InterruptionFrame,
     LLMRunFrame,
     OutputAudioRawFrame,
     UserStartedSpeakingFrame,
@@ -231,6 +232,18 @@ class _OutputSilenceFilter(FrameProcessor):
             for out in admitted:
                 await self._forward(out, rms if out is frame else _rms16(out.audio), now, direction)
             return
+        if isinstance(frame, InterruptionFrame):
+            # Someone started talking over the reply. The reserve holds up
+            # to 1.2 s of what the model was about to say; sending it now
+            # would talk over them for another second after they cut in,
+            # which is the opposite of being interruptible. It is dropped,
+            # not flushed.
+            dropped, self._preroll = len(self._preroll), []
+            self._preroll_seconds = 0.0
+            self._muting = False
+            self._run, self._runs, self._run_keep = [], 0, False
+            if dropped:
+                logger.info("output: interrupted; dropped %d held frames", dropped)
         if isinstance(frame, (EndFrame, CancelFrame)):
             # Nothing more is coming: whatever is held goes now, in order,
             # before the frame that ends the stream.

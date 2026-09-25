@@ -499,10 +499,17 @@ void VoiceAssistantWebSocket::on_microphone_data_(const std::vector<uint8_t> &da
     return;
   }
   
-  // Block microphone audio if bot is currently speaking
-  if (this->is_bot_speaking()) {
-    return;  // Don't send microphone audio while bot is speaking
-  }
+  // The microphone stays open while the speaker plays, which is what makes
+  // it interruptible: a duplex model can only stop for you if it can hear
+  // you. The guard this replaces was written for a turn-based assistant,
+  // where the model spoke and then listened, and nothing was lost by going
+  // deaf in between.
+  //
+  // What reaches the socket is the XMOS chip's echo-cancelled channel (the
+  // left of the stereo pair, taken below), not the raw microphones, so the
+  // speaker's own output is removed before it is sent. is_bot_speaking()
+  // is kept: the wake word still uses it to tell a barge-in from a fresh
+  // start.
   
   // Microphone is configured for 16kHz, 32-bit, stereo (required by micro_wake_word)
   // OpenAI expects 24kHz, 16-bit, mono (non-beta API requirement)
