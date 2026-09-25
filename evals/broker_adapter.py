@@ -33,6 +33,7 @@ import uuid
 from array import array
 
 import websockets
+import contextlib
 
 PORT = 8790
 BROKER_WS = "ws://127.0.0.1:8766"
@@ -46,6 +47,7 @@ SPEECH_RMS = 300
 VOICED_RMS = 150
 INPUT_QUIET_MS = 700
 OUTPUT_QUIET_MS = 1000
+DELEGATION_IDLE_S = 1.5
 
 ENV = pathlib.Path(__file__).resolve().parent.parent / "broker" / ".env"
 KEY = next(
@@ -90,6 +92,12 @@ def transcribe(pcm: bytes) -> str:
 def house_calls() -> int:
     with urllib.request.urlopen(HOUSE + "/executions", timeout=5) as r:
         return len(json.loads(r.read()))
+
+
+def last_call_summary() -> str:
+    with urllib.request.urlopen(HOUSE + "/executions", timeout=5) as r:
+        last = json.loads(r.read())[-1]
+    return f"{last['name']} {last['status']}: {json.dumps(last['output'])[:300]}"
 
 
 class Segment:
@@ -162,10 +170,8 @@ async def handle(client) -> None:
             if kind != "session.input_audio.append":
                 continue
             pcm = base64.b64decode(event["audio"])
-            try:
+            with contextlib.suppress(websockets.ConnectionClosed):
                 await broker.send(pcm)
-            except websockets.ConnectionClosed:
-                pass
             at_ms = round(in_samples * 1000 / RATE)
             in_samples += len(pcm) // 2
             if rms(pcm) >= SPEECH_RMS:
@@ -204,17 +210,47 @@ async def handle(client) -> None:
 
     async def watch() -> None:
         nonlocal out
-        delegated = False
+        # A delegation, as GPT-Live reports one: opened with a response id,
+        # then response.created / response.completed wrapped in response.event.
+        # The harness holds the turn open while a delegation is active, so it
+        # must be closed: here, once the house has seen no new tool call for
+        # DELEGATION_IDLE_S. Without the close every tool scenario timed out.
+        delegation_id = f"deleg_{s.id}"
+        response_id = f"resp_{s.id}"
+        calls_seen, last_call_at, open_ = baseline_calls, 0.0, False
+
+        async def lifecycle(kind: str, status: str) -> None:
+            await s.emit({"type": "response.event", "delegation_id": delegation_id,
+                          "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                          "event": {"type": kind, "response": {"id": response_id, "status": status, "output": []}}})
+
         while not s.closed:
             await asyncio.sleep(0.2)
             if out.start_ms is not None and (time.monotonic() - out.last_voice_at) * 1000 >= OUTPUT_QUIET_MS:
                 s.spawn(s.report("session.output_transcript.delta", out, out.end_ms))
                 out = Segment()
-            if not delegated and await asyncio.to_thread(house_calls) > baseline_calls:
-                delegated = True
-                await s.emit({"type": "session.delegation.created", "offset_ms": s.now_ms(),
-                              "delegation": {"id": f"deleg_{s.id}", "type": "delegation", "target": "broker"},
-                              "event_id": f"event_{uuid.uuid4().hex[:16]}"})
+            calls = await asyncio.to_thread(house_calls)
+            if calls > calls_seen:
+                calls_seen, last_call_at = calls, time.monotonic()
+                if not open_ and last_call_at:
+                    open_ = True
+                    await s.emit({"type": "session.delegation.created", "offset_ms": s.now_ms(),
+                                  "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                                  "delegation": {"id": delegation_id, "type": "delegation",
+                                                 "response_id": response_id, "target": "responses"}})
+                    await lifecycle("response.created", "in_progress")
+                # The backend's returned text, sent when the call lands: the
+                # fake house answers instantly, which is when a real backend
+                # would hand its result back. The harness only accepts an
+                # assistant turn that starts after returned text as the reply.
+                await s.emit({"type": "response.event", "delegation_id": delegation_id,
+                              "event_id": f"event_{uuid.uuid4().hex[:16]}",
+                              "event": {"type": "response.output_text.done", "response_id": response_id,
+                                        "item_id": f"msg_{s.id}_{calls}",
+                                        "text": await asyncio.to_thread(last_call_summary)}})
+            if open_ and time.monotonic() - last_call_at >= DELEGATION_IDLE_S:
+                open_ = False
+                await lifecycle("response.completed", "completed")
 
     tasks = [asyncio.create_task(downlink()), asyncio.create_task(watch())]
     try:
@@ -228,11 +264,9 @@ async def handle(client) -> None:
         await broker.close()
         if s.pending:
             await asyncio.wait(s.pending, timeout=5)
-        try:
+        with contextlib.suppress(websockets.ConnectionClosed):
             await s.emit({"type": "session.closed", "reason": "close_requested", "session": session_info,
                           "usage": {"seconds": round(s.now_ms() / 1000, 1)}})
-        except websockets.ConnectionClosed:
-            pass
         print(f"[{s.id}] closed after {s.now_ms()} ms")
 
 

@@ -10,9 +10,16 @@ harness, and what comes out is a pass rate per scenario and P50/P90 latency.
     ... --against-baseline  exit 1 if any variant's pass rate fell below the bar
 
 Variants:
-    raw     gpt-live-1 with the production persona prompt and nothing else
-    guided  the same plus the broker's delegation guidance
-    broker  the production broker under test, through evals/broker_adapter.py
+    raw            gpt-live-1 with the production persona prompt and nothing else
+    guided         the same plus the broker's delegation guidance
+    broker         the production broker, through evals/broker_adapter.py
+    broker_nohold  the broker with the output hold off
+    broker_thin    the broker with the output hold and the backstop transcriber off
+
+Broker variants restart the dev broker (evals/dev_broker.sh) with their
+settings first, and need evals/fake_house_server.py and evals/broker_adapter.py
+running. The backstop alone cannot be switched off: without it nothing marks a
+request as heard and the output hold mutes the model for good.
 """
 
 from __future__ import annotations
@@ -32,14 +39,45 @@ BASELINE = HERE / "baseline.json"
 ENV_FILE = HERE.parent / "broker" / ".env"
 BACKEND_MODEL = "gpt-5.4-mini"  # production's LIVE_BACKEND_MODEL
 
+BROKER_ENDPOINT = {
+    "GPT_LIVE_EVALS_PROMPT": "raw",
+    "OPENAI_LIVE_ENDPOINT": "ws://127.0.0.1:8790/v1/live/sessions",
+    "OPENAI_LIVE_ALLOW_INSECURE_LOOPBACK": "true",
+    "GPT_LIVE_EVALS_HOUSE_URL": "http://127.0.0.1:8791",
+}
 VARIANTS = {
     "raw": {"GPT_LIVE_EVALS_PROMPT": "raw"},
     "guided": {"GPT_LIVE_EVALS_PROMPT": "guided"},
-    "broker": {"GPT_LIVE_EVALS_PROMPT": "raw", "OPENAI_LIVE_ENDPOINT": "ws://127.0.0.1:8790/v1/live/sessions",
-               "OPENAI_LIVE_ALLOW_INSECURE_LOOPBACK": "true", "GPT_LIVE_EVALS_HOUSE_URL": "http://127.0.0.1:8791"},
+    "broker": BROKER_ENDPOINT,
+    "broker_nohold": BROKER_ENDPOINT,
+    "broker_thin": BROKER_ENDPOINT,
+}
+# What each broker variant changes in the broker itself.
+BROKER_SETTINGS = {
+    "broker": [],
+    "broker_nohold": ["LIVE_OUTPUT_HOLD=0"],
+    "broker_thin": ["LIVE_OUTPUT_HOLD=0", "LIVE_FALLBACK_TRANSCRIPTION=0"],
 }
 # One broker, one fake house: its scenarios cannot overlap.
-SERIAL = {"broker"}
+SERIAL = set(BROKER_SETTINGS)
+BROKER_LOG = Path("/tmp/claude/live-dev.log")
+
+
+def start_broker(settings: list[str]) -> None:
+    """Restart the dev broker with these settings and wait until it can take a wake."""
+    offset = BROKER_LOG.stat().st_size if BROKER_LOG.exists() else 0
+    subprocess.Popen([str(HERE / "dev_broker.sh"), *settings], start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        if BROKER_LOG.exists():
+            with BROKER_LOG.open("rb") as log:
+                log.seek(offset)
+                if b"Loaded 24 Home Assistant tools" in log.read():
+                    time.sleep(3)  # the device socket binds just after the tools load
+                    return
+    raise SystemExit(f"the dev broker did not come up with {settings}")
 
 
 def run_trial(variant: str, trial: int, data: Path, concurrency: int, only: list[str]) -> Path:
@@ -69,6 +107,29 @@ def pct(values: list[float], q: float) -> float | None:
     return values[min(len(values) - 1, round(q * (len(values) - 1)))]
 
 
+def reply_gap_ms(events: Path) -> float | None:
+    """From the end of the caller's speech to the first assistant audio.
+
+    The harness's own response_latency_ms is censored at its 5 s deadline: a
+    reply that takes 7 s is recorded as "late" with no number, which hides
+    exactly the slowness this gate exists to catch. This measures it on the
+    same clock the harness logs events on.
+    """
+    if not events.exists():
+        return None
+    speech_end = None
+    for line in events.open():
+        row = json.loads(line)
+        event = row.get("event") or {}
+        kind = event.get("type")
+        if kind == "session.input_transcript.delta" and isinstance(event.get("end_ms"), int):
+            speech_end = max(speech_end or 0, event["end_ms"])
+        elif kind == "session.output_audio.delta" and speech_end is not None:
+            if row.get("event_time_ms", 0) > speech_end:
+                return row["event_time_ms"] - speech_end
+    return None
+
+
 def summarize(files: list[Path]) -> dict:
     per: dict[str, dict] = {}
     latencies: list[float] = []
@@ -82,7 +143,7 @@ def summarize(files: list[Path]) -> dict:
             elif r["status"] == "infrastructure_error":
                 s["infra"] += 1
                 infra += 1
-            lat = (r.get("metrics") or {}).get("audio", {}).get("response_latency_ms")
+            lat = reply_gap_ms(f.parent / "events" / f"{r['scenario_id']}.jsonl")
             if lat is not None:
                 latencies.append(lat)
     graded = sum(s["runs"] - s["infra"] for s in per.values())
@@ -111,6 +172,8 @@ def main() -> int:
 
     report = {}
     for variant in args.variants:
+        if variant in BROKER_SETTINGS:
+            start_broker(BROKER_SETTINGS[variant])
         files = [run_trial(variant, t, args.data.resolve(), args.concurrency, args.example)
                  for t in range(1, args.trials + 1)]
         report[variant] = summarize(files)
