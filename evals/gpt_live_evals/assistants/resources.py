@@ -42,6 +42,10 @@ class AssistantResources:
         if remote:
             return RemoteToolObserver(initial_state=initial_state, facts=facts)
         if self.domain == "smart_home":
+            if house_url := os.environ.get("GPT_LIVE_EVALS_HOUSE_URL"):
+                from assistants.smart_home.remote import RemoteHouse
+
+                return RemoteHouse(house_url, copy.deepcopy(initial_state))
             from assistants.smart_home.house import House
 
             return House(initial_state=copy.deepcopy(initial_state))

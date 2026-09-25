@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -70,6 +71,17 @@ class SingleTurnGradeResult:
     dimension_grades: dict[str, DimensionGrade] = field(default_factory=dict)
 
 
+# Voice PE: in the smart home the outcome is what matters, not the exact tool
+# path to it. "Turn the bedroom lights on" is done equally by HassTurnOn or by
+# HassLightSet, and looking the house up with GetLiveContext first is good
+# practice, not a violation. The restaurant contract demands the exact tool
+# list and failed every one of those correct runs, so for this domain the
+# contract is graded the way the harness already grades multi-turn runs: the
+# final state, prohibited actions and "every change is backed by a completed
+# tool call" still decide the outcome.
+STRICT_TOOLS = os.environ.get("GPT_LIVE_EVALS_DOMAIN") != "smart_home"
+
+
 def _semantic_score(grade: Mapping[str, Any]) -> float:
     """Retain backward-compatible boolean grades while honoring fractional decisions."""
     score = grade.get("score")
@@ -116,7 +128,7 @@ def apply_semantic_grades(
         assessment = assess_outcome(
             result,
             semantic_completed=semantic_completed,
-            strict_tools=True,
+            strict_tools=STRICT_TOOLS,
         )
         result.task_metrics["outcome_assessment"] = assessment.model_dump()
         result.task_metrics["requirements_satisfied"] = assessment.passed
@@ -353,7 +365,7 @@ def grade_single_turn_example(
         final_state=dict(final_state or {}),
         post_tool_assistant_text=post_tool_assistant_text,
     )
-    assessment = assess_outcome(source_result, strict_tools=True)
+    assessment = assess_outcome(source_result, strict_tools=STRICT_TOOLS)
     source_result.task_metrics["outcome_assessment"] = assessment.model_dump()
     source_result.task_metrics["requirements_satisfied"] = assessment.passed
     source_result.task_metrics["task_completed"] = assessment.passed
