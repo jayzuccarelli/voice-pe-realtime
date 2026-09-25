@@ -1,0 +1,511 @@
+{
+ "schema_version": "1.0",
+ "scenarios": [
+  {
+   "id": "home_lights_off_living",
+   "title": "Lights · living room off",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "lights",
+    "from_real_wake"
+   ],
+   "input": {
+    "text": "Living room lights off."
+   },
+   "application": {
+    "initial_state": {
+     "devices": {
+      "Living Room": "on"
+     }
+    }
+   },
+   "expected": {
+    "answer": "Confirms the living room lights are off.",
+    "criteria": [
+     "Confirms the living room lights are off, without claiming failure."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassTurnOff",
+       "arguments": {}
+      }
+     ],
+     "prohibited": [
+      {
+       "name": "HassTurnOn"
+      }
+     ]
+    },
+    "state": {
+     "devices": {
+      "Living Room": "off"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_lights_on_bedroom",
+   "title": "Lights · bedroom on",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "lights"
+   ],
+   "input": {
+    "text": "Turn on the bedroom lights."
+   },
+   "application": {
+    "initial_state": {
+     "devices": {
+      "Bedroom": "off"
+     }
+    }
+   },
+   "expected": {
+    "answer": "Confirms the bedroom lights are on.",
+    "criteria": [
+     "Confirms the bedroom lights are on."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassTurnOn",
+       "arguments": {}
+      }
+     ],
+     "prohibited": [
+      {
+       "name": "HassTurnOff"
+      }
+     ]
+    },
+    "state": {
+     "devices": {
+      "Bedroom": "on"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_lamp_on_living",
+   "title": "Switch · living room lamp on",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "switch"
+   ],
+   "input": {
+    "text": "Switch on the living room lamp."
+   },
+   "application": {
+    "initial_state": {
+     "devices": {
+      "Living Room Lamp": "off"
+     }
+    }
+   },
+   "expected": {
+    "answer": "Confirms the living room lamp is on.",
+    "criteria": [
+     "Confirms the lamp is on."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassTurnOn",
+       "arguments": {}
+      }
+     ],
+     "prohibited": [
+      {
+       "name": "HassTurnOff"
+      }
+     ]
+    },
+    "state": {
+     "devices": {
+      "Living Room Lamp": "on"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_netflix_living",
+   "title": "TV · Netflix on the living room TV",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "tv",
+    "from_real_wake"
+   ],
+   "input": {
+    "text": "Put Netflix on the living room TV."
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Confirms Netflix is opening on the living room TV.",
+    "criteria": [
+     "Confirms Netflix on the living room TV."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "tv_launch_app",
+       "arguments": {
+        "app": "Netflix"
+       }
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "tv_apps": {
+      "living room": "Netflix"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_netflix_bare",
+   "title": "TV · Netflix, no room given",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "tv",
+    "from_real_wake",
+    "ambiguous"
+   ],
+   "input": {
+    "text": "Put Netflix on."
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Opens Netflix on a TV, or asks which TV.",
+    "criteria": [
+     "Either opens Netflix on a TV and says which, or asks which TV; never claims success without doing it."
+    ],
+    "delegation": "optional",
+    "tools": {
+     "required": [],
+     "prohibited": []
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_youtube_bedroom",
+   "title": "TV · YouTube on the bedroom TV",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "tv"
+   ],
+   "input": {
+    "text": "Open YouTube on the bedroom TV."
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Confirms YouTube on the bedroom TV.",
+    "criteria": [
+     "Confirms YouTube on the bedroom TV."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "tv_launch_app",
+       "arguments": {
+        "app": "YouTube"
+       }
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "tv_apps": {
+      "bedroom": "YouTube"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_pause_den",
+   "title": "Media · pause the den speaker",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "media"
+   ],
+   "input": {
+    "text": "Pause the den speaker."
+   },
+   "application": {
+    "initial_state": {
+     "devices": {
+      "the den, den speaker, living room speaker": "playing"
+     }
+    }
+   },
+   "expected": {
+    "answer": "Confirms the den speaker is paused.",
+    "criteria": [
+     "Confirms the music is paused."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassMediaPause",
+       "arguments": {}
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "devices": {
+      "the den, den speaker, living room speaker": "paused"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_shopping_milk",
+   "title": "List · add milk",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "list"
+   ],
+   "input": {
+    "text": "Add milk to the shopping list."
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Confirms milk was added to the shopping list.",
+    "criteria": [
+     "Confirms milk is on the shopping list."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassListAddItem",
+       "arguments": {}
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "lists": {
+      "Shopping List": [
+       "milk"
+      ]
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_time",
+   "title": "Info · what time is it",
+   "type": "information",
+   "interaction": "single_turn",
+   "tags": [
+    "live_state"
+   ],
+   "input": {
+    "text": "What time is it?"
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "It is 7:30 PM.",
+    "criteria": [
+     "States the time as 7:30 in the evening, taken from the backend, not guessed."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "GetDateTime",
+       "arguments": {}
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "unchanged": true
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_general_knowledge",
+   "title": "Info · capital of France",
+   "type": "information",
+   "interaction": "single_turn",
+   "tags": [
+    "no_tools",
+    "from_make_check"
+   ],
+   "input": {
+    "text": "What's the capital of France?"
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Paris.",
+    "criteria": [
+     "Answers Paris, once, with no apology or 'I didn't catch that' after it."
+    ],
+    "delegation": "optional",
+    "tools": {
+     "required": [],
+     "prohibited": [
+      {
+       "name": "HassTurnOn"
+      },
+      {
+       "name": "HassTurnOff"
+      },
+      {
+       "name": "tv_launch_app"
+      }
+     ]
+    },
+    "state": {
+     "unchanged": true
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_ps5_unavailable",
+   "title": "Honesty · PS5 is unavailable",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "honesty",
+    "failure_path"
+   ],
+   "input": {
+    "text": "Turn on the PlayStation."
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Says the PlayStation could not be turned on because it is unavailable.",
+    "criteria": [
+     "Says it could not turn the PlayStation on; never claims it is on."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [],
+     "prohibited": []
+    },
+    "state": {
+     "unchanged": true
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "home_all_bedroom_off",
+   "title": "Lights · everything off in the bedroom",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "lights",
+    "switch",
+    "area"
+   ],
+   "input": {
+    "text": "Turn everything off in the bedroom."
+   },
+   "application": {
+    "initial_state": {
+     "devices": {
+      "Bedroom": "on",
+      "Left Bedroom Lamp": "on",
+      "Right Bedroom Lamp": "on"
+     }
+    }
+   },
+   "expected": {
+    "answer": "Confirms the bedroom lights and lamps are off.",
+    "criteria": [
+     "Confirms everything in the bedroom is off."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassTurnOff",
+       "arguments": {}
+      }
+     ],
+     "prohibited": [
+      {
+       "name": "HassTurnOn"
+      }
+     ]
+    },
+    "state": {
+     "devices": {
+      "Bedroom": "off",
+      "Left Bedroom Lamp": "off",
+      "Right Bedroom Lamp": "off"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  }
+ ]
+}

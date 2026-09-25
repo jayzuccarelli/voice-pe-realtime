@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ class AssistantResources:
     backend_system_prompt_file: Path
     tools_file: Path
     facts_file: Path
+    domain: str = "restaurant"
 
     def load_facts(self) -> dict[str, Any]:
         parsed = json.loads(self.facts_file.read_text(encoding="utf-8"))
@@ -39,6 +41,10 @@ class AssistantResources:
     ) -> ToolExecutor:
         if remote:
             return RemoteToolObserver(initial_state=initial_state, facts=facts)
+        if self.domain == "smart_home":
+            from assistants.smart_home.house import House
+
+            return House(initial_state=copy.deepcopy(initial_state))
         if self.assistant_mode == "client":
             from assistants.client.tools.restaurant import RestaurantTools
         else:
@@ -69,6 +75,21 @@ def assistant_resources(*, assistant_mode: str = "responses") -> AssistantResour
     if assistant_mode not in {"responses", "client"}:
         raise ValueError(f"Unknown assistant delegation mode: {assistant_mode}")
     backend = ASSISTANTS_DIR / assistant_mode
+    # Voice PE: the same harness pointed at a fake smart home instead of the
+    # restaurant, with the broker's prompts. GPT_LIVE_EVALS_PROMPT picks the
+    # frontend prompt variant under test (raw persona, or persona plus the
+    # broker's delegation guidance).
+    if os.environ.get("GPT_LIVE_EVALS_DOMAIN") == "smart_home":
+        home = ASSISTANTS_DIR / "smart_home"
+        variant = os.environ.get("GPT_LIVE_EVALS_PROMPT", "raw")
+        return AssistantResources(
+            assistant_mode=assistant_mode,
+            system_prompt_file=home / "prompts" / f"voice_{variant}.txt",
+            backend_system_prompt_file=home / "prompts" / "backend.txt",
+            tools_file=home / "definitions.json",
+            facts_file=home / "facts.json",
+            domain="smart_home",
+        )
     return AssistantResources(
         assistant_mode=assistant_mode,
         system_prompt_file=ASSISTANTS_DIR / "frontend" / "prompts" / "voice.txt",
