@@ -286,6 +286,7 @@ class VoicePELiveService(OpenAILiveLLMService):
             self._answer_text_started = False
         else:
             self._model_spoke = True
+            self._utterance_answered = True
         await super()._open_turn(role)
 
     async def _end_turn(self, role: str) -> None:
@@ -411,6 +412,7 @@ class VoicePELiveService(OpenAILiveLLMService):
         self._live_heard_at = None
         self._held_since = None
         self._utterance_acted = False
+        self._utterance_answered = False
         self._model_spoke = False
         self._fb_audio = bytearray()
         self._fb_rate = 0
@@ -478,6 +480,7 @@ class VoicePELiveService(OpenAILiveLLMService):
                 self._live_heard_at = None
                 self._held_since = time.monotonic()
                 self._utterance_acted = False
+                self._utterance_answered = False
                 self._request_known = False
                 self._answer_text_started = False
         else:
@@ -632,6 +635,19 @@ class VoicePELiveService(OpenAILiveLLMService):
             return
         if self._utterance_acted:
             logger.info("Live check: could not read it back, but the house was already acted on")
+            return
+        if self._utterance_answered or self._live_open_responses:
+            # It has already answered this one, or the backend is still
+            # writing the answer. "I'm sorry, I didn't catch that" on top
+            # of "Humans live on Earth." is two answers to one question and
+            # the second is false: the check failing to read the audio back
+            # says nothing about whether the model heard it (2026-09-25).
+            #
+            # Asked of the assistant turn rather than of _answer_text_started,
+            # which only ever covers a delegated answer: general knowledge
+            # is answered by the frontend model directly, no delegation, so
+            # that flag stayed false and it apologised over itself anyway.
+            logger.info("Live check: could not read it back, but it has already answered")
             return
         if first or self._live_text:
             await self._await_open_calls()
