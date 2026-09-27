@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import pathlib
 import time
 import urllib.request
@@ -36,7 +37,7 @@ import websockets
 import contextlib
 
 PORT = 8790
-BROKER_WS = "ws://127.0.0.1:8766"
+BROKER_WS = os.environ.get("ADAPTER_TARGET", "ws://127.0.0.1:8766")
 HOUSE = "http://127.0.0.1:8791"
 RATE = 24000
 SPEECH_RMS = 300

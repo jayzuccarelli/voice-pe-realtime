@@ -15,6 +15,7 @@ Variants:
     broker         the production broker, through evals/broker_adapter.py
     broker_nohold  the broker with the output hold off
     broker_thin    the broker with the output hold and the backstop transcriber off
+    minimal        minimal/relay.py: the puck socket, gpt-live-1 and the HA tools, nothing else
 
 Broker variants restart the dev broker (evals/dev_broker.sh) with their
 settings first, and need evals/fake_house_server.py and evals/broker_adapter.py
@@ -51,6 +52,9 @@ VARIANTS = {
     "broker": BROKER_ENDPOINT,
     "broker_nohold": BROKER_ENDPOINT,
     "broker_thin": BROKER_ENDPOINT,
+    # minimal/relay.py behind the adapter (ADAPTER_TARGET=ws://127.0.0.1:8767),
+    # started by hand: it is not the dev broker, so nothing is restarted.
+    "minimal": BROKER_ENDPOINT,
 }
 # What each broker variant changes in the broker itself.
 BROKER_SETTINGS = {
@@ -59,7 +63,7 @@ BROKER_SETTINGS = {
     "broker_thin": ["LIVE_OUTPUT_HOLD=0", "LIVE_FALLBACK_TRANSCRIPTION=0"],
 }
 # One broker, one fake house: its scenarios cannot overlap.
-SERIAL = set(BROKER_SETTINGS)
+SERIAL = set(BROKER_SETTINGS) | {"minimal"}
 BROKER_LOG = Path("/tmp/claude/live-dev.log")
 
 
