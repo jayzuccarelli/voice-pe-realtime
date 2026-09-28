@@ -272,6 +272,14 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
     except Exception:
         log.exception("conversation failed")
     finally:
+        # The firmware only goes back to idle on an explicit disconnect
+        # message. A bare close reads to it as a dropped link: it tries to
+        # reconnect, and the next wake chimes and never connects (2026-09-28).
+        if not puck.closed:
+            try:
+                await puck.send_str('{"type":"disconnect"}')
+            except ConnectionError:
+                pass
         await puck.close()
         log.info("conversation over")
     return puck
