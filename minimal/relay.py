@@ -48,12 +48,20 @@ RATE = 24000
 FOLLOWUP_S = 6.0
 FIRST_REPLY_S = 15.0
 HARD_CAP_S = 180.0
+# The production broker's proven values for telling Live's speech from its
+# silence (broker/realtime_broker/live_server.py).
+SILENCE_RMS = 50.0
+SILENCE_HOLD_S = 0.8
 
 INSTRUCTIONS = os.environ.get(
     "INSTRUCTIONS",
     "You are Atriensis, the household steward for this smart home. Always respond in English. "
     "Be concise, warm, and natural, like a capable, unflappable butler. You can control the home "
     "with the available tools; when asked to do something, just do it and confirm in one short sentence.",
+) + (
+    # Without this Live answered "what time is it" at once with an invented
+    # time ("11:34 p.m.", "3:45") and never asked the backend (2026-09-28).
+    " You have no clock: the time and date always come from your backend, never from a guess."
 )
 BACKEND_INSTRUCTIONS = (
     "You are the backend of a home voice assistant. Each message is the recent voice conversation "
@@ -64,6 +72,27 @@ BACKEND_INSTRUCTIONS = (
 )
 
 log = logging.getLogger("minimal")
+# MINIMAL_TAPE=<dir> saves what the puck sent on each wake as a WAV: the one
+# way to tell a bad microphone from a bad relay when Live mishears.
+TAPE_DIR = os.environ.get("MINIMAL_TAPE", "")
+
+
+def save_tape(pcm: bytearray) -> None:
+    import wave
+
+    path = Path(TAPE_DIR) / f"puck-{time.strftime('%Y%m%d-%H%M%S')}.wav"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(bytes(pcm))
+    log.info("tape: %.1fs of puck audio in %s", len(pcm) / 2 / RATE, path)
+
+
+def rms(pcm: bytes) -> float:
+    samples = memoryview(pcm).cast("h") if len(pcm) % 2 == 0 else memoryview(pcm[:-1]).cast("h")
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5 if len(samples) else 0.0
 
 
 def live_tool(tool) -> dict:
@@ -113,6 +142,8 @@ class Conversation:
         self.spoke = False
         self.pending: dict[str, list[asyncio.Task]] = {}
         self.busy = 0  # tool calls in flight
+        self.tape = bytearray()  # everything the puck sent, for MINIMAL_TAPE
+        self.last_loud = 0.0  # when Live's audio last carried speech
 
     async def run(self) -> None:
         tasks = [asyncio.create_task(c) for c in (self.from_puck(), self.from_live(), self.clock())]
@@ -124,6 +155,7 @@ class Conversation:
     async def from_puck(self) -> None:
         async for msg in self.puck:
             if msg.type == aiohttp.WSMsgType.BINARY:
+                self.tape.extend(msg.data)
                 await self.live.send_json({"type": "session.input_audio.append",
                                            "audio": base64.b64encode(msg.data).decode()})
             elif msg.type == aiohttp.WSMsgType.TEXT:
@@ -142,6 +174,15 @@ class Conversation:
             if kind == "session.output_audio.delta":
                 pcm = base64.b64decode(event["delta"])
                 now = time.monotonic()
+                # Live streams silence without end once it has spoken. The
+                # puck keeps its mic muted while anything plays, so relaying
+                # that silence left it deaf after the first answer and kept
+                # every wake open to the hard cap (2026-09-28). Quiet frames
+                # just after speech are kept: they are commas and breaths.
+                if rms(pcm) < SILENCE_RMS and now - self.last_loud > SILENCE_HOLD_S:
+                    continue
+                if rms(pcm) >= SILENCE_RMS:
+                    self.last_loud = now
                 self.heard_until = max(self.heard_until, now) + len(pcm) / 2 / RATE
                 self.spoke = True
                 await self.puck.send_bytes(pcm)
@@ -223,8 +264,11 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
                 if first.get("type") != "session.started":
                     log.error("live refused the session: %s", json.dumps(first)[:400])
                     return puck
-                await Conversation(puck, live, ha).run()
+                conversation = Conversation(puck, live, ha)
+                await conversation.run()
                 await live.send_json({"type": "session.close"})
+                if TAPE_DIR:
+                    save_tape(conversation.tape)
     except Exception:
         log.exception("conversation failed")
     finally:
