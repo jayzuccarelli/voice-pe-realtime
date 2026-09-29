@@ -33,6 +33,7 @@ from aiohttp import web
 from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+import contextlib
 
 load_dotenv(Path(__file__).resolve().parent.parent / "broker" / ".env")
 
@@ -45,7 +46,12 @@ API_KEY = os.environ["OPENAI_API_KEY"]
 HA_MCP_URL = os.environ["HA_MCP_URL"]
 HA_TOKEN = os.environ["HA_TOKEN"]
 RATE = 24000
-FOLLOWUP_S = 6.0
+# Seconds of quiet after the assistant speaks before the conversation ends.
+# 6 s closed on a re-ask that came 7 s later (2026-09-29).
+FOLLOWUP_S = 10.0
+# Mic level that counts as someone talking; the quietest real question on
+# tape (far across the room) peaks around 300.
+VOICE_RMS = 250.0
 FIRST_REPLY_S = 15.0
 HARD_CAP_S = 180.0
 # The production broker's proven values for telling Live's speech from its
@@ -156,6 +162,11 @@ class Conversation:
         async for msg in self.puck:
             if msg.type == aiohttp.WSMsgType.BINARY:
                 self.tape.extend(msg.data)
+                # The user is talking even when Live does not transcribe it.
+                # Keyed only on Live's transcript, the relay hung up on "dude,
+                # I asked you a question" mid-sentence (2026-09-29).
+                if rms(msg.data) >= VOICE_RMS:
+                    self.heard_until = max(self.heard_until, time.monotonic())
                 await self.live.send_json({"type": "session.input_audio.append",
                                            "audio": base64.b64encode(msg.data).decode()})
             elif msg.type == aiohttp.WSMsgType.TEXT:
@@ -276,10 +287,8 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
         # message. A bare close reads to it as a dropped link: it tries to
         # reconnect, and the next wake chimes and never connects (2026-09-28).
         if not puck.closed:
-            try:
+            with contextlib.suppress(ConnectionError):
                 await puck.send_str('{"type":"disconnect"}')
-            except ConnectionError:
-                pass
         await puck.close()
         log.info("conversation over")
     return puck
