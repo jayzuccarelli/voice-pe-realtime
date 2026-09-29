@@ -35,7 +35,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 HARNESS = HERE / "gpt_live_evals"
-RESULTS = HARNESS / "crawl_harness" / "results"
+# --voice jay scores Jay's real puck recordings (WALK) instead of synthetic
+# speech, which Live hears every time and so cannot show its far-field misses.
+MODES = {
+    "synthetic": ("crawl-eval", "crawl_harness", "crawl.json"),
+    "jay": ("walk-eval", "walk_harness", "walk.json"),
+}
 BASELINE = HERE / "baseline.json"
 ENV_FILE = HERE.parent / "broker" / ".env"
 BACKEND_MODEL = "gpt-5.4-mini"  # production's LIVE_BACKEND_MODEL
@@ -84,7 +89,9 @@ def start_broker(settings: list[str]) -> None:
     raise SystemExit(f"the dev broker did not come up with {settings}")
 
 
-def run_trial(variant: str, trial: int, data: Path, concurrency: int, only: list[str]) -> Path:
+def run_trial(variant: str, trial: int, data: Path, concurrency: int, only: list[str],
+              voice: str = "synthetic") -> Path:
+    command, harness_dir, _ = MODES[voice]
     name = f"gate_{variant}_t{trial}_{int(time.time())}"
     env = {
         **os.environ,
@@ -93,12 +100,12 @@ def run_trial(variant: str, trial: int, data: Path, concurrency: int, only: list
         "OPENAI_LIVE_VOICE": "cedar",
         **VARIANTS[variant],
     }
-    cmd = ["uv", "run", "crawl-eval", "--data", str(data), "--backend-model", BACKEND_MODEL,
+    cmd = ["uv", "run", command, "--data", str(data), "--backend-model", BACKEND_MODEL,
            "--concurrency", str(1 if variant in SERIAL else concurrency), "--run-name", name]
     for example in only:
         cmd += ["--example", example]
     subprocess.run(cmd, cwd=HARNESS, env=env, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    found = sorted(RESULTS.glob(f"{name}_*"))
+    found = sorted((HARNESS / harness_dir / "results").glob(f"{name}_*"))
     if not found:
         raise SystemExit(f"{variant} trial {trial}: the harness wrote no results")
     return found[-1] / "results.json"
@@ -168,7 +175,8 @@ def main() -> int:
     ap.add_argument("--variants", nargs="+", default=["raw", "guided"], choices=sorted(VARIANTS))
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--concurrency", type=int, default=4)
-    ap.add_argument("--data", type=Path, default=HARNESS / "smart_home_data" / "crawl.json")
+    ap.add_argument("--voice", choices=sorted(MODES), default="synthetic")
+    ap.add_argument("--data", type=Path)
     ap.add_argument("--example", action="append", default=[])
     ap.add_argument("--save-baseline", action="store_true")
     ap.add_argument("--against-baseline", action="store_true")
@@ -178,7 +186,8 @@ def main() -> int:
     for variant in args.variants:
         if variant in BROKER_SETTINGS:
             start_broker(BROKER_SETTINGS[variant])
-        files = [run_trial(variant, t, args.data.resolve(), args.concurrency, args.example)
+        data = (args.data or HARNESS / "smart_home_data" / MODES[args.voice][2]).resolve()
+        files = [run_trial(variant, t, data, args.concurrency, args.example, args.voice)
                  for t in range(1, args.trials + 1)]
         report[variant] = summarize(files)
         report[variant]["result_files"] = [str(f.relative_to(HERE)) for f in files]

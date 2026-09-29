@@ -1,0 +1,260 @@
+{
+ "schema_version": "1.0",
+ "scenarios": [
+  {
+   "id": "jay_time_quiet_agc",
+   "title": "Jay's voice \u00b7 time_quiet",
+   "type": "information",
+   "interaction": "single_turn",
+   "tags": [
+    "far_field",
+    "jay_voice",
+    "live_state"
+   ],
+   "input": {
+    "text": "What time is it?",
+    "recordings": [
+     {
+      "id": "puck",
+      "path": "walk_audio_agc/time_quiet.wav",
+      "condition": "realistic",
+      "metadata": {
+       "language": "en"
+      }
+     }
+    ]
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "It is 7:30 PM.",
+    "criteria": [
+     "States the time as 7:30 in the evening, taken from the backend, not guessed."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "GetDateTime",
+       "arguments": {}
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "unchanged": true
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "jay_time_vreal_agc",
+   "title": "Jay's voice \u00b7 time_vreal",
+   "type": "information",
+   "interaction": "single_turn",
+   "tags": [
+    "far_field",
+    "jay_voice",
+    "live_state"
+   ],
+   "input": {
+    "text": "What time is it?",
+    "recordings": [
+     {
+      "id": "puck",
+      "path": "walk_audio_agc/time_vreal.wav",
+      "condition": "realistic",
+      "metadata": {
+       "language": "en"
+      }
+     }
+    ]
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "It is 7:30 PM.",
+    "criteria": [
+     "States the time as 7:30 in the evening, taken from the backend, not guessed."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "GetDateTime",
+       "arguments": {}
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "unchanged": true
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "jay_lights_off_agc",
+   "title": "Jay's voice \u00b7 lights_off",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "far_field",
+    "from_real_wake",
+    "jay_voice",
+    "lights"
+   ],
+   "input": {
+    "text": "Living room lights off.",
+    "recordings": [
+     {
+      "id": "puck",
+      "path": "walk_audio_agc/lights_off.wav",
+      "condition": "realistic",
+      "metadata": {
+       "language": "en"
+      }
+     }
+    ]
+   },
+   "application": {
+    "initial_state": {
+     "devices": {
+      "Living Room": "on"
+     }
+    }
+   },
+   "expected": {
+    "answer": "Confirms the living room lights are off.",
+    "criteria": [
+     "Confirms the living room lights are off, without claiming failure."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "HassTurnOff",
+       "arguments": {}
+      }
+     ],
+     "prohibited": [
+      {
+       "name": "HassTurnOn"
+      }
+     ]
+    },
+    "state": {
+     "devices": {
+      "Living Room": "off"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "jay_netflix_bare_agc",
+   "title": "Jay's voice \u00b7 netflix_bare",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "ambiguous",
+    "far_field",
+    "from_real_wake",
+    "jay_voice",
+    "tv"
+   ],
+   "input": {
+    "text": "Put Netflix on.",
+    "recordings": [
+     {
+      "id": "puck",
+      "path": "walk_audio_agc/netflix_bare.wav",
+      "condition": "realistic",
+      "metadata": {
+       "language": "en"
+      }
+     }
+    ]
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Opens Netflix on a TV, or asks which TV.",
+    "criteria": [
+     "Either opens Netflix on a TV and says which, or asks which TV; never claims success without doing it."
+    ],
+    "delegation": "optional",
+    "tools": {
+     "required": [],
+     "prohibited": []
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  },
+  {
+   "id": "jay_netflix_living_agc",
+   "title": "Jay's voice \u00b7 netflix_living",
+   "type": "device_control",
+   "interaction": "single_turn",
+   "tags": [
+    "far_field",
+    "from_real_wake",
+    "jay_voice",
+    "tv"
+   ],
+   "input": {
+    "text": "I said put Netflix on the living room TV.",
+    "recordings": [
+     {
+      "id": "puck",
+      "path": "walk_audio_agc/netflix_living.wav",
+      "condition": "realistic",
+      "metadata": {
+       "language": "en"
+      }
+     }
+    ]
+   },
+   "application": {
+    "initial_state": {}
+   },
+   "expected": {
+    "answer": "Confirms Netflix is opening on the living room TV.",
+    "criteria": [
+     "Confirms Netflix on the living room TV."
+    ],
+    "delegation": "required",
+    "tools": {
+     "required": [
+      {
+       "name": "tv_launch_app",
+       "arguments": {
+        "app": "Netflix"
+       }
+      }
+     ],
+     "prohibited": []
+    },
+    "state": {
+     "tv_apps": {
+      "living room": "Netflix"
+     }
+    },
+    "golden_path": {
+     "turns": 2
+    }
+   }
+  }
+ ]
+}
