@@ -21,11 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
+import contextlib
 import copy
 import json
 import logging
 import os
+import struct
 import time
+import urllib.request
+import uuid
 from pathlib import Path
 
 import aiohttp
@@ -33,7 +38,6 @@ from aiohttp import web
 from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.sse import sse_client
-import contextlib
 
 load_dotenv(Path(__file__).resolve().parent.parent / "broker" / ".env")
 
@@ -58,6 +62,28 @@ HARD_CAP_S = 180.0
 # silence (broker/realtime_broker/live_server.py).
 SILENCE_RMS = 50.0
 SILENCE_HOLD_S = 0.8
+# How long Live's audio is held before it goes to the puck: the slack that
+# absorbs network jitter so playback is not choppy.
+PREROLL_S = 0.4
+# The handoff. Measured on Jay's own puck recordings with no relay at all
+# (evals/gate.py --voice jay): gpt-live-1 hears his longer requests 10/10
+# and his short ones ("What time is it?", "Put Netflix on.") 0/15, at any
+# level, with or without noise. It exposes no input setting. The same audio
+# reads correctly through gpt-4o-transcribe every time, so when the mic
+# clearly carried speech and Live produced no transcript, that text goes
+# to Live's backend as the user's words. Live does everything else.
+HANDOFF_MODEL = "gpt-4o-transcribe"
+HANDOFF_QUIET_S = 0.7  # this much quiet ends an utterance
+HANDOFF_MIN_SPEECH_S = 0.3  # shorter bursts are noise
+# Mic level that opens an utterance for the handoff. Lower than VOICE_RMS:
+# Jay's quiet "Put Netflix on." from across the room sits at 150-260, the
+# room's floor at 30-60. Anything opened here is still judged by the
+# transcriber before Live sees a word of it.
+UTTERANCE_RMS = 120.0
+HANDOFF_GRACE_S = 1.0  # how long after the utterance Live gets to transcribe it
+HANDOFF_LEAD_FRAMES = 20  # 0.4 s kept from before speech opened: the words said right after the chime
+HANDOFF_MEAN_LOGPROB = -0.15  # below this the transcriber was guessing
+HANDOFF_MIN_LOGPROB = -0.5
 
 INSTRUCTIONS = os.environ.get(
     "INSTRUCTIONS",
@@ -94,6 +120,41 @@ def save_tape(pcm: bytearray) -> None:
         w.setframerate(RATE)
         w.writeframes(bytes(pcm))
     log.info("tape: %.1fs of puck audio in %s", len(pcm) / 2 / RATE, path)
+
+
+def wav(pcm: bytes) -> bytes:
+    head = b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt "
+    head += struct.pack("<IHHIIHH", 16, 1, 1, RATE, RATE * 2, 2, 16)
+    return head + b"data" + struct.pack("<I", len(pcm)) + pcm
+
+
+def transcribe(pcm: bytes) -> tuple[str, float, float]:
+    """The words, with the model's mean and lowest token log-probability.
+
+    Every transcriber writes a sentence when given noise (16 s of room tone
+    came back as "Honestly, Carl, if you give a shit."). The log-probs tell
+    it apart: Jay's real requests score mean >= -0.05 and lowest >= -0.16,
+    that invented one -0.27 and -0.94.
+    """
+    boundary = uuid.uuid4().hex
+    body = b""
+    fields = (("model", HANDOFF_MODEL), ("language", "en"), ("response_format", "json"), ("include[]", "logprobs"))
+    for name, value in fields:
+        body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
+    body += (
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n"
+    ).encode() + wav(pcm) + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/audio/transcriptions", data=body,
+        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        result = json.loads(r.read())
+    logprobs = [t["logprob"] for t in result.get("logprobs") or []]
+    if not logprobs:
+        return result["text"].strip(), 0.0, 0.0
+    return result["text"].strip(), sum(logprobs) / len(logprobs), min(logprobs)
 
 
 def rms(pcm: bytes) -> float:
@@ -150,13 +211,47 @@ class Conversation:
         self.busy = 0  # tool calls in flight
         self.tape = bytearray()  # everything the puck sent, for MINIMAL_TAPE
         self.last_loud = 0.0  # when Live's audio last carried speech
+        self.outgoing: collections.deque[tuple[float, bytes]] = collections.deque()  # (send at, pcm)
+        # The handoff's view of the mic: the utterance being spoken, and when
+        # Live last showed it had heard anything.
+        self.recent: collections.deque[bytes] = collections.deque(maxlen=HANDOFF_LEAD_FRAMES)
+        self.utterance: bytearray | None = None
+        self.utterance_started = 0.0
+        self.mic_s = 0.0  # seconds of mic audio received so far
+        self.voiced_s = 0.0
+        self.quiet_s = 0.0
+        self.live_heard_at = 0.0
+        self.handoffs: set[asyncio.Task] = set()
 
     async def run(self) -> None:
-        tasks = [asyncio.create_task(c) for c in (self.from_puck(), self.from_live(), self.clock())]
+        tasks = [asyncio.create_task(c)
+                 for c in (self.from_puck(), self.from_live(), self.speaker(), self.clock())]
         _, rest = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in rest:
             t.cancel()
         await asyncio.gather(*rest, return_exceptions=True)
+        # Whatever is still queued is the end of the last sentence.
+        for _, pcm in self.outgoing:
+            with contextlib.suppress(ConnectionError):
+                await self.puck.send_bytes(pcm)
+
+    async def speaker(self) -> None:
+        """Play Live's audio to the puck PREROLL_S late, at Live's own pace.
+
+        Live streams speech in real time, so a network hiccup on the way
+        in became a hole in the puck's playback: the voice came out choppy
+        (2026-09-30). Holding each chunk for PREROLL_S before sending gives
+        that much slack to absorb, and the puck plays it back seamlessly.
+        """
+        while True:
+            if not self.outgoing:
+                await asyncio.sleep(0.01)
+                continue
+            due, pcm = self.outgoing[0]
+            if (wait := due - time.monotonic()) > 0:
+                await asyncio.sleep(wait)
+            self.outgoing.popleft()
+            await self.puck.send_bytes(pcm)
 
     async def from_puck(self) -> None:
         async for msg in self.puck:
@@ -165,8 +260,10 @@ class Conversation:
                 # The user is talking even when Live does not transcribe it.
                 # Keyed only on Live's transcript, the relay hung up on "dude,
                 # I asked you a question" mid-sentence (2026-09-29).
-                if rms(msg.data) >= VOICE_RMS:
+                level = rms(msg.data)
+                if level >= VOICE_RMS:
                     self.heard_until = max(self.heard_until, time.monotonic())
+                self.track_utterance(msg.data, level >= UTTERANCE_RMS)
                 await self.live.send_json({"type": "session.input_audio.append",
                                            "audio": base64.b64encode(msg.data).decode()})
             elif msg.type == aiohttp.WSMsgType.TEXT:
@@ -194,11 +291,11 @@ class Conversation:
                     continue
                 if rms(pcm) >= SILENCE_RMS:
                     self.last_loud = now
-                self.heard_until = max(self.heard_until, now) + len(pcm) / 2 / RATE
+                self.heard_until = max(self.heard_until, now + PREROLL_S) + len(pcm) / 2 / RATE
                 self.spoke = True
-                await self.puck.send_bytes(pcm)
+                self.outgoing.append((now + PREROLL_S, pcm))
             elif kind == "session.input_transcript.delta":
-                self.heard_until = max(self.heard_until, time.monotonic())
+                self.heard_until = self.live_heard_at = max(self.heard_until, time.monotonic())
                 log.info("heard: %s", event.get("delta", "").strip())
             elif kind == "session.output_transcript.delta":
                 log.info("said: %s", event.get("delta", "").strip())
@@ -208,6 +305,62 @@ class Conversation:
                 log.info("live %s: %s", kind, json.dumps(event)[:300])
                 if kind == "session.closed":
                     return
+
+    def track_utterance(self, pcm: bytes, loud: bool) -> None:
+        """Cut the mic into utterances; each one that ends gets a handoff check."""
+        now = time.monotonic()
+        secs = len(pcm) / 2 / RATE
+        self.mic_s += secs
+        self.recent.append(pcm)
+        if self.utterance is None:
+            # The first half second of mic audio is the wake chime, not the
+            # user. Counted in audio, not wall time: the puck streams from
+            # the wake while the relay is still connecting, so the opening
+            # second arrives in one burst.
+            if loud and self.mic_s > 0.6:
+                self.utterance = bytearray(b"".join(self.recent))
+                self.utterance_started = now
+                self.voiced_s = self.quiet_s = 0.0
+            return
+        self.utterance.extend(pcm)
+        if loud:
+            self.voiced_s += secs
+            self.quiet_s = 0.0
+            return
+        self.quiet_s += secs
+        if self.quiet_s >= HANDOFF_QUIET_S:
+            done, started, voiced = bytes(self.utterance), self.utterance_started, self.voiced_s
+            self.utterance = None
+            if voiced >= HANDOFF_MIN_SPEECH_S:
+                # Kept in self.handoffs: an unreferenced task can be garbage
+                # collected mid-await, and this one sleeps first.
+                task = asyncio.create_task(self.handoff(done, started))
+                self.handoffs.add(task)
+                task.add_done_callback(self.handoffs.discard)
+
+    async def handoff(self, pcm: bytes, started: float) -> None:
+        await asyncio.sleep(HANDOFF_GRACE_S)
+        if self.live_heard_at > started:
+            return  # Live heard it itself
+        try:
+            text, mean_lp, min_lp = await asyncio.to_thread(transcribe, pcm)
+        except Exception as exc:  # noqa: BLE001 - a lost handoff is a lost turn, not a crash
+            log.info("handoff: transcription failed: %s", exc)
+            return
+        if self.live_heard_at > started:
+            return
+        if len(text.split()) < 2 or mean_lp < HANDOFF_MEAN_LOGPROB or min_lp < HANDOFF_MIN_LOGPROB:
+            log.info("handoff: not speech (%r, mean %.2f, min %.2f)", text, mean_lp, min_lp)
+            return
+        log.info("handoff: Live heard nothing; the user said %r", text)
+        self.heard_until = max(self.heard_until, time.monotonic() + 3)
+        # Straight to the backend as the user's words, the way Live's own
+        # transcript would have gone: it acts and Live speaks the result.
+        await self.live.send_json({
+            "type": "response.item.create",
+            "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
+        })
+        await self.live.send_json({"type": "response.create"})
 
     async def on_backend(self, inner: dict) -> None:
         kind = inner.get("type")
