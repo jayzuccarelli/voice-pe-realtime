@@ -82,8 +82,21 @@ HANDOFF_MIN_SPEECH_S = 0.3  # shorter bursts are noise
 UTTERANCE_RMS = 120.0
 HANDOFF_GRACE_S = 1.0  # how long after the utterance Live gets to transcribe it
 HANDOFF_LEAD_FRAMES = 20  # 0.4 s kept from before speech opened: the words said right after the chime
-HANDOFF_MEAN_LOGPROB = -0.15  # below this the transcriber was guessing
-HANDOFF_MIN_LOGPROB = -0.5
+# Below these the transcriber was guessing. Loose on purpose: with the TV on,
+# a real "Can you turn Netflix on?" scored mean -0.23, lowest -1.13, while
+# pure noise came back as 'Schön.' at -2.52 and a Korean word at -1.63. The
+# speech-length rule above is what keeps room tone out; this catches the
+# fragments that slip past it.
+HANDOFF_MEAN_LOGPROB = -0.4
+HANDOFF_MIN_LOGPROB = -1.5
+# Speech must also stand this far above the room's own level, measured as
+# the quietest 100 ms of the last FLOOR_FRAMES frames. With the TV on the
+# room sat at 500-800 for a whole conversation, every frame counted as
+# speech, the utterance never ended and nothing was handed off
+# (2026-09-30). His words peaked at 2500-9000 over that floor.
+FLOOR_RATIO = 2.5
+FLOOR_FRAMES = 150  # 3 s
+HANDOFF_MAX_S = 8.0  # an utterance this long is handed off as it stands
 
 INSTRUCTIONS = os.environ.get(
     "INSTRUCTIONS",
@@ -94,6 +107,10 @@ INSTRUCTIONS = os.environ.get(
     # Without this Live answered "what time is it" at once with an invented
     # time ("11:34 p.m.", "3:45") and never asked the backend (2026-09-28).
     " You have no clock: the time and date always come from your backend, never from a guess."
+    # The backend acts in well under a second. "Of course, one moment" took
+    # longer to say than the lights took to go off, and the confirmation
+    # then trailed the action by two seconds (2026-09-30).
+    " Never announce that you are about to do something or ask for a moment: act, then confirm."
 )
 BACKEND_INSTRUCTIONS = (
     "You are the backend of a home voice assistant. Each message is the recent voice conversation "
@@ -215,6 +232,8 @@ class Conversation:
         # The handoff's view of the mic: the utterance being spoken, and when
         # Live last showed it had heard anything.
         self.recent: collections.deque[bytes] = collections.deque(maxlen=HANDOFF_LEAD_FRAMES)
+        self.smooth: collections.deque[float] = collections.deque(maxlen=5)  # 100 ms of levels
+        self.levels: collections.deque[float] = collections.deque(maxlen=FLOOR_FRAMES)
         self.utterance: bytearray | None = None
         self.utterance_started = 0.0
         self.mic_s = 0.0  # seconds of mic audio received so far
@@ -265,7 +284,7 @@ class Conversation:
                 level = rms(msg.data)
                 if level >= VOICE_RMS:
                     self.heard_until = max(self.heard_until, time.monotonic())
-                self.track_utterance(msg.data, level >= UTTERANCE_RMS)
+                self.track_utterance(msg.data, level)
                 await self.live.send_json({"type": "session.input_audio.append",
                                            "audio": base64.b64encode(msg.data).decode()})
             elif msg.type == aiohttp.WSMsgType.TEXT:
@@ -309,12 +328,19 @@ class Conversation:
                 if kind == "session.closed":
                     return
 
-    def track_utterance(self, pcm: bytes, loud: bool) -> None:
+    def track_utterance(self, pcm: bytes, level: float) -> None:
         """Cut the mic into utterances; each one that ends gets a handoff check."""
         now = time.monotonic()
         secs = len(pcm) / 2 / RATE
         self.mic_s += secs
         self.recent.append(pcm)
+        # The room's level: the quietest tenth of a second in the last three.
+        # Speech has such gaps between words; a chime or a sentence does not
+        # drag it up, the TV between words does.
+        self.smooth.append(level)
+        self.levels.append(sum(self.smooth) / len(self.smooth))
+        floor = min(self.levels)
+        loud = level >= max(UTTERANCE_RMS, FLOOR_RATIO * floor)
         if self.utterance is None:
             # The first half second of mic audio is the wake chime, not the
             # user. Counted in audio, not wall time: the puck streams from
@@ -330,11 +356,13 @@ class Conversation:
         if loud:
             self.voiced_s += secs
             self.quiet_s = 0.0
-            return
-        self.quiet_s += secs
-        if self.quiet_s >= HANDOFF_QUIET_S:
+        else:
+            self.quiet_s += secs
+        if self.quiet_s >= HANDOFF_QUIET_S or len(self.utterance) >= HANDOFF_MAX_S * RATE * 2:
             done, started, voiced = bytes(self.utterance), self.utterance_started, self.voiced_s
             self.utterance = None
+            log.info("utterance: %.1fs of speech at mic %.1fs%s", voiced, self.mic_s,
+                     "" if voiced >= HANDOFF_MIN_SPEECH_S else " (too short)")
             if voiced >= HANDOFF_MIN_SPEECH_S:
                 # Kept in self.handoffs: an unreferenced task can be garbage
                 # collected mid-await, and this one sleeps first.
@@ -345,7 +373,8 @@ class Conversation:
     async def handoff(self, pcm: bytes, started: float) -> None:
         await asyncio.sleep(HANDOFF_GRACE_S)
         if self.live_heard_at > started:
-            return  # Live heard it itself
+            log.info("handoff: not needed, Live heard it")
+            return
         if self.backend_started_at > started:
             # Live made something of the audio and delegated on its own. Let
             # that finish: if it produced a real answer the words are not
@@ -358,6 +387,7 @@ class Conversation:
                     break
             await asyncio.sleep(1.0)
             if self.answer_words >= 4 or self.live_heard_at > started:
+                log.info("handoff: not needed, Live answered on its own")
                 return
         try:
             text, mean_lp, min_lp = await asyncio.to_thread(transcribe, pcm)
@@ -433,6 +463,7 @@ class Conversation:
 async def handle(request: web.Request) -> web.WebSocketResponse:
     puck = web.WebSocketResponse(max_msg_size=0)
     await puck.prepare(request)
+    woke = time.monotonic()
     log.info("wake from %s", request.remote)
     try:
         async with sse_client(HA_MCP_URL, headers={"Authorization": f"Bearer {HA_TOKEN}"}) as (r, w), \
@@ -447,6 +478,7 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
                 if first.get("type") != "session.started":
                     log.error("live refused the session: %s", json.dumps(first)[:400])
                     return puck
+                log.info("session ready %.2fs after the wake", time.monotonic() - woke)
                 conversation = Conversation(puck, live, ha)
                 await conversation.run()
                 await live.send_json({"type": "session.close"})
