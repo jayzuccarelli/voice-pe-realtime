@@ -221,6 +221,8 @@ class Conversation:
         self.voiced_s = 0.0
         self.quiet_s = 0.0
         self.live_heard_at = 0.0
+        self.backend_started_at = 0.0  # Live delegated on its own
+        self.answer_words = 0  # words Live has spoken since the utterance opened
         self.handoffs: set[asyncio.Task] = set()
 
     async def run(self) -> None:
@@ -298,6 +300,7 @@ class Conversation:
                 self.heard_until = self.live_heard_at = max(self.heard_until, time.monotonic())
                 log.info("heard: %s", event.get("delta", "").strip())
             elif kind == "session.output_transcript.delta":
+                self.answer_words += len(event.get("delta", "").split())
                 log.info("said: %s", event.get("delta", "").strip())
             elif kind == "response.event":
                 await self.on_backend(event.get("event") or {})
@@ -321,6 +324,7 @@ class Conversation:
                 self.utterance = bytearray(b"".join(self.recent))
                 self.utterance_started = now
                 self.voiced_s = self.quiet_s = 0.0
+                self.answer_words = 0
             return
         self.utterance.extend(pcm)
         if loud:
@@ -342,6 +346,19 @@ class Conversation:
         await asyncio.sleep(HANDOFF_GRACE_S)
         if self.live_heard_at > started:
             return  # Live heard it itself
+        if self.backend_started_at > started:
+            # Live made something of the audio and delegated on its own. Let
+            # that finish: if it produced a real answer the words are not
+            # needed, and a second request on top gave "How may I help...
+            # on Thursday" (2026-09-30). If it came back with nothing to
+            # say, hand off as usual.
+            for _ in range(20):
+                await asyncio.sleep(0.2)
+                if not self.pending and not self.busy:
+                    break
+            await asyncio.sleep(1.0)
+            if self.answer_words >= 4 or self.live_heard_at > started:
+                return
         try:
             text, mean_lp, min_lp = await asyncio.to_thread(transcribe, pcm)
         except Exception as exc:  # noqa: BLE001 - a lost handoff is a lost turn, not a crash
@@ -365,6 +382,8 @@ class Conversation:
     async def on_backend(self, inner: dict) -> None:
         kind = inner.get("type")
         item = inner.get("item") or {}
+        if kind == "response.created":
+            self.backend_started_at = time.monotonic()
         if kind == "response.output_item.done" and item.get("type") == "function_call" \
                 and item.get("status") == "completed":
             rid = inner.get("response_id") or ""
