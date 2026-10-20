@@ -1,0 +1,780 @@
+[
+ {
+  "type": "function",
+  "name": "HassTurnOn",
+  "description": "Turns on/opens/presses a device or entity. For locks, this performs a 'lock' action. Use for requests like 'turn on', 'activate', 'enable', or 'lock'.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "water",
+       "gas",
+       "identify",
+       "restart",
+       "update",
+       "tv",
+       "speaker",
+       "receiver",
+       "outlet",
+       "switch",
+       "awning",
+       "blind",
+       "curtain",
+       "damper",
+       "door",
+       "garage",
+       "gate",
+       "shade",
+       "shutter",
+       "window"
+      ]
+     }
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassTurnOff",
+  "description": "Turns off/closes a device or entity. For locks, this performs an 'unlock' action. Use for requests like 'turn off', 'deactivate', 'disable', or 'unlock'.",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "water",
+       "gas",
+       "identify",
+       "restart",
+       "update",
+       "tv",
+       "speaker",
+       "receiver",
+       "outlet",
+       "switch",
+       "awning",
+       "blind",
+       "curtain",
+       "damper",
+       "door",
+       "garage",
+       "gate",
+       "shade",
+       "shutter",
+       "window"
+      ]
+     }
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassCancelAllTimers",
+  "description": "Cancels all timers",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "area": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaUnpause",
+  "description": "Resumes a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaPause",
+  "description": "Pauses a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaNext",
+  "description": "Skips a media player to the next item",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaPrevious",
+  "description": "Replays the previous item for a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassSetVolume",
+  "description": "Sets the volume percentage of a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    },
+    "volume_level": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 100,
+     "description": "The volume percentage of the media player"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassSetVolumeRelative",
+  "description": "Increases or decreases the volume of a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "volume_step": {
+     "anyOf": [
+      {
+       "type": "string",
+       "enum": [
+        "down",
+        "up"
+       ]
+      },
+      {
+       "type": "integer",
+       "minimum": -100,
+       "maximum": 100
+      }
+     ]
+    },
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaPlayerMute",
+  "description": "Mutes a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    },
+    "is_volume_muted": {
+     "description": "Whether the media player should be muted or unmuted",
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaPlayerUnmute",
+  "description": "Unmutes a media player",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "media_player"
+      ]
+     }
+    },
+    "device_class": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "tv",
+       "speaker",
+       "receiver"
+      ]
+     }
+    },
+    "is_volume_muted": {
+     "description": "Whether the media player should be muted or unmuted",
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassMediaSearchAndPlay",
+  "description": "Searches for media and plays the first result",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "search_query": {
+     "type": "string"
+    },
+    "media_class": {
+     "type": "string",
+     "enum": [
+      "album",
+      "app",
+      "artist",
+      "channel",
+      "composer",
+      "contributing_artist",
+      "directory",
+      "episode",
+      "game",
+      "genre",
+      "image",
+      "movie",
+      "music",
+      "playlist",
+      "podcast",
+      "season",
+      "track",
+      "tv_show",
+      "url",
+      "video"
+     ]
+    },
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassBroadcast",
+  "description": "Broadcast a message through the home",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "message": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassClimateSetTemperature",
+  "description": "Sets the target temperature of a climate device or entity",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "temperature": {
+     "type": "number"
+    },
+    "area": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassFanSetSpeed",
+  "description": "Sets a fan's speed by percentage",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string",
+      "enum": [
+       "fan"
+      ]
+     }
+    },
+    "percentage": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 100,
+     "description": "The speed percentage of the fan"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassLightSet",
+  "description": "Sets the brightness percentage or color of a light",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "name": {
+     "type": "string"
+    },
+    "area": {
+     "type": "string"
+    },
+    "floor": {
+     "type": "string"
+    },
+    "domain": {
+     "type": "array",
+     "items": {
+      "type": "string"
+     }
+    },
+    "color": {
+     "type": "string"
+    },
+    "temperature": {
+     "type": "integer",
+     "minimum": 0
+    },
+    "brightness": {
+     "type": "integer",
+     "minimum": 0,
+     "maximum": 100,
+     "description": "The brightness percentage of the light between 0 and 100, where 0 is off and 100 is fully lit"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassListAddItem",
+  "description": "Add item to a todo list",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "item": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassListCompleteItem",
+  "description": "Complete item on a todo list",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "item": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "HassListRemoveItem",
+  "description": "Remove one or more items from a todo list",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "item": {
+     "type": "string"
+    },
+    "name": {
+     "type": "string"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "GetDateTime",
+  "description": "Provides the current date and time.",
+  "parameters": {
+   "type": "object",
+   "properties": {}
+  }
+ },
+ {
+  "type": "function",
+  "name": "todo_get_items",
+  "description": "Query a to-do list to find out what items are on it. Use this to answer questions like 'What's on my task list?' or 'Read my grocery list'. Filters items by status (needs_action, completed, all).",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "todo_list": {
+     "type": "string",
+     "enum": [
+      "Shopping List"
+     ]
+    },
+    "status": {
+     "type": "string",
+     "enum": [
+      "needs_action",
+      "completed",
+      "all"
+     ],
+     "description": "Filter returned items by status, by default returns incomplete items",
+     "default": "needs_action"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "tv_launch_app",
+  "description": "Open a streaming app on a TV: Netflix, Hulu, YouTube, Disney+, Prime Video, Spotify, Apple TV or Max, on the living room TV or the bedroom TV. Turns the TV on first if it is off. Use this whenever the user asks to put on, open, launch or watch an app on a TV.. Aliases: ['TV — Launch App']",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "room": {
+     "type": "string",
+     "enum": [
+      "living room",
+      "bedroom"
+     ],
+     "description": "Which TV — the living room TV or the bedroom TV"
+    },
+    "app": {
+     "type": "string",
+     "enum": [
+      "Netflix",
+      "Hulu",
+      "YouTube",
+      "Disney+",
+      "Prime Video",
+      "Spotify",
+      "Apple TV",
+      "Max"
+     ],
+     "description": "Which streaming app to open"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "tv_remote",
+  "description": "Control a TV the way the physical remote does: change channel (up, down or to a specific number), play, pause, stop, fast forward, rewind, volume up or down, mute, move around the on-screen menu (up, down, left, right, select, back, home, guide, menu, info) and switch input. Works on the living room TV and the bedroom TV. Use this for anything that is not turning the TV on/off or opening a streaming app.. Aliases: ['TV — Remote Control']",
+  "parameters": {
+   "type": "object",
+   "properties": {
+    "room": {
+     "type": "string",
+     "enum": [
+      "living room",
+      "bedroom"
+     ],
+     "description": "Which TV — the living room TV or the bedroom TV"
+    },
+    "action": {
+     "type": "string",
+     "enum": [
+      "channel up",
+      "channel down",
+      "channel",
+      "play",
+      "pause",
+      "stop",
+      "fast forward",
+      "rewind",
+      "volume up",
+      "volume down",
+      "mute",
+      "up",
+      "down",
+      "left",
+      "right",
+      "select",
+      "back",
+      "home",
+      "menu",
+      "guide",
+      "info",
+      "exit",
+      "source"
+     ],
+     "description": "What the remote should do"
+    },
+    "channel": {
+     "type": "number",
+     "minimum": 1.0,
+     "maximum": 9999.0,
+     "description": "Channel number, only used when action is \"channel\""
+    },
+    "repeats": {
+     "type": "number",
+     "minimum": 1.0,
+     "maximum": 20.0,
+     "description": "How many times to send it, for example volume up 5 times"
+    }
+   }
+  }
+ },
+ {
+  "type": "function",
+  "name": "GetLiveContext",
+  "description": "Provides real-time information about the CURRENT state, value, or mode of devices, sensors, entities, or areas. Use this tool for: 1. Answering questions about current conditions (e.g., 'Is the light on?'). 2. As the first step in conditional actions (e.g., 'If the weather is rainy, turn off sprinklers' requires checking the weather first).",
+  "parameters": {
+   "type": "object",
+   "properties": {}
+  }
+ }
+]

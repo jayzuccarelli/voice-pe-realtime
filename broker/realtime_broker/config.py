@@ -119,6 +119,9 @@ class Config:
     # model has not opened a turn on it by the time the speaker goes quiet,
     # the words are handed to it as text. Once per wake.
     live_fallback_transcription: bool = True
+    # Withhold the model's audio until the request is verified and the backend
+    # has answered. On by default; off only to score the broker without it.
+    live_output_hold: bool = True
     # gpt-4o-mini-transcribe returned garbage on one of two passes over a
     # far-field "turn the living room TV off"; gpt-4o-transcribe and
     # whisper-1, both told the language, were right on every pass over three
@@ -201,6 +204,7 @@ class Config:
             live_flush_pace=_non_negative_float("LIVE_FLUSH_PACE", cls.live_flush_pace),
             live_fallback_transcription=os.environ.get("LIVE_FALLBACK_TRANSCRIPTION", "1").lower()
             in ("1", "true", "yes"),
+            live_output_hold=os.environ.get("LIVE_OUTPUT_HOLD", "1").lower() in ("1", "true", "yes"),
             live_fallback_model=os.environ.get("LIVE_FALLBACK_MODEL", cls.live_fallback_model),
             live_fallback_check_model=os.environ.get(
                 "LIVE_FALLBACK_CHECK_MODEL", cls.live_fallback_check_model

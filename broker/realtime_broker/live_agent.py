@@ -105,9 +105,11 @@ class VoicePELiveService(OpenAILiveLLMService):
         fallback_language: str = "en",
         memory_turns: int = 8,
         memory_minutes: float = 60.0,
+        output_hold: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
+        self._output_hold_enabled = bool(output_hold)
         self._flush_pace = float(flush_pace)
         # Audio waiting to go to the model at real-time pace once the session
         # is live: what was captured while it opened, then anything that
@@ -749,7 +751,12 @@ class VoicePELiveService(OpenAILiveLLMService):
         cut the start off the answer ("21 p.m. on Saturday", 2026-09-19).
         Without answer text, a moment after the backend finishes is still
         held but kept, and replayed if it turns out to be the answer.
+
+        LIVE_OUTPUT_HOLD=0 turns all of this off so the eval can score the
+        broker with and without it (evals/gate.py).
         """
+        if not self._output_hold_enabled:
+            return False, False
         if not self._request_known:
             if (
                 self._held_since is not None
@@ -1324,6 +1331,7 @@ def build_live_agent(config: Config) -> VoicePELiveService:
         fallback_language=config.live_fallback_language,
         memory_turns=config.live_memory_turns,
         memory_minutes=config.live_memory_minutes,
+        output_hold=config.live_output_hold,
         settings=VoicePELiveService.Settings(
             model=config.live_model,
             voice=config.live_voice or config.voice,
