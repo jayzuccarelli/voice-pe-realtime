@@ -49,6 +49,11 @@ VOICE = os.environ.get("LIVE_VOICE", "cedar")
 API_KEY = os.environ["OPENAI_API_KEY"]
 HA_MCP_URL = os.environ["HA_MCP_URL"]
 HA_TOKEN = os.environ["HA_TOKEN"]
+HA_URL = HA_MCP_URL.split("/mcp_server")[0]
+# TVs muted for the length of a conversation. The room's TV was heard as the
+# user: its lines were answered and real requests were lost under it
+# (2026-10-21/22). Comma-separated media_player entity ids; empty = off.
+MUTE_ON_WAKE = [e for e in os.environ.get("MUTE_ON_WAKE", "").split(",") if e]
 RATE = 24000
 # Seconds of quiet after the assistant speaks before the conversation ends.
 # 6 s closed on a re-ask that came 7 s later (2026-09-29).
@@ -479,10 +484,35 @@ class Conversation:
             if now - self.started > HARD_CAP_S:
                 log.info("hard cap reached")
                 return
+            # The puck hangs up after 10 s without audio; a slow tool (the TV
+            # took 8 s to switch off) ended the wake before the answer
+            # (2026-10-22). Silence while waiting keeps it on the line.
+            if (self.busy or self.pending) and now - self.play_end > 2:
+                self.outgoing.append((now, bytes(RATE // 10 * 2)))
             quiet = now - self.heard_until
             if not self.busy and not self.pending and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
                 log.info("quiet for %.0fs, ending the conversation", quiet)
                 return
+
+
+async def mute_tvs(mute: bool, only: list[str] | None = None) -> list[str]:
+    """Mute (or unmute) the MUTE_ON_WAKE TVs that are on; returns the ones touched."""
+    touched = []
+    async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {HA_TOKEN}"},
+                                     timeout=aiohttp.ClientTimeout(total=5)) as http:
+        for entity in MUTE_ON_WAKE if only is None else only:
+            try:
+                async with http.get(f"{HA_URL}/api/states/{entity}") as r:
+                    if (await r.json()).get("state") != "on":
+                        continue
+                async with http.post(f"{HA_URL}/api/services/media_player/volume_mute",
+                                     json={"entity_id": entity, "is_volume_muted": mute}) as r:
+                    r.raise_for_status()
+                touched.append(entity)
+                log.info("%s %s", "muted" if mute else "unmuted", entity)
+            except Exception as exc:  # noqa: BLE001 - a TV that will not mute must not cost the conversation
+                log.info("could not %s %s: %s", "mute" if mute else "unmute", entity, exc)
+    return touched
 
 
 async def handle(request: web.Request) -> web.WebSocketResponse:
@@ -490,6 +520,7 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
     await puck.prepare(request)
     woke = time.monotonic()
     log.info("wake from %s", request.remote)
+    muting = asyncio.create_task(mute_tvs(True))
     try:
         async with sse_client(HA_MCP_URL, headers={"Authorization": f"Bearer {HA_TOKEN}"}) as (r, w), \
                 ClientSession(r, w) as ha:
@@ -519,6 +550,8 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
             with contextlib.suppress(ConnectionError):
                 await puck.send_str('{"type":"disconnect"}')
         await puck.close()
+        if muted := await muting:
+            await mute_tvs(False, muted)
         log.info("conversation over")
     return puck
 
