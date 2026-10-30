@@ -1,18 +1,27 @@
-"""Voice PE puck <-> GPT-Live with Home Assistant tools, and nothing else.
+"""Voice PE puck -> transcriber -> text model with Home Assistant tools -> speech.
 
-The whole assistant is gpt-live-1: it hears, decides, delegates to its
-backend, and speaks. This file only does what the puck cannot do itself:
+The puck streams its microphone. The relay cuts that into utterances, has a
+transcriber read each one, hands the words to a text model that can act only
+through Home Assistant's tools, and speaks the outcome:
 
-- carry the puck's audio to Live and Live's audio back (PCM16, 24 kHz);
-- run the backend's tool calls against Home Assistant over MCP and hand the
-  results back to Live;
-- end the conversation, because the puck never hangs up on its own: after
-  FOLLOWUP_S of quiet once the assistant has spoken, and at HARD_CAP_S
-  whatever happens, so a stuck session cannot keep billing.
+- the confirmation of an action is built from the tool result, never from
+  the model's words, so "the lights are off" cannot be said unless a tool
+  reported it (gpt-live-1 said it without acting on 4 of 14 commands,
+  2026-10-20..29, and "the front door is now locked" to "actually nothing");
+- "On it." plays the moment a command is read, before the model is asked,
+  so the acknowledgement comes before the action instead of after it;
+- an answer that needs no action is the model's text, spoken as is.
 
-No transcript checks, no output holds, no retries, no memory: the eval
-(evals/gate.py) showed each of those made the broker slower and less
-accurate than Live on its own.
+Until 2026-10-30 gpt-live-1 was the ear and the brain. On this puck it
+produced a transcript for about one utterance in five at any length (of
+twelve identical "What time is it?" wakes it heard one), so the transcriber
+was already carrying the conversation as a fallback. This file makes that
+the design. The puck's firmware closes the mic while audio plays, so
+nothing is lost on interruptions: there were none to lose.
+
+The relay still does what the puck cannot: mute the room's TVs for the
+length of the conversation, keep the puck on the line through a slow tool,
+and hang up after FOLLOWUP_S of quiet or at HARD_CAP_S whatever happens.
 
     broker/.venv-live/bin/python minimal/relay.py     # listens on :8767
 """
@@ -20,18 +29,19 @@ accurate than Live on its own.
 from __future__ import annotations
 
 import asyncio
-import base64
 import collections
 import contextlib
-import copy
 import json
 import logging
 import os
+import re
 import struct
 import time
 import urllib.request
 import uuid
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiohttp import web
@@ -42,10 +52,15 @@ from mcp.client.sse import sse_client
 load_dotenv(Path(__file__).resolve().parent.parent / "broker" / ".env")
 
 PORT = int(os.environ.get("MINIMAL_PORT", "8767"))
-LIVE_URL = os.environ.get("LIVE_URL", "wss://api.openai.com/v1/live/sessions")
-LIVE_MODEL = os.environ.get("LIVE_MODEL", "gpt-live-1")
-BACKEND_MODEL = os.environ.get("LIVE_BACKEND_MODEL", "gpt-5.4-mini")
+BRAIN_MODEL = os.environ.get("LIVE_BACKEND_MODEL", "gpt-5.4-mini")
+# Two transcribers read every utterance and the better-scoring English
+# reading wins. One alone is a coin flip on a short far-field clip: the same
+# "Turn the living room lights on." came back as Afrikaans, then as
+# 'livingroom lights on.' at mean -0.80, on consecutive replays (2026-10-30).
+STT_MODELS = tuple(os.environ.get("STT_MODELS", "gpt-4o-transcribe,gpt-4o-mini-transcribe").split(","))
+TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
 VOICE = os.environ.get("LIVE_VOICE", "cedar")
+TZ = ZoneInfo(os.environ.get("HOUSE_TZ", "America/New_York"))
 API_KEY = os.environ["OPENAI_API_KEY"]
 HA_MCP_URL = os.environ["HA_MCP_URL"]
 HA_TOKEN = os.environ["HA_TOKEN"]
@@ -55,76 +70,80 @@ HA_URL = HA_MCP_URL.split("/mcp_server")[0]
 # (2026-10-21/22). Comma-separated media_player entity ids; empty = off.
 MUTE_ON_WAKE = [e for e in os.environ.get("MUTE_ON_WAKE", "").split(",") if e]
 RATE = 24000
-# Seconds of quiet after the assistant speaks before the conversation ends.
-# 6 s closed on a re-ask that came 7 s later (2026-09-29).
+CHUNK = RATE // 10 * 2  # 100 ms of audio to the puck; its playback queue holds ten
 FOLLOWUP_S = 10.0
 FIRST_REPLY_S = 15.0
 HARD_CAP_S = 180.0
-# The production broker's proven values for telling Live's speech from its
-# silence (broker/realtime_broker/live_server.py).
-SILENCE_RMS = 50.0
-SILENCE_HOLD_S = 0.8
-# How long Live's audio is held before it goes to the puck: the slack that
-# absorbs network jitter so playback is not choppy.
+# How far ahead of its playback the puck is kept: the slack that absorbs
+# network jitter so speech is not choppy. Audio is paced at real time after
+# that; a whole reply sent at once overran the puck's heap (11 KB free
+# during playback, 2026-10-19).
 PREROLL_S = 0.4
-# The handoff. Measured on real puck recordings with no relay at all
-# (evals/gate.py --voice real): gpt-live-1 hears longer requests 10/10
-# and short ones ("What time is it?", "Put Netflix on.") 0/15, at any
-# level, with or without noise. It exposes no input setting. The same audio
-# reads correctly through gpt-4o-transcribe every time, so when the mic
-# clearly carried speech and Live produced no transcript, that text goes
-# to Live's backend as the user's words. Live does everything else.
-HANDOFF_MODEL = "gpt-4o-transcribe"
-HANDOFF_QUIET_S = 0.7  # this much quiet ends an utterance
-HANDOFF_MIN_SPEECH_S = 0.3  # shorter bursts are noise
-# Mic level that opens an utterance for the handoff. A quiet "Put Netflix
-# on." from across the room sits at 150-260, the room's floor at 30-60. Anything opened here is still judged by the
-# transcriber before Live sees a word of it.
+# The cutter, measured in production since 2026-09-27 and unchanged here. A
+# quiet "Put Netflix on." from across the room sits at 150-260 RMS, the
+# room's floor at 30-60; with the TV on the room sat at 500-800 for a whole
+# conversation and a fixed threshold never closed an utterance, so speech
+# must also be FLOOR_RATIO above the quietest 100 ms of the last 3 s.
 UTTERANCE_RMS = 120.0
-HANDOFF_GRACE_S = 1.0  # how long after the utterance Live gets to transcribe it
-HANDOFF_LEAD_FRAMES = 20  # 0.4 s kept from before speech opened: the words said right after the chime
-# Below these the transcriber was guessing. Loose on purpose: with the TV on,
-# a real "Can you turn Netflix on?" scored mean -0.23, lowest -1.13, while
-# pure noise came back as 'Schön.' at -2.52 and a Korean word at -1.63. The
-# speech-length rule above is what keeps room tone out; this catches the
-# fragments that slip past it.
-HANDOFF_MEAN_LOGPROB = -0.4
-HANDOFF_MIN_LOGPROB = -1.5
-# Speech must also stand this far above the room's own level, measured as
-# the quietest 100 ms of the last FLOOR_FRAMES frames. With the TV on the
-# room sat at 500-800 for a whole conversation, every frame counted as
-# speech, the utterance never ended and nothing was handed off
-# (2026-09-30). His words peaked at 2500-9000 over that floor.
 FLOOR_RATIO = 2.5
 FLOOR_FRAMES = 150  # 3 s
-HANDOFF_MAX_S = 8.0  # an utterance this long is handed off as it stands
-
+QUIET_S = 0.7  # this much quiet ends an utterance
+MIN_SPEECH_S = 0.3  # shorter bursts are noise
+LEAD_FRAMES = 20  # 0.4 s kept from before speech opened: the words said right after the chime
+MAX_UTTERANCE_S = 8.0  # an utterance this long is read as it stands
+# Frame counts are in puck chunks of 20 ms (one microphone callback each;
+# the firmware's AUDIO_SEND_INTERVAL_MS = 100 is nominal). Measured by
+# replaying tapes at several sizes against production's cut times
+# (evals/cutter_replay.py, 2026-10-30): 20 ms matches to the tenth.
+# Every transcriber writes a sentence when given noise (16 s of room tone
+# came back as "Honestly, Carl, if you give a shit."; a chair scrape as
+# 'Schön.'). Mean token log-probability tells them apart: of 33 wakes
+# 2026-10-20..29 every real sentence scored mean >= -0.53 and every
+# invented one <= -0.59 or came out in another alphabet. The lowest single
+# token is NOT used: a long clean command always has one unlikely word in
+# it ("Turn Netflix on, living room TV and turn the lights on in the living
+# room." was thrown away at min -3.04 while scoring mean -0.30).
+GUARD_MIN_WORDS = 2
+GUARD_MEAN_LOGPROB = -0.6
+GUARD_ASCII = 0.9  # share of letters that must be plain ASCII: language=en is a hint, not a rule
+# No vocabulary "prompt" for the transcriber: given one, it returned the
+# prompt itself as the transcript of a half-second of room noise, at a
+# log-probability that passed the guard, and seven tools fired in reply
+# to "the what?" (harness, 2026-10-30).
+HOUSE_AREAS = os.environ.get("HOUSE_AREAS", "the living room, the bedroom, the office and the kitchen")
+ACK = "On it."
+# Only a command gets the acknowledgement; a question gets its answer, room
+# talk that slipped through the guard gets nothing.
+COMMAND_RE = re.compile(
+    r"\b(turn|switch|put|play|pause|resume|set|dim|mute|unmute|stop|start|open|close|lock|unlock|"
+    r"netflix|youtube|spotify|lights?|lamp|tv|television|playstation|ps5|volume)\b", re.I)
 INSTRUCTIONS = os.environ.get(
     "INSTRUCTIONS",
     "You are Atriensis, the household steward for this smart home. Always respond in English. "
-    "Be concise, warm, and natural, like a capable, unflappable butler. You can control the home "
-    "with the available tools; when asked to do something, just do it and confirm in one short sentence.",
+    "Be concise, warm, and natural, like a capable, unflappable butler.",
 ) + (
-    # Without this Live answered "what time is it" at once with an invented
-    # time ("11:34 p.m.", "3:45") and never asked the backend (2026-09-28).
-    " You have no clock: the time and date always come from your backend, never from a guess."
-    # The backend acts in well under a second. "Of course, one moment" took
-    # longer to say than the lights took to go off, and the confirmation
-    # then trailed the action by two seconds (2026-09-30).
-    " Never announce that you are about to do something or ask for a moment: act, then confirm."
+    " Each message is one request transcribed from a far-field microphone. The transcriber garbles "
+    "the opening words of a command and keeps the end, so the device and the LAST state word are the "
+    "request: 'Don't be leaving the lights off', 'Don't put the living room lights off', 'I'm leaving "
+    "the lights off' and 'Remember lights off' all mean 'Turn the lights off' (off, never on); "
+    "'Fernando PlayStation 5' is 'Turn on the PlayStation 5'; 'Netflix on out there' is 'Put Netflix "
+    f"on'. The rooms are {HOUSE_AREAS}; 'living' means the living room. Whenever a device of this "
+    "home is named with on or off, or you are asked to play, put on, open or pause something, act on "
+    "it. An app or show named without such a verb is not a request. When the speaker corrects "
+    "themselves ('the TV, uh, the light'), only the correction counts. Never act on a device, app or "
+    "room that was not named. To turn a TV off or on use HassTurnOff or HassTurnOn on the media "
+    "player, not the remote. You can act on the home only through the tools: when asked to do "
+    "something, call the tool and write nothing. When asked a question, answer in one short spoken "
+    "sentence with no Markdown. If you called no tool, never say that anything was done. If the words "
+    "are only the wake word ('Hey Mycroft', 'Minecraft', 'Michael'), or name nothing in the home and "
+    "ask you nothing (overheard conversation, a fragment, a TV line), reply with exactly: (nothing)"
 )
-BACKEND_INSTRUCTIONS = (
-    "You are the backend of a home voice assistant. Each message is the recent voice conversation "
-    "as a transcript; work out what is being asked and do it. Use the Home Assistant tools to "
-    "control the home and read live state. Reply with the verified result in one short "
-    "conversational sentence the assistant can say aloud, with no Markdown and no JSON, and never "
-    "claim an action completed without a tool result confirming it."
-)
-
 log = logging.getLogger("minimal")
 # MINIMAL_TAPE=<dir> saves what the puck sent on each wake as a WAV: the one
-# way to tell a bad microphone from a bad relay when Live mishears.
+# way to tell a bad microphone from a bad relay when a request is misheard.
 TAPE_DIR = os.environ.get("MINIMAL_TAPE", "")
+OPENAI = "https://api.openai.com/v1"
+AUTH = {"Authorization": f"Bearer {API_KEY}"}
 
 
 def save_tape(pcm: bytearray) -> None:
@@ -146,17 +165,11 @@ def wav(pcm: bytes) -> bytes:
     return head + b"data" + struct.pack("<I", len(pcm)) + pcm
 
 
-def transcribe(pcm: bytes) -> tuple[str, float, float]:
-    """The words, with the model's mean and lowest token log-probability.
-
-    Every transcriber writes a sentence when given noise (16 s of room tone
-    came back as "Honestly, Carl, if you give a shit."). The log-probs tell
-    it apart: real requests score mean >= -0.05 and lowest >= -0.16,
-    that invented one -0.27 and -0.94.
-    """
+def transcribe(pcm: bytes, model: str) -> tuple[str, float]:
+    """The words, with the model's mean token log-probability."""
     boundary = uuid.uuid4().hex
     body = b""
-    fields = (("model", HANDOFF_MODEL), ("language", "en"), ("response_format", "json"), ("include[]", "logprobs"))
+    fields = (("model", model), ("language", "en"), ("response_format", "json"), ("include[]", "logprobs"))
     for name, value in fields:
         body += f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n".encode()
     body += (
@@ -164,15 +177,19 @@ def transcribe(pcm: bytes) -> tuple[str, float, float]:
         "Content-Type: audio/wav\r\n\r\n"
     ).encode() + wav(pcm) + f"\r\n--{boundary}--\r\n".encode()
     req = urllib.request.Request(
-        "https://api.openai.com/v1/audio/transcriptions", data=body,
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": f"multipart/form-data; boundary={boundary}"},
+        f"{OPENAI}/audio/transcriptions", data=body,
+        headers={**AUTH, "Content-Type": f"multipart/form-data; boundary={boundary}"},
     )
     with urllib.request.urlopen(req, timeout=20) as r:
         result = json.loads(r.read())
     logprobs = [t["logprob"] for t in result.get("logprobs") or []]
-    if not logprobs:
-        return result["text"].strip(), 0.0, 0.0
-    return result["text"].strip(), sum(logprobs) / len(logprobs), min(logprobs)
+    return result["text"].strip(), (sum(logprobs) / len(logprobs)) if logprobs else 0.0
+
+
+def is_speech(text: str, mean_lp: float) -> bool:
+    letters = [c for c in text if c.isalpha()]
+    ascii_share = sum(c.isascii() for c in letters) / len(letters) if letters else 0.0
+    return len(text.split()) >= GUARD_MIN_WORDS and mean_lp >= GUARD_MEAN_LOGPROB and ascii_share >= GUARD_ASCII
 
 
 def rms(pcm: bytes) -> float:
@@ -180,76 +197,74 @@ def rms(pcm: bytes) -> float:
     return (sum(s * s for s in samples) / len(samples)) ** 0.5 if len(samples) else 0.0
 
 
-def live_tool(tool) -> dict:
-    """An MCP tool as a Live backend function: optional fields become nullable, all listed."""
-    params = copy.deepcopy(tool.inputSchema or {"type": "object", "properties": {}})
-    props = params.setdefault("properties", {})
-    required = set(params.get("required", []))
-    for name, schema in list(props.items()):
-        if name not in required:
-            props[name] = {"anyOf": [schema, {"type": "null"}]}
-    params["required"] = list(props)
-    params["additionalProperties"] = False
-    return {"type": "function", "name": tool.name, "description": tool.description or tool.name,
-            "parameters": params}
+def chat_tool(tool) -> dict:
+    return {"type": "function", "function": {
+        "name": tool.name, "description": tool.description or tool.name,
+        "parameters": tool.inputSchema or {"type": "object", "properties": {}}}}
 
 
-def session_start(tools: list[dict]) -> dict:
-    return {
-        "type": "session.start",
-        "session": {
-            "model": LIVE_MODEL,
-            "instructions": INSTRUCTIONS,
-            "audio": {"format": {"type": "audio/pcm", "rate": RATE}, "output": {"voice": VOICE}},
-            "delegation": {
-                "type": "responses",
-                "responses": {
-                    "model": BACKEND_MODEL,
-                    "instructions": BACKEND_INSTRUCTIONS,
-                    "tools": tools,
-                    "tool_choice": "auto",
-                    "parallel_tool_calls": True,
-                    "reasoning": {"effort": "none"},
-                    "text": {"verbosity": "low"},
-                },
-            },
-        },
-    }
+ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_)")  # tools that change the house; the rest only read it
+
+
+def confirmation(acted: list[tuple[str, dict]]) -> str:
+    """What to say about the actions that ran, from their results alone."""
+    said = []
+    for name, output in acted:
+        if "error" in output:
+            said.append("That didn't work.")
+            continue
+        try:
+            result = json.loads(output.get("result") or "{}")
+        except ValueError:
+            result = {}
+        if result.get("success") is False:
+            said.append("That didn't work.")
+            continue
+        if "response_type" not in result and "result" in result:
+            result = result["result"]  # the eval's fake house wraps HA's shape
+        if isinstance(result, str):  # a custom tool's own words ("Launched Netflix on the living room TV")
+            said.append(result.strip().rstrip(".") + ".")
+            continue
+        data = result.get("data") or {}
+        names = list(dict.fromkeys(e.get("name", "") for e in data.get("success") or [] if e.get("name")))
+        if result.get("response_type") == "error" or (not names and data.get("failed")):
+            said.append("That didn't work.")
+        elif names and name in ("HassTurnOff", "HassTurnOn"):
+            said.append(f"{', '.join(names)} {name[-3:].lower() if name.endswith('Off') else 'on'}.")
+        elif names:
+            said.append(f"{', '.join(names)}: done.")
+        else:
+            said.append(((result.get("speech") or {}).get("plain") or {}).get("speech") or "Done.")
+    return " ".join(said)
 
 
 class Conversation:
     """One wake: from the puck connecting to the relay closing it."""
 
-    def __init__(self, puck: web.WebSocketResponse, live, ha: ClientSession) -> None:
-        self.puck, self.live, self.ha = puck, live, ha
+    def __init__(self, puck: web.WebSocketResponse, ha: ClientSession, http: aiohttp.ClientSession,
+                 tools: list[dict]) -> None:
+        self.puck, self.ha, self.http, self.tools = puck, ha, http, tools
         self.started = time.monotonic()
         self.heard_until = self.started  # when the puck finishes playing what it has been sent
         self.spoke = False
-        self.pending: dict[str, list[asyncio.Task]] = {}
-        self.busy = 0  # tool calls in flight
+        self.busy = 0  # turns in flight: transcribing, thinking, or a tool running
         self.tape = bytearray()  # everything the puck sent, for MINIMAL_TAPE
-        self.last_loud = 0.0  # when Live's audio last carried speech
         self.play_end = 0.0  # when the audio sent so far finishes playing on the puck
-        self.prev_loud = False
+        self.cursor = 0.0  # when the audio queued so far finishes playing
         self.outgoing: collections.deque[tuple[float, bytes]] = collections.deque()  # (send at, pcm)
-        # The handoff's view of the mic: the utterance being spoken, and when
-        # Live last showed it had heard anything.
-        self.recent: collections.deque[bytes] = collections.deque(maxlen=HANDOFF_LEAD_FRAMES)
+        self.history: list[dict] = []  # this wake's turns, so "and the bedroom too" has context
+        # The cutter's view of the mic.
+        self.recent: collections.deque[bytes] = collections.deque(maxlen=LEAD_FRAMES)
         self.smooth: collections.deque[float] = collections.deque(maxlen=5)  # 100 ms of levels
         self.levels: collections.deque[float] = collections.deque(maxlen=FLOOR_FRAMES)
         self.utterance: bytearray | None = None
-        self.utterance_started = 0.0
         self.mic_s = 0.0  # seconds of mic audio received so far
         self.voiced_s = 0.0
         self.quiet_s = 0.0
-        self.live_heard_at = 0.0
-        self.backend_started_at = 0.0  # Live delegated on its own
-        self.answer_words = 0  # words Live has spoken since the utterance opened
-        self.handoffs: set[asyncio.Task] = set()
+        self.turns: set[asyncio.Task] = set()
 
     async def run(self) -> None:
-        tasks = [asyncio.create_task(c)
-                 for c in (self.from_puck(), self.from_live(), self.speaker(), self.clock())]
+        tasks = [asyncio.create_task(c) for c in (self.from_puck(), self.speaker(), self.clock())]
         _, rest = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for t in rest:
             t.cancel()
@@ -260,99 +275,48 @@ class Conversation:
                 await self.puck.send_bytes(pcm)
 
     async def speaker(self) -> None:
-        """Keep PREROLL_S of Live's audio queued on the puck while it speaks.
-
-        Live sends 100 ms chunks in real time with no slack, and some arrive
-        up to ~120 ms late. Delaying every chunk by the same PREROLL_S (the
-        old way) passed each late chunk straight through as a hole in the
-        voice (2026-10-20). Now only the first chunk of a reply waits
-        PREROLL_S; while the puck still has audio to play, chunks go out as
-        soon as they arrive, so the puck stays PREROLL_S ahead and a late
-        chunk is absorbed.
-        """
+        """Send queued audio when it is due; each chunk is due PREROLL_S before it plays."""
         while True:
             if not self.outgoing:
                 await asyncio.sleep(0.01)
                 continue
             due, pcm = self.outgoing[0]
-            if self.play_end <= time.monotonic() and (wait := due - time.monotonic()) > 0:
+            if (wait := due - time.monotonic()) > 0:
                 await asyncio.sleep(wait)
             self.outgoing.popleft()
-            # Where the puck's playback would be if nothing stalled: a chunk
-            # sent after that point plays after a hole of silence.
-            # Counted only between two chunks of speech, so pauses Live
-            # makes itself are not reported.
-            now = time.monotonic()
-            loud = rms(pcm) >= SILENCE_RMS
-            if loud and self.prev_loud and now - self.play_end > 0.05:
-                log.info("playback gap: %.0f ms of silence mid-speech", (now - self.play_end) * 1000)
-            self.prev_loud = loud
-            self.play_end = max(self.play_end, now) + len(pcm) / 2 / RATE
+            self.play_end = max(self.play_end, time.monotonic()) + len(pcm) / 2 / RATE
             await self.puck.send_bytes(pcm)
+
+    def queue(self, pcm: bytes) -> None:
+        """Schedule audio at real time from the end of whatever is already queued."""
+        self.cursor = max(time.monotonic(), self.play_end, self.cursor)
+        for i in range(0, len(pcm), CHUNK):
+            chunk = pcm[i:i + CHUNK]
+            self.outgoing.append((self.cursor - PREROLL_S, chunk))
+            self.cursor += len(chunk) / 2 / RATE
+        self.spoke = True
+        self.heard_until = max(self.heard_until, self.cursor)
 
     async def from_puck(self) -> None:
         async for msg in self.puck:
             if msg.type == aiohttp.WSMsgType.BINARY:
                 self.tape.extend(msg.data)
-                # The user is talking even when Live does not transcribe it.
-                # Keyed only on Live's transcript, the relay hung up on "dude,
-                # I asked you a question" mid-sentence (2026-09-29). Only an
-                # utterance with real speech in it counts: a single loud frame
-                # did, and a room at ~150 RMS kept a wake open 104 s with the
-                # light spinning (2026-10-19).
-                level = rms(msg.data)
-                self.track_utterance(msg.data, level)
-                if self.utterance is not None and self.voiced_s >= HANDOFF_MIN_SPEECH_S:
+                self.track_utterance(msg.data, rms(msg.data))
+                # The user is talking: keep the wake open. Only an utterance
+                # with real speech in it counts: a single loud frame did, and
+                # a room at ~150 RMS kept a wake open 104 s (2026-10-19).
+                if self.utterance is not None and self.voiced_s >= MIN_SPEECH_S:
                     self.heard_until = max(self.heard_until, time.monotonic())
-                await self.live.send_json({"type": "session.input_audio.append",
-                                           "audio": base64.b64encode(msg.data).decode()})
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 log.info("puck says %s", msg.data)
         log.info("puck hung up")
 
-    async def from_live(self) -> None:
-        async for msg in self.live:
-            if msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-            event = json.loads(msg.data)
-            kind = event.get("type")
-            if kind != "session.output_audio.delta":
-                inner = (event.get("event") or {}).get("type", "")
-                log.debug("live event %s %s", kind, inner)
-            if kind == "session.output_audio.delta":
-                pcm = base64.b64decode(event["delta"])
-                now = time.monotonic()
-                # Live streams silence without end once it has spoken. The
-                # puck keeps its mic muted while anything plays, so relaying
-                # that silence left it deaf after the first answer and kept
-                # every wake open to the hard cap (2026-09-28). Quiet frames
-                # just after speech are kept: they are commas and breaths.
-                if rms(pcm) < SILENCE_RMS and now - self.last_loud > SILENCE_HOLD_S:
-                    continue
-                if rms(pcm) >= SILENCE_RMS:
-                    self.last_loud = now
-                self.heard_until = max(self.heard_until, now + PREROLL_S) + len(pcm) / 2 / RATE
-                self.spoke = True
-                self.outgoing.append((now + PREROLL_S, pcm))
-            elif kind == "session.input_transcript.delta":
-                self.heard_until = self.live_heard_at = max(self.heard_until, time.monotonic())
-                log.info("heard: %s", event.get("delta", "").strip())
-            elif kind == "session.output_transcript.delta":
-                self.answer_words += len(event.get("delta", "").split())
-                log.info("said: %s", event.get("delta", "").strip())
-            elif kind == "response.event":
-                await self.on_backend(event.get("event") or {})
-            elif kind in ("error", "session.closed"):
-                log.info("live %s: %s", kind, json.dumps(event)[:300])
-                if kind == "session.closed":
-                    return
-
     def track_utterance(self, pcm: bytes, level: float) -> None:
-        """Cut the mic into utterances; each one that ends gets a handoff check."""
-        now = time.monotonic()
+        """Cut the mic into utterances; each one that ends with speech in it becomes a turn."""
         secs = len(pcm) / 2 / RATE
         self.mic_s += secs
-        self.recent.append(pcm)
+        if self.mic_s > 0.6:
+            self.recent.append(pcm)  # never the chime: it sends the transcriber into other languages
         # The room's level: the quietest tenth of a second in the last three.
         # Speech has such gaps between words; a chime or a sentence does not
         # drag it up, the TV between words does.
@@ -367,9 +331,7 @@ class Conversation:
             # second arrives in one burst.
             if loud and self.mic_s > 0.6:
                 self.utterance = bytearray(b"".join(self.recent))
-                self.utterance_started = now
                 self.voiced_s = self.quiet_s = 0.0
-                self.answer_words = 0
             return
         self.utterance.extend(pcm)
         if loud:
@@ -377,82 +339,94 @@ class Conversation:
             self.quiet_s = 0.0
         else:
             self.quiet_s += secs
-        if self.quiet_s >= HANDOFF_QUIET_S or len(self.utterance) >= HANDOFF_MAX_S * RATE * 2:
-            done, started, voiced = bytes(self.utterance), self.utterance_started, self.voiced_s
+        if self.quiet_s >= QUIET_S or len(self.utterance) >= MAX_UTTERANCE_S * RATE * 2:
+            done, voiced = bytes(self.utterance), self.voiced_s
             self.utterance = None
             log.info("utterance: %.1fs of speech at mic %.1fs%s", voiced, self.mic_s,
-                     "" if voiced >= HANDOFF_MIN_SPEECH_S else " (too short)")
-            if voiced >= HANDOFF_MIN_SPEECH_S:
-                # Kept in self.handoffs: an unreferenced task can be garbage
-                # collected mid-await, and this one sleeps first.
-                task = asyncio.create_task(self.handoff(done, started))
-                self.handoffs.add(task)
-                task.add_done_callback(self.handoffs.discard)
+                     "" if voiced >= MIN_SPEECH_S else " (too short)")
+            if voiced >= MIN_SPEECH_S:
+                self.on_utterance(done)
 
-    async def handoff(self, pcm: bytes, started: float) -> None:
-        await asyncio.sleep(HANDOFF_GRACE_S)
-        if self.live_heard_at > started:
-            log.info("handoff: not needed, Live heard it")
-            return
-        if self.backend_started_at > started:
-            # Live made something of the audio and delegated on its own. Let
-            # that finish: if it produced a real answer the words are not
-            # needed, and a second request on top gave "How may I help...
-            # on Thursday" (2026-09-30). If it came back with nothing to
-            # say, hand off as usual.
-            for _ in range(20):
-                await asyncio.sleep(0.2)
-                if not self.pending and not self.busy:
-                    break
-            await asyncio.sleep(1.0)
-            if self.answer_words >= 4 or self.live_heard_at > started:
-                log.info("handoff: not needed, Live answered on its own")
-                return
+    def on_utterance(self, pcm: bytes) -> None:
+        # Kept in self.turns: an unreferenced task can be garbage collected mid-await.
+        task = asyncio.create_task(self.turn(pcm))
+        self.turns.add(task)
+        task.add_done_callback(self.turns.discard)
+
+    async def hear(self, pcm: bytes) -> tuple[str, float] | None:
+        """The best reading of an utterance that passes the guard, or None."""
+        readings = await asyncio.gather(*(asyncio.to_thread(transcribe, pcm, m) for m in STT_MODELS),
+                                        return_exceptions=True)
+        best = None
+        for model, reading in zip(STT_MODELS, readings):
+            if isinstance(reading, BaseException):
+                log.info("%s failed: %s", model, reading)
+                continue
+            text, mean_lp = reading
+            log.debug("%s: %r (mean %.2f)", model, text, mean_lp)
+            if is_speech(text, mean_lp) and (best is None or mean_lp > best[1]):
+                best = (text, mean_lp)
+        if best is None:
+            log.info("not speech (%s)", "; ".join(
+                f"{r[0]!r} {r[1]:.2f}" for r in readings if not isinstance(r, BaseException)))
+        return best
+
+    async def turn(self, pcm: bytes) -> None:
+        self.busy += 1
         try:
-            text, mean_lp, min_lp = await asyncio.to_thread(transcribe, pcm)
-        except Exception as exc:  # noqa: BLE001 - a lost handoff is a lost turn, not a crash
-            log.info("handoff: transcription failed: %s", exc)
-            return
-        if self.live_heard_at > started:
-            return
-        if len(text.split()) < 2 or mean_lp < HANDOFF_MEAN_LOGPROB or min_lp < HANDOFF_MIN_LOGPROB:
-            log.info("handoff: not speech (%r, mean %.2f, min %.2f)", text, mean_lp, min_lp)
-            return
-        log.info("handoff: Live heard nothing; the user said %r", text)
-        self.heard_until = max(self.heard_until, time.monotonic() + 3)
-        # Straight to the backend as the user's words, the way Live's own
-        # transcript would have gone: it acts and Live speaks the result.
-        await self.live.send_json({
-            "type": "response.item.create",
-            "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]},
-        })
-        await self.live.send_json({"type": "response.create"})
-
-    async def on_backend(self, inner: dict) -> None:
-        kind = inner.get("type")
-        item = inner.get("item") or {}
-        if kind == "response.created":
-            self.backend_started_at = time.monotonic()
-        if kind == "response.output_item.done" and item.get("type") == "function_call" \
-                and item.get("status") == "completed":
-            rid = inner.get("response_id") or ""
-            self.pending.setdefault(rid, []).append(asyncio.create_task(self.call(item)))
-        elif kind == "response.completed":
-            rid = (inner.get("response") or {}).get("id", "")
-            calls = self.pending.pop(rid, None) or self.pending.pop("", None)
-            if not calls:
+            t0 = time.monotonic()
+            heard = await self.hear(pcm)
+            if heard is None:
                 return
-            for call_id, output in await asyncio.gather(*calls):
-                await self.live.send_json({
-                    "type": "response.item.create",
-                    "item": {"type": "function_call_output", "call_id": call_id,
-                             "output": json.dumps(output, ensure_ascii=False)},
-                })
-            await self.live.send_json({"type": "response.create"})
+            text, mean_lp = heard
+            log.info("heard: %s (mean %.2f, %.1fs)", text, mean_lp, time.monotonic() - t0)
+            if COMMAND_RE.search(text):
+                await self.ack()
+            answer, acted = await self.think(text)
+            spoken = confirmation(acted) if acted else answer
+            if spoken.strip().lower().startswith("(nothing)"):
+                spoken = ""
+            self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": spoken or "(nothing)"}]
+            await self.say(spoken)
+        except Exception:
+            log.exception("turn failed")
+            await self.say("Sorry, something went wrong.")
+        finally:
+            self.busy -= 1
 
-    async def call(self, item: dict) -> tuple[str, dict]:
-        name = item.get("name", "")
-        args = {k: v for k, v in json.loads(item.get("arguments") or "{}").items() if v is not None}
+    async def think(self, text: str) -> tuple[str, list[tuple[str, dict]]]:
+        """Ask the model; run its tool calls; stop at the first action, or return its answer."""
+        now = datetime.now(TZ).strftime("%A %B %-d, %-I:%M %p")
+        messages = [{"role": "system", "content": f"{INSTRUCTIONS} It is now {now}."}, *self.history,
+                    {"role": "user", "content": text}]
+        acted: list[tuple[str, dict]] = []
+        for _ in range(3):
+            t0 = time.monotonic()
+            async with self.http.post(f"{OPENAI}/chat/completions", headers=AUTH, json={
+                "model": BRAIN_MODEL, "messages": messages, "tools": self.tools,
+                "tool_choice": "auto", "parallel_tool_calls": True,
+            }) as r:
+                data = await r.json()
+            if "choices" not in data:
+                raise RuntimeError(f"chat refused: {json.dumps(data)[:300]}")
+            msg = data["choices"][0]["message"]
+            calls = msg.get("tool_calls") or []
+            log.info("thought %.1fs: %s", time.monotonic() - t0,
+                     ", ".join(c["function"]["name"] for c in calls) or repr((msg.get("content") or "")[:80]))
+            if not calls:
+                return (msg.get("content") or "").strip(), acted
+            messages.append({"role": "assistant", "content": msg.get("content"), "tool_calls": calls})
+            outputs = await asyncio.gather(*(self.call(c["function"]["name"], c["function"]["arguments"]) for c in calls))
+            for c, output in zip(calls, outputs):
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(output, ensure_ascii=False)})
+                if ACTION_TOOLS.match(c["function"]["name"]):
+                    acted.append((c["function"]["name"], output))
+            if acted:
+                return "", acted
+        return "", acted
+
+    async def call(self, name: str, arguments: str) -> dict:
+        args = {k: v for k, v in json.loads(arguments or "{}").items() if v is not None}
         # "Can you turn the lights off?" became HassTurnOff(domain=[light, switch])
         # with no name or area: every exposed switch went off, the server's
         # own outlet among them (2026-10-10).
@@ -463,19 +437,52 @@ class Conversation:
             output = {"error": "Refused: switches are never turned on or off all at once. For lights "
                                "use domain [\"light\"] alone; for a switch, give its name or area."}
             log.info("tool %s(%s) -> %s", name, json.dumps(args), json.dumps(output)[:200])
-            return item.get("call_id", ""), output
-        self.busy += 1
+            return output
         try:
             result = await self.ha.call_tool(name, args)
             text = "".join(getattr(c, "text", "") for c in result.content)
             output = {"error": text} if result.isError else {"result": text}
-        except Exception as exc:  # noqa: BLE001 - a failed call is reported to the model, not raised
+        except Exception as exc:  # noqa: BLE001 - a failed call is reported, not raised
             output = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
-            self.busy -= 1
             self.heard_until = max(self.heard_until, time.monotonic())
         log.info("tool %s(%s) -> %s", name, json.dumps(args), json.dumps(output)[:200])
-        return item.get("call_id", ""), output
+        return output
+
+    async def tts(self, text: str) -> bytes:
+        async with self.http.post(f"{OPENAI}/audio/speech", headers=AUTH, json={
+            "model": TTS_MODEL, "voice": VOICE, "input": text, "response_format": "pcm",
+        }) as r:
+            if r.status != 200:
+                raise RuntimeError(f"tts {r.status}: {(await r.text())[:200]}")
+            return await r.read()
+
+    async def ack(self) -> None:
+        global _ack_pcm
+        if _ack_pcm is None:
+            _ack_pcm = await self.tts(ACK)
+        log.info("said: %s", ACK)
+        self.queue(_ack_pcm)
+
+    async def say(self, text: str) -> None:
+        """Speak text, queueing the voice as it streams in so the first word is not held for the last."""
+        if not text:
+            return
+        log.info("said: %s", text)
+        buf = bytearray()
+        async with self.http.post(f"{OPENAI}/audio/speech", headers=AUTH, json={
+            "model": TTS_MODEL, "voice": VOICE, "input": text, "response_format": "pcm",
+        }) as r:
+            if r.status != 200:
+                raise RuntimeError(f"tts {r.status}: {(await r.text())[:200]}")
+            async for part in r.content.iter_chunked(CHUNK):
+                buf += part
+                whole = len(buf) // CHUNK * CHUNK
+                if whole:
+                    self.queue(bytes(buf[:whole]))
+                    del buf[:whole]
+        if buf:
+            self.queue(bytes(buf))
 
     async def clock(self) -> None:
         while True:
@@ -487,12 +494,15 @@ class Conversation:
             # The puck hangs up after 10 s without audio; a slow tool (the TV
             # took 8 s to switch off) ended the wake before the answer
             # (2026-10-22). Silence while waiting keeps it on the line.
-            if (self.busy or self.pending) and now - self.play_end > 2:
-                self.outgoing.append((now, bytes(RATE // 10 * 2)))
+            if self.busy and now - self.play_end > 2:
+                self.outgoing.append((now, bytes(CHUNK)))
             quiet = now - self.heard_until
-            if not self.busy and not self.pending and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
+            if not self.busy and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
                 log.info("quiet for %.0fs, ending the conversation", quiet)
                 return
+
+
+_ack_pcm: bytes | None = None
 
 
 async def mute_tvs(mute: bool, only: list[str] | None = None) -> list[str]:
@@ -523,23 +533,15 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
     muting = asyncio.create_task(mute_tvs(True))
     try:
         async with sse_client(HA_MCP_URL, headers={"Authorization": f"Bearer {HA_TOKEN}"}) as (r, w), \
-                ClientSession(r, w) as ha:
+                ClientSession(r, w) as ha, \
+                aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=True) as http:
             await ha.initialize()
-            tools = [live_tool(t) for t in (await ha.list_tools()).tools]
-            async with aiohttp.ClientSession() as http, http.ws_connect(
-                LIVE_URL, headers={"Authorization": f"Bearer {API_KEY}"}, heartbeat=20, max_msg_size=0
-            ) as live:
-                await live.send_json(session_start(tools))
-                first = await live.receive_json()
-                if first.get("type") != "session.started":
-                    log.error("live refused the session: %s", json.dumps(first)[:400])
-                    return puck
-                log.info("session ready %.2fs after the wake", time.monotonic() - woke)
-                conversation = Conversation(puck, live, ha)
-                await conversation.run()
-                await live.send_json({"type": "session.close"})
-                if TAPE_DIR:
-                    save_tape(conversation.tape)
+            tools = [chat_tool(t) for t in (await ha.list_tools()).tools]
+            log.info("session ready %.2fs after the wake", time.monotonic() - woke)
+            conversation = Conversation(puck, ha, http, tools)
+            await conversation.run()
+            if TAPE_DIR:
+                save_tape(conversation.tape)
     except Exception:
         log.exception("conversation failed")
     finally:
