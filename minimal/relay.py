@@ -194,7 +194,21 @@ def live_tool(tool) -> dict:
             "parameters": params}
 
 
-def session_start(tools: list[dict]) -> dict:
+MEMORY_HEADER = 'Follow these instructions for tools from "memory":'
+
+
+async def memory_instructions(ha: ClientSession) -> str:
+    """The Memory part of HA's merged LLM API prompt: how to use the memory tools and
+    the current index. Empty when the MCP Server entry has no Memory API ticked."""
+    prompts = (await ha.list_prompts()).prompts
+    if not prompts:
+        return ""
+    text = (await ha.get_prompt(prompts[0].name)).messages[0].content.text
+    at = text.find(MEMORY_HEADER)
+    return "" if at < 0 else text[at:].strip()
+
+
+def session_start(tools: list[dict], memory: str = "") -> dict:
     return {
         "type": "session.start",
         "session": {
@@ -205,7 +219,7 @@ def session_start(tools: list[dict]) -> dict:
                 "type": "responses",
                 "responses": {
                     "model": BACKEND_MODEL,
-                    "instructions": BACKEND_INSTRUCTIONS,
+                    "instructions": BACKEND_INSTRUCTIONS + ("\n\n" + memory if memory else ""),
                     "tools": tools,
                     "tool_choice": "auto",
                     "parallel_tool_calls": True,
@@ -433,6 +447,7 @@ class Conversation:
         item = inner.get("item") or {}
         if kind == "response.created":
             self.backend_started_at = time.monotonic()
+            log.info("backend: delegated")
         if kind == "response.output_item.done" and item.get("type") == "function_call" \
                 and item.get("status") == "completed":
             rid = inner.get("response_id") or ""
@@ -441,6 +456,7 @@ class Conversation:
             rid = (inner.get("response") or {}).get("id", "")
             calls = self.pending.pop(rid, None) or self.pending.pop("", None)
             if not calls:
+                log.info("backend: answered without a tool call")
                 return
             for call_id, output in await asyncio.gather(*calls):
                 await self.live.send_json({
@@ -458,7 +474,10 @@ class Conversation:
         # own outlet among them (2026-10-10).
         # No domain at all is refused too: device_class "outlet" alone matches the same plugs.
         domain = args.get("domain") or []
-        if name in ("HassTurnOn", "HassTurnOff") and (not domain or "switch" in domain) \
+        # Tool names arrive as "assist__HassTurnOn" once the MCP Server entry
+        # serves more than one API (Assist + Memory since 2026-10-31).
+        bare = name.rsplit("__", 1)[-1]
+        if bare in ("HassTurnOn", "HassTurnOff") and (not domain or "switch" in domain) \
                 and not (args.get("name") or args.get("area") or args.get("floor")):
             output = {"error": "Refused: switches are never turned on or off all at once. For lights "
                                "use domain [\"light\"] alone; for a switch, give its name or area."}
@@ -526,10 +545,11 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
                 ClientSession(r, w) as ha:
             await ha.initialize()
             tools = [live_tool(t) for t in (await ha.list_tools()).tools]
+            memory = await memory_instructions(ha)
             async with aiohttp.ClientSession() as http, http.ws_connect(
                 LIVE_URL, headers={"Authorization": f"Bearer {API_KEY}"}, heartbeat=20, max_msg_size=0
             ) as live:
-                await live.send_json(session_start(tools))
+                await live.send_json(session_start(tools, memory))
                 first = await live.receive_json()
                 if first.get("type") != "session.started":
                     log.error("live refused the session: %s", json.dumps(first)[:400])
