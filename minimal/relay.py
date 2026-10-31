@@ -112,6 +112,10 @@ INSTRUCTIONS = os.environ.get(
     # longer to say than the lights took to go off, and the confirmation
     # then trailed the action by two seconds (2026-09-30).
     " Never announce that you are about to do something or ask for a moment: act, then confirm."
+    # Live said "I'll remember that" and later "I don't know your favorite" without
+    # ever delegating; the memory tools live in the backend (2026-10-31).
+    " You have no memory of your own: whatever the user asks you to remember or forget, and any"
+    " question about what they told you before, goes to your backend, which keeps the household memory."
 )
 BACKEND_INSTRUCTIONS = (
     "You are the backend of a home voice assistant. Each message is the recent voice conversation "
