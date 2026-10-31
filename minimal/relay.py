@@ -515,11 +515,9 @@ class Conversation:
             # The puck hangs up after 10 s without audio; a slow tool (the TV
             # took 8 s to switch off) ended the wake before the answer
             # (2026-10-22). Silence while waiting keeps it on the line.
-            # The same timer cut a 6 s request plus Live's think time: the
-            # puck counts its own speaker only, so hold it while the user is
-            # still talking or Live has just heard them (2026-10-31).
-            thinking = self.utterance is not None or now - self.live_heard_at < 4
-            if (self.busy or self.pending or thinking) and now - self.play_end > 2:
+            # Not while the user is talking: the puck drops mic audio whenever
+            # speaker audio arrived recently, so silence then made it deaf (2026-10-31).
+            if (self.busy or self.pending) and now - self.play_end > 2:
                 self.outgoing.append((now, bytes(RATE // 10 * 2)))
             quiet = now - self.heard_until
             if not self.busy and not self.pending and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
