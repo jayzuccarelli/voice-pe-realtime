@@ -19,9 +19,9 @@ was already carrying the conversation as a fallback. This file makes that
 the design. The puck's firmware closes the mic while audio plays, so
 nothing is lost on interruptions: there were none to lose.
 
-The relay still does what the puck cannot: mute the room's TVs for the
-length of the conversation, keep the puck on the line through a slow tool,
-and hang up after FOLLOWUP_S of quiet or at HARD_CAP_S whatever happens.
+The relay still does what the puck cannot: keep the puck on the line
+through a slow tool, and hang up after FOLLOWUP_S of quiet or at
+HARD_CAP_S whatever happens.
 
     broker/.venv-live/bin/python minimal/relay.py     # listens on :8767
 """
@@ -64,11 +64,6 @@ TZ = ZoneInfo(os.environ.get("HOUSE_TZ", "America/New_York"))
 API_KEY = os.environ["OPENAI_API_KEY"]
 HA_MCP_URL = os.environ["HA_MCP_URL"]
 HA_TOKEN = os.environ["HA_TOKEN"]
-HA_URL = HA_MCP_URL.split("/mcp_server")[0]
-# TVs muted for the length of a conversation. The room's TV was heard as the
-# user: its lines were answered and real requests were lost under it
-# (2026-10-21/22). Comma-separated media_player entity ids; empty = off.
-MUTE_ON_WAKE = [e for e in os.environ.get("MUTE_ON_WAKE", "").split(",") if e]
 RATE = 24000
 CHUNK = RATE // 10 * 2  # 100 ms of audio to the puck; its playback queue holds ten
 FOLLOWUP_S = 10.0
@@ -127,7 +122,8 @@ INSTRUCTIONS = os.environ.get(
     "request: 'Don't be leaving the lights off', 'Don't put the living room lights off', 'I'm leaving "
     "the lights off' and 'Remember lights off' all mean 'Turn the lights off' (off, never on); "
     "'Fernando PlayStation 5' is 'Turn on the PlayStation 5'; 'Netflix on out there' is 'Put Netflix "
-    f"on'. The rooms are {HOUSE_AREAS}; 'living' means the living room. Whenever a device of this "
+    f"on'. The rooms are {HOUSE_AREAS}; 'living' means the living room, and 'the TV' with no room "
+    "means the living room TV, where this microphone is. Whenever a device of this "
     "home is named with on or off, or you are asked to play, put on, open or pause something, act on "
     "it. An app or show named without such a verb is not a request. When the speaker corrects "
     "themselves ('the TV, uh, the light'), only the correction counts. Never act on a device, app or "
@@ -206,10 +202,10 @@ def chat_tool(tool) -> dict:
 ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_)")  # tools that change the house; the rest only read it
 
 
-def confirmation(acted: list[tuple[str, dict]]) -> str:
+def confirmation(acted: list[tuple[str, dict, dict]]) -> str:
     """What to say about the actions that ran, from their results alone."""
     said = []
-    for name, output in acted:
+    for name, args, output in acted:
         if "error" in output:
             said.append("That didn't work.")
             continue
@@ -230,7 +226,12 @@ def confirmation(acted: list[tuple[str, dict]]) -> str:
         if result.get("response_type") == "error" or (not names and data.get("failed")):
             said.append("That didn't work.")
         elif names and name in ("HassTurnOff", "HassTurnOn"):
-            said.append(f"{', '.join(names)} {name[-3:].lower() if name.endswith('Off') else 'on'}.")
+            state = "off" if name.endswith("Off") else "on"
+            if len(names) > 3:  # every lamp and strip in the house is not a sentence
+                kind = "lights" if args.get("domain") == ["light"] else "devices"
+                said.append(f"{len(names)} {kind} {state}.")
+            else:
+                said.append(f"{', '.join(names)} {state}.")
         elif names:
             said.append(f"{', '.join(names)}: done.")
         else:
@@ -394,12 +395,12 @@ class Conversation:
         finally:
             self.busy -= 1
 
-    async def think(self, text: str) -> tuple[str, list[tuple[str, dict]]]:
+    async def think(self, text: str) -> tuple[str, list[tuple[str, dict, dict]]]:
         """Ask the model; run its tool calls; stop at the first action, or return its answer."""
         now = datetime.now(TZ).strftime("%A %B %-d, %-I:%M %p")
         messages = [{"role": "system", "content": f"{INSTRUCTIONS} It is now {now}."}, *self.history,
                     {"role": "user", "content": text}]
-        acted: list[tuple[str, dict]] = []
+        acted: list[tuple[str, dict, dict]] = []
         for _ in range(3):
             t0 = time.monotonic()
             async with self.http.post(f"{OPENAI}/chat/completions", headers=AUTH, json={
@@ -420,7 +421,7 @@ class Conversation:
             for c, output in zip(calls, outputs):
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(output, ensure_ascii=False)})
                 if ACTION_TOOLS.match(c["function"]["name"]):
-                    acted.append((c["function"]["name"], output))
+                    acted.append((c["function"]["name"], json.loads(c["function"]["arguments"] or "{}"), output))
             if acted:
                 return "", acted
         return "", acted
@@ -505,32 +506,11 @@ class Conversation:
 _ack_pcm: bytes | None = None
 
 
-async def mute_tvs(mute: bool, only: list[str] | None = None) -> list[str]:
-    """Mute (or unmute) the MUTE_ON_WAKE TVs that are on; returns the ones touched."""
-    touched = []
-    async with aiohttp.ClientSession(headers={"Authorization": f"Bearer {HA_TOKEN}"},
-                                     timeout=aiohttp.ClientTimeout(total=5)) as http:
-        for entity in MUTE_ON_WAKE if only is None else only:
-            try:
-                async with http.get(f"{HA_URL}/api/states/{entity}") as r:
-                    if (await r.json()).get("state") != "on":
-                        continue
-                async with http.post(f"{HA_URL}/api/services/media_player/volume_mute",
-                                     json={"entity_id": entity, "is_volume_muted": mute}) as r:
-                    r.raise_for_status()
-                touched.append(entity)
-                log.info("%s %s", "muted" if mute else "unmuted", entity)
-            except Exception as exc:  # noqa: BLE001 - a TV that will not mute must not cost the conversation
-                log.info("could not %s %s: %s", "mute" if mute else "unmute", entity, exc)
-    return touched
-
-
 async def handle(request: web.Request) -> web.WebSocketResponse:
     puck = web.WebSocketResponse(max_msg_size=0)
     await puck.prepare(request)
     woke = time.monotonic()
     log.info("wake from %s", request.remote)
-    muting = asyncio.create_task(mute_tvs(True))
     try:
         async with sse_client(HA_MCP_URL, headers={"Authorization": f"Bearer {HA_TOKEN}"}) as (r, w), \
                 ClientSession(r, w) as ha, \
@@ -552,8 +532,6 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
             with contextlib.suppress(ConnectionError):
                 await puck.send_str('{"type":"disconnect"}')
         await puck.close()
-        if muted := await muting:
-            await mute_tvs(False, muted)
         log.info("conversation over")
     return puck
 
