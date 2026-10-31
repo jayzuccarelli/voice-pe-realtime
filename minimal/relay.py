@@ -492,6 +492,11 @@ class Conversation:
             result = await self.ha.call_tool(name, args)
             text = "".join(getattr(c, "text", "") for c in result.content)
             output = {"error": text} if result.isError else {"result": text}
+            # The index in the backend's instructions is from the wake; after a
+            # write the backend otherwise looks for names that no longer exist
+            # ("update it to pepperoni" then "what's my favorite" in one wake, 2026-10-31).
+            if bare in ("memory_save", "memory_delete") and not result.isError:
+                output["memory_index"] = await memory_instructions(self.ha)
         except Exception as exc:  # noqa: BLE001 - a failed call is reported to the model, not raised
             output = {"error": f"{type(exc).__name__}: {exc}"}
         finally:
@@ -510,7 +515,11 @@ class Conversation:
             # The puck hangs up after 10 s without audio; a slow tool (the TV
             # took 8 s to switch off) ended the wake before the answer
             # (2026-10-22). Silence while waiting keeps it on the line.
-            if (self.busy or self.pending) and now - self.play_end > 2:
+            # The same timer cut a 6 s request plus Live's think time: the
+            # puck counts its own speaker only, so hold it while the user is
+            # still talking or Live has just heard them (2026-10-31).
+            thinking = self.utterance is not None or now - self.live_heard_at < 4
+            if (self.busy or self.pending or thinking) and now - self.play_end > 2:
                 self.outgoing.append((now, bytes(RATE // 10 * 2)))
             quiet = now - self.heard_until
             if not self.busy and not self.pending and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
