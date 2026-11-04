@@ -132,14 +132,17 @@ INSTRUCTIONS = os.environ.get(
     "the lights off' and 'Remember lights off' all mean 'Turn the lights off' (off, never on); "
     "'Fernando PlayStation 5' is 'Turn on the PlayStation 5'; 'Netflix on out there' is 'Put Netflix "
     f"on'. The rooms are {HOUSE_AREAS}; 'living' means the living room, and 'the TV' with no room "
-    "means the living room TV, where this microphone is. Whenever a device of this "
+    "means the living room TV, where this microphone is. The PlayStation's power is the switch named "
+    "'PlayStation 5' (domain switch); use HassTurnOn or HassTurnOff on it. Whenever a device of this "
     "home is named with on or off, or you are asked to play, put on, open or pause something, act on "
     "it. An app or show named without such a verb is not a request. When the speaker corrects "
     "themselves ('the TV, uh, the light'), only the correction counts. Never act on a device, app or "
     "room that was not named. To turn a TV off or on use HassTurnOff or HassTurnOn on the media "
     "player, not the remote. You can act on the home only through the tools: when asked to do "
     "something, call the tool and write nothing. When asked a question, answer in one short spoken "
-    "sentence with no Markdown. If you called no tool, never say that anything was done. If the words "
+    "sentence with no Markdown. When asked what went wrong or what did not work, answer from the "
+    "[actions: ...] record of your previous turn in this conversation; do not run the actions again "
+    "unless asked to retry. If you called no tool, never say that anything was done. If the words "
     "are only the wake word ('Hey Mycroft', 'Minecraft', 'Michael'), or name nothing in the home and "
     "ask you nothing (overheard conversation, a fragment, a TV line), reply with exactly: (nothing)"
 )
@@ -234,30 +237,54 @@ async def memory_instructions(ha: ClientSession) -> str:
     return "" if at < 0 else text[at:].strip()
 
 
+def target(args: dict) -> str:
+    """What an action was aimed at, in words: 'PlayStation 5', 'the living room lights'."""
+    if args.get("name"):
+        return args["name"]
+    kind = {"light": "lights", "media_player": "TV", "switch": "switch"}.get((args.get("domain") or [""])[0], "")
+    where = args.get("area") or args.get("room") or ""
+    return f"the {where} {kind}".replace("  ", " ").strip() if (where or kind) else "that"
+
+
 def confirmation(acted: list[tuple[str, dict, dict]]) -> str:
-    """What to say about the actions that ran, from their results alone."""
+    """What to say about the actions that ran, from their results alone.
+
+    Every sentence names its target: "Done. That didn't work." for two
+    actions told the user nothing about which was which (2026-11-04).
+    """
     said = []
     for name, args, output in acted:
         name = bare(name)
+        verb = {"HassTurnOn": "turn on", "HassTurnOff": "turn off", "tv_launch_app": "open", "tv_power": "switch"}.get(name, "do")
         if "error" in output:
-            said.append("That didn't work.")
+            why = " (two devices have that name)" if "DUPLICATE_NAME" in output["error"] else ""
+            said.append(f"Couldn't {verb} {args.get('app') or target(args)}{why}.")
+            continue
+        if name == "tv_launch_app":
+            said.append(f"{args.get('app', 'The app')} on the {args.get('room', 'living room')} TV.")
+            continue
+        if name == "tv_power":
+            said.append(f"{args.get('room', 'living room').capitalize()} TV {args.get('state', 'on')}.")
             continue
         try:
             result = json.loads(output.get("result") or "{}")
         except ValueError:
             result = {}
         if result.get("success") is False:
-            said.append("That didn't work.")
+            said.append(f"Couldn't {verb} {target(args)}.")
             continue
         if "response_type" not in result and "result" in result:
             result = result["result"]  # the eval's fake house wraps HA's shape
         if isinstance(result, str):  # a custom tool's own words ("Launched Netflix on the living room TV")
             said.append(result.strip().rstrip(".") + ".")
             continue
+        if not isinstance(result, dict) or not result:
+            said.append(f"{target(args).capitalize()}: done.")
+            continue
         data = result.get("data") or {}
         names = list(dict.fromkeys(e.get("name", "") for e in data.get("success") or [] if e.get("name")))
         if result.get("response_type") == "error" or (not names and data.get("failed")):
-            said.append("That didn't work.")
+            said.append(f"Couldn't {verb} {target(args)}.")
         elif names and name in ("HassTurnOff", "HassTurnOn"):
             state = "off" if name.endswith("Off") else "on"
             if len(names) > 3:  # every lamp and strip in the house is not a sentence
@@ -286,6 +313,7 @@ class Conversation:
         self.tape = bytearray()  # everything the puck sent, for MINIMAL_TAPE
         self.play_end = 0.0  # when the audio sent so far finishes playing on the puck
         self.cursor = 0.0  # when the audio queued so far finishes playing
+        self.last_tick = 0.0  # when the last keep-alive silence went out
         self.outgoing: collections.deque[tuple[float, bytes]] = collections.deque()  # (send at, pcm)
         self.history: list[dict] = []  # this wake's turns, so "and the bedroom too" has context
         # The cutter's view of the mic.
@@ -421,7 +449,12 @@ class Conversation:
             spoken = confirmation(acted) if acted else answer
             if spoken.strip().lower().startswith("(nothing)"):
                 spoken = ""
-            self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": spoken or "(nothing)"}]
+            # The model sees what it did, not only what was said, so "what
+            # didn't work?" is answered from the result instead of by running
+            # everything again (2026-11-04).
+            did = "; ".join(f"{bare(n)}({json.dumps(a)}) -> {json.dumps(o)[:160]}" for n, a, o in acted)
+            self.history += [{"role": "user", "content": text},
+                             {"role": "assistant", "content": (spoken or "(nothing)") + (f"\n[actions: {did}]" if did else "")}]
             await self.say(spoken)
         except Exception:
             log.exception("turn failed")
@@ -477,6 +510,15 @@ class Conversation:
                                "use domain [\"light\"] alone; for a switch, give its name or area."}
             log.info("tool %s(%s) -> %s", name, json.dumps(args), json.dumps(output)[:200])
             return output
+        output = await self.ha_call(name, args)
+        # "PlayStation 5" is both a media player and its power switch; HA
+        # refuses the ambiguous name. Power is the switch (2026-11-04).
+        if "DUPLICATE_NAME" in output.get("error", "") and bare(name) in ("HassTurnOn", "HassTurnOff") \
+                and args.get("name") and not domain:
+            output = await self.ha_call(name, {**args, "domain": ["switch"]})
+        return output
+
+    async def ha_call(self, name: str, args: dict) -> dict:
         try:
             result = await self.ha.call_tool(name, args)
             text = "".join(getattr(c, "text", "") for c in result.content)
@@ -530,13 +572,14 @@ class Conversation:
             if now - self.started > HARD_CAP_S:
                 log.info("hard cap reached")
                 return
-            # The puck hangs up after 10 s without audio; a slow tool (the TV
-            # took 8 s to switch off) ended the wake before the answer
-            # (2026-10-22). Silence while waiting keeps it on the line. Not
-            # while the user is talking: the puck drops mic audio whenever
-            # speaker audio arrived recently, so silence then made it deaf
-            # (2026-10-31).
-            if self.busy and self.utterance is None and now - self.play_end > 2:
+            # The puck hangs up after 10 s without audio from the relay. A
+            # slow tool ended the wake before the answer (2026-10-22), and a
+            # follow-up spoken 8 s after the reply was cut off mid-sentence
+            # (2026-11-04). A short silence every few seconds keeps it on the
+            # line. Not while the user is talking: the puck drops mic audio
+            # whenever speaker audio arrived recently (2026-10-31).
+            if self.utterance is None and now - self.play_end > 4 and now - self.last_tick > 4:
+                self.last_tick = now
                 self.outgoing.append((now, bytes(CHUNK)))
             quiet = now - self.heard_until
             if not self.busy and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
