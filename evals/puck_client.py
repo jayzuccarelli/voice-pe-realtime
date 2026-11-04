@@ -70,8 +70,10 @@ async def main(url: str, path: str) -> None:
             bursts.append([(t, n)])
     for b in bursts:
         start, total = b[0][0], sum(n for _, n in b) / 2 / RATE
-        lead = max((sum(n for _, n in b[:k]) / 2 / RATE) - (t - start) for k, (t, _) in enumerate(b))
-        print(f"audio burst at {start:5.1f}s: {total:.1f}s of audio, sent up to {lead:.2f}s ahead of real time")
+        leads = [(sum(n for _, n in b[:k]) / 2 / RATE) - (t - start) for k, (t, _) in enumerate(b)]
+        gaps = [t - b[k - 1][0] for k, (t, _) in enumerate(b) if k and t - b[k - 1][0] > 0.15]
+        print(f"audio burst at {start:5.1f}s: {total:.1f}s of audio, lead {min(leads):+.2f}s..{max(leads):+.2f}s, "
+              f"{len(gaps)} inter-chunk gaps >150ms{(' (max %.2fs)' % max(gaps)) if gaps else ''}")
     print(f"total {sum(n for _, n in got) / 2 / RATE:.1f}s of audio in {len(got)} chunks; "
           f"disconnect at {disconnect_at if disconnect_at is None else round(disconnect_at, 1)}s")
 

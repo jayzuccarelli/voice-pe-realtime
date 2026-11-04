@@ -83,6 +83,7 @@ HARD_CAP_S = 180.0
 # that; a whole reply sent at once overran the puck's heap (11 KB free
 # during playback, 2026-10-19).
 PREROLL_S = 0.4
+TTS_HOLD_S = 1.0  # voice buffered in the relay before the first chunk goes out
 # The cutter, measured in production since 2026-09-27 and unchanged here. A
 # quiet "Put Netflix on." from across the room sits at 150-260 RMS, the
 # room's floor at 30-60; with the TV on the room sat at 500-800 for a whole
@@ -142,7 +143,8 @@ INSTRUCTIONS = os.environ.get(
     "something, call the tool and write nothing. When asked a question, answer in one short spoken "
     "sentence with no Markdown. When asked what went wrong or what did not work, answer from the "
     "[actions: ...] record of your previous turn in this conversation; do not run the actions again "
-    "unless asked to retry. If you called no tool, never say that anything was done. If the words "
+    "unless asked to retry. When the user says bye, goodbye, that's all, or thanks that's it, call "
+    "end_conversation. If you called no tool, never say that anything was done. If the words "
     "are only the wake word ('Hey Mycroft', 'Minecraft', 'Michael'), or name nothing in the home and "
     "ask you nothing (overheard conversation, a fragment, a TV line), reply with exactly: (nothing)"
 )
@@ -194,10 +196,15 @@ def transcribe(pcm: bytes, model: str) -> tuple[str, float]:
     return result["text"].strip(), (sum(logprobs) / len(logprobs)) if logprobs else 0.0
 
 
+ONE_WORD_OK = {"bye", "goodbye", "stop", "cancel", "thanks", "yes", "no", "okay"}
+
+
 def is_speech(text: str, mean_lp: float) -> bool:
     letters = [c for c in text if c.isalpha()]
     ascii_share = sum(c.isascii() for c in letters) / len(letters) if letters else 0.0
-    return len(text.split()) >= GUARD_MIN_WORDS and mean_lp >= GUARD_MEAN_LOGPROB and ascii_share >= GUARD_ASCII
+    words = text.split()
+    enough = len(words) >= GUARD_MIN_WORDS or (len(words) == 1 and words[0].strip(".!,").lower() in ONE_WORD_OK)
+    return enough and mean_lp >= GUARD_MEAN_LOGPROB and ascii_share >= GUARD_ASCII
 
 
 def rms(pcm: bytes) -> float:
@@ -217,7 +224,11 @@ def bare(name: str) -> str:
     return name.rsplit("__", 1)[-1]
 
 
-ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_)")  # tools that change the house; the rest read it or keep memory
+ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_|end_conversation$)")  # change the house or end the wake; the rest read or remember
+END_TOOL = {"type": "function", "function": {
+    "name": "end_conversation",
+    "description": "The user is done: 'bye', 'goodbye', 'that's all', 'thanks, that's it'. Say goodbye and close.",
+    "parameters": {"type": "object", "properties": {}}}}
 
 MEMORY_HEADER = 'Follow these instructions for tools from "memory":'
 
@@ -255,6 +266,9 @@ def confirmation(acted: list[tuple[str, dict, dict]]) -> str:
     said = []
     for name, args, output in acted:
         name = bare(name)
+        if name == "end_conversation":
+            said.append("Bye.")
+            continue
         verb = {"HassTurnOn": "turn on", "HassTurnOff": "turn off", "tv_launch_app": "open", "tv_power": "switch"}.get(name, "do")
         if "error" in output:
             why = " (two devices have that name)" if "DUPLICATE_NAME" in output["error"] else ""
@@ -315,6 +329,7 @@ class Conversation:
         self.cursor = 0.0  # when the audio queued so far finishes playing
         self.last_tick = 0.0  # when the last keep-alive silence went out
         self.apologised = False  # "Didn't catch that." said once this wake
+        self.ending = False  # the user said bye: hang up once the goodbye has played
         self.outgoing: collections.deque[tuple[float, bytes]] = collections.deque()  # (send at, pcm)
         self.history: list[dict] = []  # this wake's turns, so "and the bedroom too" has context
         # The cutter's view of the mic.
@@ -506,6 +521,10 @@ class Conversation:
 
     async def call(self, name: str, arguments: str) -> dict:
         args = {k: v for k, v in json.loads(arguments or "{}").items() if v is not None}
+        if name == "end_conversation":
+            self.ending = True
+            log.info("tool end_conversation: hanging up after the goodbye")
+            return {"result": "ending"}
         # "Can you turn the lights off?" became HassTurnOff(domain=[light, switch])
         # with no name or area: every exposed switch went off, the server's
         # own outlet among them (2026-10-10).
@@ -558,6 +577,7 @@ class Conversation:
             return
         log.info("said: %s", text)
         buf = bytearray()
+        started = False
         async with self.http.post(f"{OPENAI}/audio/speech", headers=AUTH, json={
             "model": TTS_MODEL, "voice": VOICE, "input": text, "response_format": "pcm",
         }) as r:
@@ -565,6 +585,12 @@ class Conversation:
                 raise RuntimeError(f"tts {r.status}: {(await r.text())[:200]}")
             async for part in r.content.iter_chunked(CHUNK):
                 buf += part
+                # The service sometimes delivers slower than real time for a
+                # moment; started on the first chunk, the puck ran 0.12 s dry
+                # mid-sentence (2026-11-04). Hold TTS_HOLD_S before playing.
+                if not started and len(buf) < TTS_HOLD_S * RATE * 2:
+                    continue
+                started = True
                 whole = len(buf) // CHUNK * CHUNK
                 if whole:
                     self.queue(bytes(buf[:whole]))
@@ -588,6 +614,9 @@ class Conversation:
             if self.utterance is None and now - self.play_end > 4 and now - self.last_tick > 4:
                 self.last_tick = now
                 self.outgoing.append((now, bytes(CHUNK)))
+            if self.ending and not self.busy and not self.outgoing and now > self.cursor + 0.3:
+                log.info("goodbye played, ending the conversation")
+                return
             quiet = now - self.heard_until
             if not self.busy and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
                 log.info("quiet for %.0fs, ending the conversation", quiet)
@@ -607,7 +636,7 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
                 ClientSession(r, w) as ha, \
                 aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=True) as http:
             await ha.initialize()
-            tools = [chat_tool(t) for t in (await ha.list_tools()).tools]
+            tools = [chat_tool(t) for t in (await ha.list_tools()).tools] + [END_TOOL]
             memory = await memory_instructions(ha)
             log.info("session ready %.2fs after the wake", time.monotonic() - woke)
             conversation = Conversation(puck, ha, http, tools, memory)
