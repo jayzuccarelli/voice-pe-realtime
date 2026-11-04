@@ -116,6 +116,7 @@ GUARD_ASCII = 0.9  # share of letters that must be plain ASCII: language=en is a
 # log-probability that passed the guard, and seven tools fired in reply
 # to "the what?" (harness, 2026-10-30).
 HOUSE_AREAS = os.environ.get("HOUSE_AREAS", "the living room, the bedroom, the office and the kitchen")
+HOME_AREA = os.environ.get("HOME_AREA", "living room")  # where the puck is: the room a bare "the lights" means
 ACK = "On it."
 # Only a command gets the acknowledgement; a question gets its answer, room
 # talk that slipped through the guard gets nothing.
@@ -197,6 +198,18 @@ def transcribe(pcm: bytes, model: str) -> tuple[str, float]:
 
 
 ONE_WORD_OK = {"bye", "goodbye", "stop", "cancel", "thanks", "yes", "no", "okay"}
+# The transcribers turn "Turn the lights on in the living room" into "Don't
+# leave the lights on." often enough to be a pattern (six wakes Oct 19 to
+# Nov 4), and the model then does the opposite of what was said. Nobody
+# tells a light switch what not to do: such an opening is read as "Turn".
+GARBLED_OPENING = re.compile(
+    r"^(don'?t( be)?( leaving| leave| put| bring)?|do not|i'?m leaving|remember|everybody leave)\b\s*(the |them |my |your )?",
+    re.I)
+
+
+def ungarble(text: str) -> str:
+    fixed = GARBLED_OPENING.sub("Turn the ", text.strip())
+    return fixed if fixed != text.strip() and re.search(r"\b(on|off)\b", fixed, re.I) else text
 
 
 def is_speech(text: str, mean_lp: float) -> bool:
@@ -465,6 +478,9 @@ class Conversation:
                 return
             text, mean_lp = heard
             log.info("heard: %s (mean %.2f, %.1fs)", text, mean_lp, time.monotonic() - t0)
+            if (fixed := ungarble(text)) != text:
+                log.info("read as: %s", fixed)
+                text = fixed
             if COMMAND_RE.search(text):
                 await self.ack()
             answer, acted = await self.think(text)
@@ -536,6 +552,12 @@ class Conversation:
                                "use domain [\"light\"] alone; for a switch, give its name or area."}
             log.info("tool %s(%s) -> %s", name, json.dumps(args), json.dumps(output)[:200])
             return output
+        # "The lights" from the living room puck means the living room's, not
+        # all seven in the house ("Turn the lights on in the living room"
+        # lost its room in transcription and every light went off, 2026-11-04).
+        if bare(name) in ("HassTurnOn", "HassTurnOff") and domain == ["light"] \
+                and not (args.get("name") or args.get("area") or args.get("floor")):
+            args = {**args, "area": HOME_AREA}
         output = await self.ha_call(name, args)
         # "PlayStation 5" is both a media player and its power switch; HA
         # refuses the ambiguous name. Power is the switch (2026-11-04).
@@ -611,7 +633,11 @@ class Conversation:
             # (2026-11-04). A short silence every few seconds keeps it on the
             # line. Not while the user is talking: the puck drops mic audio
             # whenever speaker audio arrived recently (2026-10-31).
-            if self.utterance is None and now - self.play_end > 4 and now - self.last_tick > 4:
+            # A game on the TV keeps an utterance open for the whole wake, so
+            # "not while talking" alone let the puck hang up at 10 s
+            # (2026-11-04 18:06): after 8 s a tick goes out regardless.
+            if now - self.play_end > 4 and now - self.last_tick > 4 \
+                    and (self.utterance is None or now - self.last_tick > 8):
                 self.last_tick = now
                 self.outgoing.append((now, bytes(CHUNK)))
             if self.ending and not self.busy and not self.outgoing and now > self.cursor + 0.3:
