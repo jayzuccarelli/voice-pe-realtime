@@ -1,4 +1,11 @@
-"""Voice PE puck -> transcriber -> text model with Home Assistant tools -> speech.
+"""The "chain" relay: wake word -> transcriber -> text model with Home Assistant tools -> speech.
+
+Two relays have served the puck. "live" (minimal/relay.py up to commit
+e5b2559, kept beside the deploy as relay.py.bak_live_e5b2559) put
+gpt-live-1 in charge of hearing, deciding and speaking. "chain", this file,
+is the plain chained design from OpenAI's voice-agent guide, chosen on
+2026-11-04 after the live version said "Sure, I'll take care of that" to a
+Spotify request and did nothing. See minimal/VERSIONS.md.
 
 The puck streams its microphone. The relay cuts that into utterances, has a
 transcriber read each one, hands the words to a text model that can act only
@@ -51,13 +58,15 @@ from mcp.client.sse import sse_client
 
 load_dotenv(Path(__file__).resolve().parent.parent / "broker" / ".env")
 
+VERSION = "chain"
 PORT = int(os.environ.get("MINIMAL_PORT", "8767"))
 BRAIN_MODEL = os.environ.get("LIVE_BACKEND_MODEL", "gpt-5.4-mini")
 # Two transcribers read every utterance and the better-scoring English
 # reading wins. One alone is a coin flip on a short far-field clip: the same
 # "Turn the living room lights on." came back as Afrikaans, then as
 # 'livingroom lights on.' at mean -0.80, on consecutive replays (2026-10-30).
-STT_MODELS = tuple(os.environ.get("STT_MODELS", "gpt-4o-transcribe,gpt-4o-mini-transcribe").split(","))
+# gpt-transcribe (July 2026) is the more accurate successor of gpt-4o-transcribe.
+STT_MODELS = tuple(os.environ.get("STT_MODELS", "gpt-transcribe,gpt-4o-mini-transcribe").split(","))
 TTS_MODEL = os.environ.get("TTS_MODEL", "gpt-4o-mini-tts")
 VOICE = os.environ.get("LIVE_VOICE", "cedar")
 TZ = ZoneInfo(os.environ.get("HOUSE_TZ", "America/New_York"))
@@ -199,13 +208,37 @@ def chat_tool(tool) -> dict:
         "parameters": tool.inputSchema or {"type": "object", "properties": {}}}}
 
 
-ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_)")  # tools that change the house; the rest only read it
+def bare(name: str) -> str:
+    """Tool names arrive as "assist__HassTurnOn" once HA's MCP Server entry serves
+    more than one API (Assist + Memory since 2026-10-31)."""
+    return name.rsplit("__", 1)[-1]
+
+
+ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_)")  # tools that change the house; the rest read it or keep memory
+
+MEMORY_HEADER = 'Follow these instructions for tools from "memory":'
+
+
+async def memory_instructions(ha: ClientSession) -> str:
+    """The Memory part of HA's merged LLM API prompt: how to use the memory tools and
+    the current index. Empty when the MCP Server entry has no Memory API ticked."""
+    try:
+        prompts = (await ha.list_prompts()).prompts
+    except Exception as exc:  # noqa: BLE001 - a server without prompts (the eval's fake house) means no memory
+        log.info("no memory prompt: %s", exc)
+        return ""
+    if not prompts:
+        return ""
+    text = (await ha.get_prompt(prompts[0].name)).messages[0].content.text
+    at = text.find(MEMORY_HEADER)
+    return "" if at < 0 else text[at:].strip()
 
 
 def confirmation(acted: list[tuple[str, dict, dict]]) -> str:
     """What to say about the actions that ran, from their results alone."""
     said = []
     for name, args, output in acted:
+        name = bare(name)
         if "error" in output:
             said.append("That didn't work.")
             continue
@@ -243,8 +276,9 @@ class Conversation:
     """One wake: from the puck connecting to the relay closing it."""
 
     def __init__(self, puck: web.WebSocketResponse, ha: ClientSession, http: aiohttp.ClientSession,
-                 tools: list[dict]) -> None:
+                 tools: list[dict], memory: str = "") -> None:
         self.puck, self.ha, self.http, self.tools = puck, ha, http, tools
+        self.memory = memory  # HA's memory instructions and index, refreshed after a memory write
         self.started = time.monotonic()
         self.heard_until = self.started  # when the puck finishes playing what it has been sent
         self.spoke = False
@@ -398,8 +432,8 @@ class Conversation:
     async def think(self, text: str) -> tuple[str, list[tuple[str, dict, dict]]]:
         """Ask the model; run its tool calls; stop at the first action, or return its answer."""
         now = datetime.now(TZ).strftime("%A %B %-d, %-I:%M %p")
-        messages = [{"role": "system", "content": f"{INSTRUCTIONS} It is now {now}."}, *self.history,
-                    {"role": "user", "content": text}]
+        system = f"{INSTRUCTIONS} It is now {now}." + (f"\n\n{self.memory}" if self.memory else "")
+        messages = [{"role": "system", "content": system}, *self.history, {"role": "user", "content": text}]
         acted: list[tuple[str, dict, dict]] = []
         for _ in range(3):
             t0 = time.monotonic()
@@ -420,8 +454,12 @@ class Conversation:
             outputs = await asyncio.gather(*(self.call(c["function"]["name"], c["function"]["arguments"]) for c in calls))
             for c, output in zip(calls, outputs):
                 messages.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(output, ensure_ascii=False)})
-                if ACTION_TOOLS.match(c["function"]["name"]):
+                if ACTION_TOOLS.match(bare(c["function"]["name"])):
                     acted.append((c["function"]["name"], json.loads(c["function"]["arguments"] or "{}"), output))
+                elif bare(c["function"]["name"]) in ("memory_save", "memory_delete") and "error" not in output:
+                    # The index in the prompt is from the wake; after a write the
+                    # model otherwise looks for names that no longer exist.
+                    self.memory = await memory_instructions(self.ha)
             if acted:
                 return "", acted
         return "", acted
@@ -433,7 +471,7 @@ class Conversation:
         # own outlet among them (2026-10-10).
         # No domain at all is refused too: device_class "outlet" alone matches the same plugs.
         domain = args.get("domain") or []
-        if name in ("HassTurnOn", "HassTurnOff") and (not domain or "switch" in domain) \
+        if bare(name) in ("HassTurnOn", "HassTurnOff") and (not domain or "switch" in domain) \
                 and not (args.get("name") or args.get("area") or args.get("floor")):
             output = {"error": "Refused: switches are never turned on or off all at once. For lights "
                                "use domain [\"light\"] alone; for a switch, give its name or area."}
@@ -494,8 +532,11 @@ class Conversation:
                 return
             # The puck hangs up after 10 s without audio; a slow tool (the TV
             # took 8 s to switch off) ended the wake before the answer
-            # (2026-10-22). Silence while waiting keeps it on the line.
-            if self.busy and now - self.play_end > 2:
+            # (2026-10-22). Silence while waiting keeps it on the line. Not
+            # while the user is talking: the puck drops mic audio whenever
+            # speaker audio arrived recently, so silence then made it deaf
+            # (2026-10-31).
+            if self.busy and self.utterance is None and now - self.play_end > 2:
                 self.outgoing.append((now, bytes(CHUNK)))
             quiet = now - self.heard_until
             if not self.busy and quiet > (FOLLOWUP_S if self.spoke else FIRST_REPLY_S):
@@ -517,8 +558,9 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
                 aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=True) as http:
             await ha.initialize()
             tools = [chat_tool(t) for t in (await ha.list_tools()).tools]
+            memory = await memory_instructions(ha)
             log.info("session ready %.2fs after the wake", time.monotonic() - woke)
-            conversation = Conversation(puck, ha, http, tools)
+            conversation = Conversation(puck, ha, http, tools, memory)
             await conversation.run()
             if TAPE_DIR:
                 save_tape(conversation.tape)
@@ -541,7 +583,9 @@ def main() -> None:
     log.setLevel(os.environ.get("MINIMAL_LOG", "INFO"))
     app = web.Application()
     app.router.add_get("/{tail:.*}", handle)
-    web.run_app(app, host="0.0.0.0", port=PORT, print=lambda *_: log.info("listening on :%d", PORT))
+    web.run_app(app, host="0.0.0.0", port=PORT,
+                print=lambda *_: log.info("relay '%s' listening on :%d (%s + %s -> %s -> %s)",
+                                          VERSION, PORT, *STT_MODELS[:2], BRAIN_MODEL, TTS_MODEL))
 
 
 if __name__ == "__main__":
