@@ -314,6 +314,7 @@ class Conversation:
         self.play_end = 0.0  # when the audio sent so far finishes playing on the puck
         self.cursor = 0.0  # when the audio queued so far finishes playing
         self.last_tick = 0.0  # when the last keep-alive silence went out
+        self.apologised = False  # "Didn't catch that." said once this wake
         self.outgoing: collections.deque[tuple[float, bytes]] = collections.deque()  # (send at, pcm)
         self.history: list[dict] = []  # this wake's turns, so "and the bedroom too" has context
         # The cutter's view of the mic.
@@ -440,6 +441,12 @@ class Conversation:
             t0 = time.monotonic()
             heard = await self.hear(pcm)
             if heard is None:
+                # A real sentence that no transcriber could read (a game on
+                # the TV at the same level as the voice, 2026-11-04) got
+                # silence and a hang-up. Once per wake, say so instead.
+                if not self.history and not self.apologised and len(pcm) / 2 / RATE >= 1.5:
+                    self.apologised = True
+                    await self.say("Didn't catch that.")
                 return
             text, mean_lp = heard
             log.info("heard: %s (mean %.2f, %.1fs)", text, mean_lp, time.monotonic() - t0)
