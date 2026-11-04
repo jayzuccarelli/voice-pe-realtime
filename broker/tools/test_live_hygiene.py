@@ -303,6 +303,7 @@ class _HoldOnly(VoicePELiveService):
     """The output-hold state without the websocket machinery."""
 
     def __init__(self):
+        self._output_hold_enabled = True
         self._request_known = False
         self._answer_text_started = False
         self._live_heard_at = None

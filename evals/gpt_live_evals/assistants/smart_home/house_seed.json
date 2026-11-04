@@ -1,0 +1,153 @@
+{
+ "entities": [
+  {
+   "names": [
+    "Air Purifier Fan"
+   ],
+   "domain": "fan",
+   "state": "on"
+  },
+  {
+   "names": [
+    "Bedroom"
+   ],
+   "domain": "light",
+   "state": "off",
+   "area": "Bedroom"
+  },
+  {
+   "names": [
+    "Bedroom Left"
+   ],
+   "domain": "light",
+   "state": "off",
+   "area": "Bedroom"
+  },
+  {
+   "names": [
+    "Bedroom Right"
+   ],
+   "domain": "light",
+   "state": "off",
+   "area": "Bedroom"
+  },
+  {
+   "names": [
+    "the den",
+    "den speaker",
+    "living room speaker"
+   ],
+   "domain": "media_player",
+   "state": "paused",
+   "area": "Living Room"
+  },
+  {
+   "names": [
+    "Left Bedroom Lamp"
+   ],
+   "domain": "switch",
+   "state": "off",
+   "area": "Bedroom"
+  },
+  {
+   "names": [
+    "Living Room"
+   ],
+   "domain": "light",
+   "state": "off",
+   "area": "Living Room"
+  },
+  {
+   "names": [
+    "Living Room Lamp"
+   ],
+   "domain": "switch",
+   "state": "off",
+   "area": "Living Room"
+  },
+  {
+   "names": [
+    "Office"
+   ],
+   "domain": "light",
+   "state": "off"
+  },
+  {
+   "names": [
+    "Office Light"
+   ],
+   "domain": "switch",
+   "state": "unavailable",
+   "area": "Office"
+  },
+  {
+   "names": [
+    "PlayStation",
+    "PS5",
+    "PlayStation 5"
+   ],
+   "domain": "switch",
+   "state": "unavailable",
+   "area": "Living Room"
+  },
+  {
+   "names": [
+    "Right Bedroom Lamp"
+   ],
+   "domain": "switch",
+   "state": "off",
+   "area": "Bedroom"
+  },
+  {
+   "names": [
+    "Samsung 8 Series (43)"
+   ],
+   "domain": "media_player",
+   "state": "idle"
+  },
+  {
+   "names": [
+    "Samsung 8 Series (43) (UN43TU8000FXZA). Bedroom"
+   ],
+   "domain": "media_player",
+   "state": "off",
+   "area": "Bedroom"
+  },
+  {
+   "names": [
+    "Samsung The Frame (55)"
+   ],
+   "domain": "media_player",
+   "state": "idle"
+  },
+  {
+   "names": [
+    "The Frame (Living Room)"
+   ],
+   "domain": "media_player",
+   "state": "idle",
+   "area": "Living Room"
+  },
+  {
+   "names": [
+    "The Frame (Living Room)",
+    "Living Room TV",
+    "Living Room Television"
+   ],
+   "domain": "media_player",
+   "state": "on",
+   "area": "Living Room"
+  },
+  {
+   "names": [
+    "PlayStation 5"
+   ],
+   "domain": "media_player",
+   "state": "unavailable",
+   "area": "Living Room"
+  }
+ ],
+ "lists": {
+  "Shopping List": []
+ }
+}
