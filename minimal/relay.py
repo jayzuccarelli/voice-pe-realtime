@@ -38,6 +38,8 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import copy
+import difflib
 import json
 import logging
 import os
@@ -145,7 +147,9 @@ INSTRUCTIONS = os.environ.get(
     "sentence with no Markdown. When asked what went wrong or what did not work, answer from the "
     "[actions: ...] record of your previous turn in this conversation; do not run the actions again "
     "unless asked to retry. When the user says bye, goodbye, that's all, or thanks that's it, call "
-    "end_conversation. If you called no tool, never say that anything was done. If the words "
+    "end_conversation. For any music (a song, artist, album, genre, playlist, 'on Spotify') call "
+    "play_music with the speaker the user named. If you called no tool, never say that anything was "
+    "done. If the words "
     "are only the wake word ('Hey Mycroft', 'Minecraft', 'Michael'), or name nothing in the home and "
     "ask you nothing (overheard conversation, a fragment, a TV line), reply with exactly: (nothing)"
 )
@@ -237,11 +241,74 @@ def bare(name: str) -> str:
     return name.rsplit("__", 1)[-1]
 
 
-ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_|end_conversation$)")  # change the house or end the wake; the rest read or remember
+ACTION_TOOLS = re.compile(r"^(Hass(?!.*Get)|tv_|end_conversation$|play_music$)")  # change the house or end the wake
 END_TOOL = {"type": "function", "function": {
     "name": "end_conversation",
     "description": "The user is done: 'bye', 'goodbye', 'that's all', 'thanks, that's it'. Say goodbye and close.",
     "parameters": {"type": "object", "properties": {}}}}
+# HA's generic media-search tool refuses Music Assistant players (they do not
+# advertise the SEARCH_MEDIA feature), so music goes through Music Assistant's
+# own service, which searches Spotify itself. Carried over from the 2026
+# Realtime broker, where "play some jazz on the Den" needed the same tool.
+MUSIC_PLAYER = os.environ.get("MUSIC_PLAYER", "")  # the speaker when none is named
+MUSIC_TOOL = {"type": "function", "function": {
+    "name": "play_music",
+    "description": "Play music on a speaker through Music Assistant (Spotify). Use this for any request to play "
+                   "a song, artist, album, genre, playlist or 'something on Spotify'; never the generic media "
+                   "tools. `query` is what to play; `speaker` is the speaker's name as the user said it (e.g. 'Den').",
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string"}, "speaker": {"type": "string"}}, "required": ["query"]}}}
+
+
+def music_players() -> dict[str, str]:
+    """Music Assistant's media players: entity id -> friendly name. Only those accept play_media."""
+    base = HA_MCP_URL.split("/mcp_server")[0]
+    hdr = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+    try:
+        tmpl = "{{ integration_entities('music_assistant') | select('match','media_player') | list | to_json }}"
+        req = urllib.request.Request(f"{base}/api/template", data=json.dumps({"template": tmpl}).encode(), headers=hdr)
+        ids = set(json.loads(urllib.request.urlopen(req, timeout=8).read()))
+        states = json.load(urllib.request.urlopen(urllib.request.Request(f"{base}/api/states", headers=hdr), timeout=8))
+        return {s["entity_id"]: s.get("attributes", {}).get("friendly_name", "") for s in states if s["entity_id"] in ids}
+    except Exception as exc:  # noqa: BLE001 - no player list means the default speaker only
+        log.info("music player lookup failed: %s", exc)
+        return {}
+
+
+def music_tool(players: dict[str, str]) -> dict:
+    """The play_music tool with the speakers' real names in it, so "dance speaker" becomes "Den"."""
+    tool = copy.deepcopy(MUSIC_TOOL)
+    names = ", ".join(sorted(n for n in players.values() if n))
+    if names:
+        tool["function"]["parameters"]["properties"]["speaker"]["description"] = f"One of: {names}."
+    return tool
+
+
+def start_music(query: str, speaker: str | None, players: dict[str, str]) -> str:
+    """Play `query` on a Music Assistant speaker; the spoken result, never a guess."""
+    base = HA_MCP_URL.split("/mcp_server")[0]
+    hdr = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+    available = ", ".join(sorted(n for n in players.values() if n)) or "no speakers"
+    if speaker:
+        wanted = speaker.lower().replace("speaker", "").strip()
+        by_name = {n.lower(): eid for eid, n in players.items() if n}
+        close = difflib.get_close_matches(wanted, list(by_name), n=1, cutoff=0.5)
+        target = next((eid for n, eid in by_name.items() if n in wanted or wanted in n), None) \
+            or (by_name[close[0]] if close else None)
+        if target is None:
+            return f"Couldn't find a speaker called {speaker}. Available: {available}."
+    else:
+        target = MUSIC_PLAYER
+    if not target:
+        return f"Which speaker? Available: {available}."
+    try:
+        body = json.dumps({"entity_id": target, "media_id": query}).encode()
+        urllib.request.urlopen(urllib.request.Request(f"{base}/api/services/music_assistant/play_media", data=body,
+                                                      headers=hdr), timeout=20)
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        log.info("play_music failed: %s", exc)
+        return "Couldn't start the music."
+    return f"Playing {query} on {players.get(target) or 'the speaker'}."
 
 MEMORY_HEADER = 'Follow these instructions for tools from "memory":'
 
@@ -296,13 +363,13 @@ def confirmation(acted: list[tuple[str, dict, dict]]) -> str:
         try:
             result = json.loads(output.get("result") or "{}")
         except ValueError:
-            result = {}
-        if result.get("success") is False:
+            result = output.get("result", "")  # a tool's own sentence, spoken as is
+        if isinstance(result, dict) and result.get("success") is False:
             said.append(f"Couldn't {verb} {target(args)}.")
             continue
-        if "response_type" not in result and "result" in result:
+        if isinstance(result, dict) and "response_type" not in result and "result" in result:
             result = result["result"]  # the eval's fake house wraps HA's shape
-        if isinstance(result, str):  # a custom tool's own words ("Launched Netflix on the living room TV")
+        if isinstance(result, str):  # a tool's own words ("Playing DJ Matrix on Den")
             said.append(result.strip().rstrip(".") + ".")
             continue
         if not isinstance(result, dict) or not result:
@@ -330,8 +397,10 @@ class Conversation:
     """One wake: from the puck connecting to the relay closing it."""
 
     def __init__(self, puck: web.WebSocketResponse, ha: ClientSession, http: aiohttp.ClientSession,
-                 tools: list[dict], memory: str = "") -> None:
-        self.puck, self.ha, self.http, self.tools = puck, ha, http, tools
+                 tools: list[dict], memory: str = "", players: dict[str, str] | None = None) -> None:
+        self.puck, self.ha, self.http = puck, ha, http
+        self.players = players or {}  # Music Assistant speakers, looked up once per wake
+        self.tools = tools + [END_TOOL, music_tool(self.players)]
         self.memory = memory  # HA's memory instructions and index, refreshed after a memory write
         self.started = time.monotonic()
         self.heard_until = self.started  # when the puck finishes playing what it has been sent
@@ -342,6 +411,7 @@ class Conversation:
         self.cursor = 0.0  # when the audio queued so far finishes playing
         self.last_tick = 0.0  # when the last keep-alive silence went out
         self.apologised = False  # "Didn't catch that." said once this wake
+        self.unreadable = False  # the last utterance: every transcriber returned nothing
         self.ending = False  # the user said bye: hang up once the goodbye has played
         self.outgoing: collections.deque[tuple[float, bytes]] = collections.deque()  # (send at, pcm)
         self.history: list[dict] = []  # this wake's turns, so "and the bedroom too" has context
@@ -401,6 +471,9 @@ class Conversation:
                     self.heard_until = max(self.heard_until, time.monotonic())
             elif msg.type == aiohttp.WSMsgType.TEXT:
                 log.info("puck says %s", msg.data)
+                if "interrupt" in msg.data:  # the wake word mid-reply: stop talking, keep listening
+                    self.outgoing.clear()
+                    self.cursor = self.play_end = time.monotonic()
         log.info("puck hung up")
 
     def track_utterance(self, pcm: bytes, level: float) -> None:
@@ -450,12 +523,15 @@ class Conversation:
         readings = await asyncio.gather(*(asyncio.to_thread(transcribe, pcm, m) for m in STT_MODELS),
                                         return_exceptions=True)
         best = None
+        self.unreadable = True  # every transcriber came back empty: speech it could not read at all
         for model, reading in zip(STT_MODELS, readings):
             if isinstance(reading, BaseException):
                 log.info("%s failed: %s", model, reading)
                 continue
             text, mean_lp = reading
             log.debug("%s: %r (mean %.2f)", model, text, mean_lp)
+            if text:
+                self.unreadable = False
             if is_speech(text, mean_lp) and (best is None or mean_lp > best[1]):
                 best = (text, mean_lp)
         if best is None:
@@ -471,8 +547,10 @@ class Conversation:
             if heard is None:
                 # A real sentence that no transcriber could read (a game on
                 # the TV at the same level as the voice, 2026-11-04) got
-                # silence and a hang-up. Once per wake, say so instead.
-                if not self.history and not self.apologised and len(pcm) / 2 / RATE >= 1.5:
+                # silence and a hang-up. Once per wake, say so instead. Only
+                # when every reading was empty: foreign-looking noise is just
+                # noise, and the chime must not trigger it.
+                if self.unreadable and not self.history and not self.apologised and len(pcm) / 2 / RATE >= 1.5:
                     self.apologised = True
                     await self.say("Didn't catch that.")
                 return
@@ -541,6 +619,11 @@ class Conversation:
             self.ending = True
             log.info("tool end_conversation: hanging up after the goodbye")
             return {"result": "ending"}
+        if name == "play_music":
+            result = await asyncio.to_thread(start_music, args.get("query", ""), args.get("speaker"), self.players)
+            log.info("tool play_music(%s) -> %s", json.dumps(args), result)
+            self.heard_until = max(self.heard_until, time.monotonic())
+            return {"result": result}
         # "Can you turn the lights off?" became HassTurnOff(domain=[light, switch])
         # with no name or area: every exposed switch went off, the server's
         # own outlet among them (2026-10-10).
@@ -662,10 +745,10 @@ async def handle(request: web.Request) -> web.WebSocketResponse:
                 ClientSession(r, w) as ha, \
                 aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=True) as http:
             await ha.initialize()
-            tools = [chat_tool(t) for t in (await ha.list_tools()).tools] + [END_TOOL]
-            memory = await memory_instructions(ha)
+            tools = [chat_tool(t) for t in (await ha.list_tools()).tools]
+            memory, players = await asyncio.gather(memory_instructions(ha), asyncio.to_thread(music_players))
             log.info("session ready %.2fs after the wake", time.monotonic() - woke)
-            conversation = Conversation(puck, ha, http, tools, memory)
+            conversation = Conversation(puck, ha, http, tools, memory, players)
             await conversation.run()
             if TAPE_DIR:
                 save_tape(conversation.tape)

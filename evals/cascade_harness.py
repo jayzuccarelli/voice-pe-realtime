@@ -60,7 +60,7 @@ async def replay(path: Path, http: aiohttp.ClientSession) -> dict:
         r.raise_for_status()
     async with sse_client(os.environ["HA_MCP_URL"]) as (rd, wr), ClientSession(rd, wr) as ha:
         await ha.initialize()
-        tools = [relay.chat_tool(t) for t in (await ha.list_tools()).tools] + [relay.END_TOOL]
+        tools = [relay.chat_tool(t) for t in (await ha.list_tools()).tools]
         conv = relay.Conversation(Puck(), ha, http, tools)
 
         async def tts(text: str) -> bytes:
